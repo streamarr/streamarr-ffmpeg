@@ -72,7 +72,7 @@ jobs:
       - name: Build
         run: ${{ matrix.build }}
 
-      - name: Name the archive after the Streamarr release
+      - name: Package the archive for the Streamarr release
         env:
           TARGET: ${{ matrix.target }}
           BUILT: ${{ matrix.built }}
@@ -99,9 +99,30 @@ jobs:
           else
             release_version="${upstream_version}-streamarr-g${SHA:0:12}"
           fi
+          # The upstream archive holds only the binaries. A downloaded archive also needs FFmpeg's
+          # license texts and the directions to its Corresponding Source.
+          pkg="$(mktemp -d)"
+          tar -xJf "${built[0]}" -C "${pkg}"
+          mkdir "${pkg}/licenses"
+          cp COPYING.GPLv2 COPYING.GPLv3 COPYING.LGPLv2.1 COPYING.LGPLv3 LICENSE.md "${pkg}/licenses/"
+          cat > "${pkg}/SOURCE.txt" <<SOURCE
+          streamarr-ffmpeg ${release_version} (portable ${TARGET}-gpl)
+
+          These binaries are FFmpeg built from https://github.com/${GITHUB_REPOSITORY}
+          at revision ${SHA}. That revision's source is the Corresponding Source: FFmpeg's
+          source, the patch series in debian/patches (the streamarr- patches are Streamarr's
+          changes) and the build recipes in builder/. Each recipe in builder/scripts.d names its
+          bundled library's repository and exact revision. The license texts are in licenses/.
+          SOURCE
           mkdir -p release
-          out="release/streamarr-ffmpeg_${release_version}_portable_${TARGET}-gpl.tar.xz"
-          mv "${built[0]}" "${out}"
+          out="${PWD}/release/streamarr-ffmpeg_${release_version}_portable_${TARGET}-gpl.tar.xz"
+          (cd "${pkg}" && tar -cJf "${out}" *)
+          for member in ffmpeg ffprobe SOURCE.txt licenses/COPYING.GPLv3 licenses/LICENSE.md; do
+            if ! tar -tJf "${out}" | grep -qx "${member}"; then
+              echo "${out##*/} lacks ${member}" >&2
+              exit 1
+            fi
+          done
           (cd release && shasum -a 256 "${out##*/}" > "${out##*/}.sha256")
           cat release/*.sha256
 
@@ -126,14 +147,43 @@ jobs:
           path: release
           merge-multiple: true
 
-      - name: Attach the archives to the tag's release
+      - name: Publish the archives as the tag's release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          if ! gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" > /dev/null 2>&1; then
-            gh release create "${TAG}" --repo "${GITHUB_REPOSITORY}" --verify-tag --title "${TAG}" \
-              --notes "Portable GPL builds of ${TAG} for Linux amd64, Linux arm64 and macOS arm64: the upstream release plus the streamarr- patches at the end of debian/patches/series. Corresponding Source: the source of this tag, which holds FFmpeg's source, the patch series in debian/patches and the build recipes in builder/. Each recipe in builder/scripts.d names its bundled library's repository and exact revision."
+          cd release
+          expected="$(ls *.tar.xz *.sha256 | sort)"
+          if [[ "$(ls *.tar.xz | wc -l)" -ne 3 ]]; then
+            echo "Expected 3 archives" >&2
+            exit 1
           fi
-          gh release upload "${TAG}" --repo "${GITHUB_REPOSITORY}" --clobber release/*
+          shasum -a 256 -c *.sha256
+
+          # A published release keeps its assets: the worker may already pin their digests.
+          # Rebuilt archives differ byte for byte, so a retry after publication only checks
+          # that the release is complete. Changed archives need a new Streamarr revision.
+          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" --json isDraft --jq .isDraft 2>/dev/null | grep -qx false; then
+            published="$(gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" --json assets --jq '.assets[].name' | sort)"
+            if [[ "${published}" != "${expected}" ]]; then
+              echo "Release ${TAG} is published without the expected assets; tag a new Streamarr revision" >&2
+              exit 1
+            fi
+            echo "Release ${TAG} is already published with every asset; nothing to do"
+            exit 0
+          fi
+
+          if ! gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" > /dev/null 2>&1; then
+            gh release create "${TAG}" --repo "${GITHUB_REPOSITORY}" --verify-tag --draft --title "${TAG}" \
+              --notes "Portable GPL builds of ${TAG} for Linux amd64, Linux arm64 and macOS arm64: the upstream release plus the streamarr- patches at the end of debian/patches/series. Corresponding Source: the source of this tag, which holds FFmpeg's source, the patch series in debian/patches and the build recipes in builder/. Each recipe in builder/scripts.d names its bundled library's repository and exact revision. Each archive carries SOURCE.txt and FFmpeg's license texts."
+          fi
+          # The release is still a draft, so replacing its assets cannot affect a pinned digest.
+          gh release upload "${TAG}" --repo "${GITHUB_REPOSITORY}" --clobber *.tar.xz *.sha256
+          gh release download "${TAG}" --repo "${GITHUB_REPOSITORY}" --dir ../verify --pattern '*'
+          (cd ../verify && shasum -a 256 -c *.sha256)
+          if [[ "$(ls ../verify | sort)" != "${expected}" ]]; then
+            echo "The draft release holds other assets than the build" >&2
+            exit 1
+          fi
+          gh release edit "${TAG}" --repo "${GITHUB_REPOSITORY}" --draft=false
