@@ -100,7 +100,7 @@ jobs:
               d="${g%/.git}"
               printf '%s %s %s\n' "${d#builder/build/}" "$(git -C "$d" config --get remote.origin.url)" "$(git -C "$d" rev-parse HEAD)"
             done
-          } | sort > build-sources.txt
+          } | sort -u > build-sources.txt
           cat build-sources.txt
           grep -q 'libpng' build-sources.txt
           awk 'NF != 3 || $3 !~ /^[0-9a-f]{40}$/ { print "Bad record: " $0; bad = 1 } END { exit bad }' build-sources.txt
@@ -152,8 +152,9 @@ jobs:
           texts are in licenses/, and the bundled components' license texts and notices are in
           licenses/components/.
           SOURCE
-          mkdir -p release
-          out="${PWD}/release/streamarr-ffmpeg_${release_version}_portable_${TARGET}-gpl.tar.xz"
+          # Not "release": the upstream tree has a RELEASE file, and macOS ignores case.
+          mkdir -p streamarr-release
+          out="${PWD}/streamarr-release/streamarr-ffmpeg_${release_version}_portable_${TARGET}-gpl.tar.xz"
           (cd "${pkg}" && tar -cJf "${out}" *)
           for member in ffmpeg ffprobe SOURCE.txt BUILD-SOURCES.txt licenses/COPYING.GPLv3 licenses/LICENSE.md \
             licenses/components/openssl/LICENSE.txt licenses/components/x264/COPYING.txt; do
@@ -162,8 +163,8 @@ jobs:
               exit 1
             fi
           done
-          (cd release && shasum -a 256 "${out##*/}" > "${out##*/}.sha256")
-          cat release/*.sha256
+          (cd streamarr-release && shasum -a 256 "${out##*/}" > "${out##*/}.sha256")
+          cat streamarr-release/*.sha256
 
       # Without streamarr-0001 this command never finishes: the stream copy of input 1's audio
       # is that stream's first destination and hides the filter graph behind its decoder from
@@ -173,7 +174,7 @@ jobs:
         run: |
           set -euo pipefail
           bin="$(mktemp -d)"
-          tar -xJf release/*.tar.xz -C "${bin}" ffmpeg
+          tar -xJf streamarr-release/*.tar.xz -C "${bin}" ffmpeg
           source='testsrc2=s=160x120:r=24:d=4[out0];sine=r=48000:d=120[out1]'
           graph='[0:v]tpad=stop=-1:stop_mode=clone,trim=end=120[v];aevalsrc=0:d=0.1[z];[1:a][z]amix=inputs=2:duration=first[a]'
           perl -e 'alarm shift; exec @ARGV' 120 "${bin}/ffmpeg" -nostdin -v error \
@@ -186,7 +187,7 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: portable-${{ matrix.target }}-gpl
-          path: release
+          path: streamarr-release
           if-no-files-found: error
 
   publish:
@@ -200,7 +201,7 @@ jobs:
       - name: Download the archives
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          path: release
+          path: streamarr-release
           merge-multiple: true
 
       - name: Publish the archives as the tag's release
@@ -209,7 +210,7 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          cd release
+          cd streamarr-release
           expected="$(ls *.tar.xz *.sha256 | sort)"
           if [[ "$(ls *.tar.xz | wc -l)" -ne 3 ]]; then
             echo "Expected 3 archives" >&2
