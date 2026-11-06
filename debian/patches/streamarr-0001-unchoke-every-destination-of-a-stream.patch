@@ -1,0 +1,42 @@
+Description: fftools/ffmpeg_sched: unchoke every destination of a stream
+ When the scheduler unchokes a demuxer, unchoke_for_stream() passed only
+ the first element of each stream's destination array to
+ unchoke_downstream(), and unchoke_downstream() did the same for each
+ decoder output. A demuxed stream that is both stream-copied and decoded,
+ or a decoder output that feeds two filter graphs, therefore never
+ reached its later destinations.
+ .
+ A filter graph with sources of its own (have_sources) returns after
+ every step and waits in sch_filter_receive() with best_input ==
+ nb_inputs. Only a visit to one of its inputs unchokes it. When that
+ input is a later destination, the graph waits forever while its full
+ input queue blocks the decoder and the demuxer behind it, and FFmpeg
+ deadlocks. Visit every destination instead.
+Author: Streamarr
+Forwarded: no
+Last-Update: 2026-11-06
+---
+Index: FFmpeg/fftools/ffmpeg_sched.c
+===================================================================
+--- FFmpeg.orig/fftools/ffmpeg_sched.c
++++ FFmpeg/fftools/ffmpeg_sched.c
+@@ -1295,7 +1295,8 @@ static void unchoke_downstream(Scheduler *sch, Schedul
+     case SCH_NODE_TYPE_DEC:
+         dec = &sch->dec[dst->idx];
+         for (int i = 0; i < dec->nb_outputs; i++)
+-            unchoke_downstream(sch, dec->outputs[i].dst);
++            for (int j = 0; j < dec->outputs[i].nb_dst; j++)
++                unchoke_downstream(sch, &dec->outputs[i].dst[j]);
+         break;
+     case SCH_NODE_TYPE_ENC:
+         enc = &sch->enc[dst->idx];
+@@ -1334,7 +1335,8 @@ static void unchoke_for_stream(Scheduler *sch, Schedul
+                 return; // prevent infinite loop
+             demux->waiter.choked_next = 0;
+             for (int i = 0; i < demux->nb_streams; i++)
+-                unchoke_downstream(sch, demux->streams[i].dst);
++                for (int j = 0; j < demux->streams[i].nb_dst; j++)
++                    unchoke_downstream(sch, &demux->streams[i].dst[j]);
+             return;
+         case SCH_NODE_TYPE_DEC:
+             src = sch->dec[src.idx].src;
