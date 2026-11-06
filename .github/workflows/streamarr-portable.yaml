@@ -72,8 +72,10 @@ jobs:
       - name: Build
         run: ${{ matrix.build }}
 
-      # Some recipes clone without a revision (Implib.so on Linux; libpng and others in the macOS
-      # base). Record the revision each clone resolved to, so the archive names its exact source.
+      # builder/images/base/git-mini-clone.sh records the revision of every clone, including one
+      # whose recipe passes no revision (fftw3f), in the prefix that each stage copies into the
+      # final image. Clones that do not use it (Implib.so on Linux, libpng in the macOS base)
+      # keep their .git directory. Every record must name a full revision.
       - name: Record the resolved source revisions (Linux)
         if: runner.os == 'Linux'
         env:
@@ -81,20 +83,27 @@ jobs:
         run: |
           set -euo pipefail
           image="ghcr.io/${GITHUB_REPOSITORY,,}/${TARGET}-gpl:latest"
-          docker run --rm "${image}" sh -c 'for g in $(find / -xdev -name .git -type d 2>/dev/null); do d=${g%/.git}; printf "%s %s %s\n" "$d" "$(git -C "$d" config --get remote.origin.url)" "$(git -C "$d" rev-parse HEAD)"; done' \
+          docker run --rm "${image}" sh -c 'cat "$FFBUILD_PREFIX"/share/streamarr-build-sources/*.txt; for g in $(find / -xdev -name .git -type d 2>/dev/null); do d=${g%/.git}; printf "%s %s %s\n" "$d" "$(git -C "$d" config --get remote.origin.url)" "$(git -C "$d" rev-parse HEAD)"; done' \
             | sort > build-sources.txt
           cat build-sources.txt
+          grep -q '^fftw3f ' build-sources.txt
           grep -q 'Implib.so ' build-sources.txt
+          awk 'NF != 3 || $3 !~ /^[0-9a-f]{40}$/ { print "Bad record: " $0; bad = 1 } END { exit bad }' build-sources.txt
 
       - name: Record the resolved source revisions (macOS)
         if: runner.os == 'macOS'
         run: |
           set -euo pipefail
-          find builder/build -name .git -type d | sort | while read -r g; do
-            d="${g%/.git}"
-            printf '%s %s %s\n' "${d#builder/build/}" "$(git -C "$d" config --get remote.origin.url)" "$(git -C "$d" rev-parse HEAD)"
-          done > build-sources.txt
+          {
+            cat /opt/ffbuild/prefix/share/streamarr-build-sources/*.txt
+            find builder/build -name .git -type d | while read -r g; do
+              d="${g%/.git}"
+              printf '%s %s %s\n' "${d#builder/build/}" "$(git -C "$d" config --get remote.origin.url)" "$(git -C "$d" rev-parse HEAD)"
+            done
+          } | sort > build-sources.txt
           cat build-sources.txt
+          grep -q 'libpng' build-sources.txt
+          awk 'NF != 3 || $3 !~ /^[0-9a-f]{40}$/ { print "Bad record: " $0; bad = 1 } END { exit bad }' build-sources.txt
 
       - name: Package the archive for the Streamarr release
         env:
