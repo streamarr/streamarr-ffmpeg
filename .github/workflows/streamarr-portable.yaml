@@ -1,7 +1,7 @@
-name: 'Streamarr portable Linux release'
+name: 'Streamarr portable release'
 
-# Builds the portable GPL Linux archives that the Streamarr transcode worker pins, with the
-# upstream build scripts unchanged. A tag v<upstream release>-streamarr.<revision> publishes
+# Builds the portable GPL archives for Linux amd64, Linux arm64 and macOS arm64 that the
+# Streamarr transcode worker pins, with the upstream build scripts unchanged. A tag v<upstream release>-streamarr.<revision> publishes
 # them to that tag's GitHub release, created with the workflow token. A release made that way
 # sends no release event, so the upstream publishing workflow, which needs upstream's deploy
 # secrets, never runs here. Create releases only by pushing a tag.
@@ -25,19 +25,28 @@ permissions:
 jobs:
   build:
     name: 'Build portable ${{ matrix.target }}-gpl'
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 360
     strategy:
       fail-fast: false
       matrix:
         include:
-          - arch: amd64
-            target: linux64
-          - arch: arm64
-            target: linuxarm64
+          - target: linux64
+            runner: ubuntu-latest
+            build: ./build-linux-amd64 ./dist
+            built: dist
+          - target: linuxarm64
+            runner: ubuntu-latest
+            build: ./build-linux-arm64 ./dist
+            built: dist
+          - target: macarm64
+            runner: macos-latest
+            build: ./builder/buildmac.sh arm64
+            built: builder/artifacts
 
     steps:
       - name: Free disk space
+        if: runner.os == 'Linux'
         uses: jlumbroso/free-disk-space@36e9a5af4eddb91fc11aec4c6f6f79b3cc0cb523 # main
         with:
           preinstalled-runtimes: false
@@ -50,19 +59,30 @@ jobs:
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Set up Homebrew
+        if: runner.os == 'macOS'
+        uses: Homebrew/actions/setup-homebrew@2026.09.13.1
+
+      - name: Prepare the macOS prefix
+        if: runner.os == 'macOS'
+        run: |
+          sudo mkdir /opt/ffbuild
+          sudo chmod 777 /opt/ffbuild
+
       - name: Build
-        run: ./build-linux-${{ matrix.arch }} ./dist
+        run: ${{ matrix.build }}
 
       - name: Name the archive after the Streamarr release
         env:
           TARGET: ${{ matrix.target }}
+          BUILT: ${{ matrix.built }}
           REF_TYPE: ${{ github.ref_type }}
           REF_NAME: ${{ github.ref_name }}
           SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           shopt -s nullglob
-          built=(dist/*_portable_"${TARGET}"-gpl.tar.xz)
+          built=("${BUILT}"/*_portable_"${TARGET}"-gpl.tar.xz)
           if [[ ${#built[@]} -ne 1 ]]; then
             echo "Expected exactly one ${TARGET}-gpl archive, found ${#built[@]}" >&2
             exit 1
@@ -77,12 +97,12 @@ jobs:
               exit 1
             fi
           else
-            release_version="${upstream_version}-streamarr-g${SHA::12}"
+            release_version="${upstream_version}-streamarr-g${SHA:0:12}"
           fi
           mkdir -p release
           out="release/streamarr-ffmpeg_${release_version}_portable_${TARGET}-gpl.tar.xz"
           mv "${built[0]}" "${out}"
-          (cd release && sha256sum "${out##*/}" > "${out##*/}.sha256")
+          (cd release && shasum -a 256 "${out##*/}" > "${out##*/}.sha256")
           cat release/*.sha256
 
       - name: Upload the archive
@@ -114,6 +134,6 @@ jobs:
           set -euo pipefail
           if ! gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" > /dev/null 2>&1; then
             gh release create "${TAG}" --repo "${GITHUB_REPOSITORY}" --verify-tag --title "${TAG}" \
-              --notes "Portable GPL Linux builds of ${TAG}: the upstream release plus the streamarr- patches at the end of debian/patches/series."
+              --notes "Portable GPL builds of ${TAG} for Linux amd64, Linux arm64 and macOS arm64: the upstream release plus the streamarr- patches at the end of debian/patches/series. Corresponding Source: the source of this tag, which holds FFmpeg's source, the patch series in debian/patches and the build recipes in builder/. Each recipe in builder/scripts.d names its bundled library's repository and exact revision."
           fi
           gh release upload "${TAG}" --repo "${GITHUB_REPOSITORY}" --clobber release/*
