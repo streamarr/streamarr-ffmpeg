@@ -1,0 +1,119 @@
+name: 'Streamarr portable Linux release'
+
+# Builds the portable GPL Linux archives that the Streamarr transcode worker pins, with the
+# upstream build scripts unchanged. A tag v<upstream release>-streamarr.<revision> publishes
+# them to that tag's GitHub release, created with the workflow token. A release made that way
+# sends no release event, so the upstream publishing workflow, which needs upstream's deploy
+# secrets, never runs here. Create releases only by pushing a tag.
+
+on:
+  pull_request:
+    branches:
+      - streamarr
+  push:
+    tags:
+      - 'v*-streamarr.*'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: 'Build portable ${{ matrix.target }}-gpl'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            target: linux64
+          - arch: arm64
+            target: linuxarm64
+
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@36e9a5af4eddb91fc11aec4c6f6f79b3cc0cb523 # main
+        with:
+          preinstalled-runtimes: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build
+        run: ./build-linux-${{ matrix.arch }} ./dist
+
+      - name: Name the archive after the Streamarr release
+        env:
+          TARGET: ${{ matrix.target }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          built=(dist/*_portable_"${TARGET}"-gpl.tar.xz)
+          if [[ ${#built[@]} -ne 1 ]]; then
+            echo "Expected exactly one ${TARGET}-gpl archive, found ${#built[@]}" >&2
+            exit 1
+          fi
+          name="${built[0]##*/}"
+          upstream_version="${name#*_}"
+          upstream_version="${upstream_version%%_portable_*}"
+          if [[ "${REF_TYPE}" == tag ]]; then
+            release_version="${REF_NAME#v}"
+            if [[ "${release_version}" != "${upstream_version}"-streamarr.* ]]; then
+              echo "Tag ${REF_NAME} does not name the built upstream release ${upstream_version}" >&2
+              exit 1
+            fi
+          else
+            release_version="${upstream_version}-streamarr-g${SHA::12}"
+          fi
+          mkdir -p release
+          out="release/streamarr-ffmpeg_${release_version}_portable_${TARGET}-gpl.tar.xz"
+          mv "${built[0]}" "${out}"
+          (cd release && sha256sum "${out##*/}" > "${out##*/}.sha256")
+          cat release/*.sha256
+
+      - name: Upload the archive
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: portable-${{ matrix.target }}-gpl
+          path: release
+          if-no-files-found: error
+
+  publish:
+    name: 'Publish the Streamarr release'
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download the archives
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: release
+          merge-multiple: true
+
+      - name: Attach the archives to the tag's release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" > /dev/null 2>&1; then
+            gh release create "${TAG}" --repo "${GITHUB_REPOSITORY}" --verify-tag --title "${TAG}" \
+              --notes "Portable GPL Linux builds of ${TAG}: the upstream release plus the streamarr- patches at the end of debian/patches/series."
+          fi
+          gh release upload "${TAG}" --repo "${GITHUB_REPOSITORY}" --clobber release/*
