@@ -126,6 +126,23 @@ jobs:
           (cd release && shasum -a 256 "${out##*/}" > "${out##*/}.sha256")
           cat release/*.sha256
 
+      # Without streamarr-0001 this command never finishes: the stream copy of input 1's audio
+      # is that stream's first destination and hides the filter graph behind its decoder from
+      # the scheduler. linuxarm64 binaries cannot run on these runners.
+      - name: Check that the scheduler unchokes every destination
+        if: matrix.target != 'linuxarm64'
+        run: |
+          set -euo pipefail
+          bin="$(mktemp -d)"
+          tar -xJf release/*.tar.xz -C "${bin}" ffmpeg
+          source='testsrc2=s=160x120:r=24:d=4[out0];sine=r=48000:d=120[out1]'
+          graph='[0:v]tpad=stop=-1:stop_mode=clone,trim=end=120[v];aevalsrc=0:d=0.1[z];[1:a][z]amix=inputs=2:duration=first[a]'
+          perl -e 'alarm shift; exec @ARGV' 120 "${bin}/ffmpeg" -nostdin -v error \
+            -f lavfi -i "${source}" -f lavfi -i "${source}" -filter_complex "${graph}" \
+            -map '[v]' -map '[a]' -c:v rawvideo -c:a pcm_s16le -f null - \
+            -map 1:a -c copy -f null - \
+            -map 1:v -c copy -f null -
+
       - name: Upload the archive
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
