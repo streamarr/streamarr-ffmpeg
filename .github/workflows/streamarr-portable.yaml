@@ -156,14 +156,18 @@ jobs:
           mkdir -p streamarr-release
           out="${PWD}/streamarr-release/streamarr-ffmpeg_${release_version}_portable_${TARGET}-gpl.tar.xz"
           (cd "${pkg}" && tar -cJf "${out}" *)
+          # List once: grep -q in a pipe from tar stops reading early, and pipefail then reports
+          # tar's write error as a missing member.
+          members="$(tar -tJf "${out}")"
           for member in ffmpeg ffprobe SOURCE.txt BUILD-SOURCES.txt licenses/COPYING.GPLv3 licenses/LICENSE.md \
             licenses/components/openssl/LICENSE.txt licenses/components/x264/COPYING.txt; do
-            if ! tar -tJf "${out}" | grep -qx "${member}"; then
+            if ! grep -qx "${member}" <<< "${members}"; then
               echo "${out##*/} lacks ${member}" >&2
               exit 1
             fi
           done
-          (cd streamarr-release && shasum -a 256 "${out##*/}" > "${out##*/}.sha256")
+          if command -v sha256sum > /dev/null; then sha256=(sha256sum); else sha256=(shasum -a 256); fi
+          (cd streamarr-release && "${sha256[@]}" "${out##*/}" > "${out##*/}.sha256")
           cat streamarr-release/*.sha256
 
       # Without streamarr-0001 this command never finishes: the stream copy of input 1's audio
@@ -216,7 +220,7 @@ jobs:
             echo "Expected 3 archives" >&2
             exit 1
           fi
-          shasum -a 256 -c *.sha256
+          sha256sum -c *.sha256
 
           # A published release keeps its assets: the worker may already pin their digests.
           # Rebuilt archives differ byte for byte, so a retry after publication only checks
@@ -259,7 +263,7 @@ jobs:
           fi
           gh release upload "${TAG}" --repo "${GITHUB_REPOSITORY}" --clobber *.tar.xz *.sha256
           gh release download "${TAG}" --repo "${GITHUB_REPOSITORY}" --dir ../verify --pattern '*'
-          (cd ../verify && shasum -a 256 -c *.sha256)
+          (cd ../verify && sha256sum -c *.sha256)
           if [[ "$(ls ../verify | sort)" != "${expected}" ]]; then
             echo "The draft release holds other assets than the build" >&2
             exit 1
