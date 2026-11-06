@@ -72,6 +72,30 @@ jobs:
       - name: Build
         run: ${{ matrix.build }}
 
+      # Some recipes clone without a revision (Implib.so on Linux; libpng and others in the macOS
+      # base). Record the revision each clone resolved to, so the archive names its exact source.
+      - name: Record the resolved source revisions (Linux)
+        if: runner.os == 'Linux'
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY,,}/${TARGET}-gpl:latest"
+          docker run --rm "${image}" sh -c 'for g in $(find / -xdev -name .git -type d 2>/dev/null); do d=${g%/.git}; printf "%s %s %s\n" "$d" "$(git -C "$d" config --get remote.origin.url)" "$(git -C "$d" rev-parse HEAD)"; done' \
+            | sort > build-sources.txt
+          cat build-sources.txt
+          grep -q 'Implib.so ' build-sources.txt
+
+      - name: Record the resolved source revisions (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          find builder/build -name .git -type d | sort | while read -r g; do
+            d="${g%/.git}"
+            printf '%s %s %s\n' "${d#builder/build/}" "$(git -C "$d" config --get remote.origin.url)" "$(git -C "$d" rev-parse HEAD)"
+          done > build-sources.txt
+          cat build-sources.txt
+
       - name: Package the archive for the Streamarr release
         env:
           TARGET: ${{ matrix.target }}
@@ -105,6 +129,8 @@ jobs:
           tar -xJf "${built[0]}" -C "${pkg}"
           mkdir "${pkg}/licenses"
           cp COPYING.GPLv2 COPYING.GPLv3 COPYING.LGPLv2.1 COPYING.LGPLv3 LICENSE.md "${pkg}/licenses/"
+          cp -R streamarr/notices "${pkg}/licenses/components"
+          cp build-sources.txt "${pkg}/BUILD-SOURCES.txt"
           cat > "${pkg}/SOURCE.txt" <<SOURCE
           streamarr-ffmpeg ${release_version} (portable ${TARGET}-gpl)
 
@@ -112,12 +138,16 @@ jobs:
           at revision ${SHA}. That revision's source is the Corresponding Source: FFmpeg's
           source, the patch series in debian/patches (the streamarr- patches are Streamarr's
           changes) and the build recipes in builder/. Each recipe in builder/scripts.d names its
-          bundled library's repository and exact revision. The license texts are in licenses/.
+          bundled library's repository and exact revision. BUILD-SOURCES.txt names the revision
+          that each clone without a pinned revision resolved to in this build. FFmpeg's license
+          texts are in licenses/, and the bundled components' license texts and notices are in
+          licenses/components/.
           SOURCE
           mkdir -p release
           out="${PWD}/release/streamarr-ffmpeg_${release_version}_portable_${TARGET}-gpl.tar.xz"
           (cd "${pkg}" && tar -cJf "${out}" *)
-          for member in ffmpeg ffprobe SOURCE.txt licenses/COPYING.GPLv3 licenses/LICENSE.md; do
+          for member in ffmpeg ffprobe SOURCE.txt BUILD-SOURCES.txt licenses/COPYING.GPLv3 licenses/LICENSE.md \
+            licenses/components/openssl/LICENSE.txt licenses/components/x264/COPYING.txt; do
             if ! tar -tJf "${out}" | grep -qx "${member}"; then
               echo "${out##*/} lacks ${member}" >&2
               exit 1
@@ -181,7 +211,25 @@ jobs:
           # A published release keeps its assets: the worker may already pin their digests.
           # Rebuilt archives differ byte for byte, so a retry after publication only checks
           # that the release is complete. Changed archives need a new Streamarr revision.
-          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" --json isDraft --jq .isDraft 2>/dev/null | grep -qx false; then
+          # Assets are replaced only on a release confirmed to be a draft; an unknown state stops.
+          release_state() {
+            local out
+            if out="$(gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" --json isDraft --jq .isDraft 2> state.err)"; then
+              case "${out}" in
+                true) echo draft ;;
+                false) echo published ;;
+                *) echo "Unexpected release state '${out}'" >&2; return 1 ;;
+              esac
+            elif grep -q 'release not found' state.err; then
+              echo missing
+            else
+              cat state.err >&2
+              return 1
+            fi
+          }
+
+          state="$(release_state)"
+          if [[ "${state}" == published ]]; then
             published="$(gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" --json assets --jq '.assets[].name' | sort)"
             if [[ "${published}" != "${expected}" ]]; then
               echo "Release ${TAG} is published without the expected assets; tag a new Streamarr revision" >&2
@@ -191,11 +239,14 @@ jobs:
             exit 0
           fi
 
-          if ! gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" > /dev/null 2>&1; then
+          if [[ "${state}" == missing ]]; then
             gh release create "${TAG}" --repo "${GITHUB_REPOSITORY}" --verify-tag --draft --title "${TAG}" \
-              --notes "Portable GPL builds of ${TAG} for Linux amd64, Linux arm64 and macOS arm64: the upstream release plus the streamarr- patches at the end of debian/patches/series. Corresponding Source: the source of this tag, which holds FFmpeg's source, the patch series in debian/patches and the build recipes in builder/. Each recipe in builder/scripts.d names its bundled library's repository and exact revision. Each archive carries SOURCE.txt and FFmpeg's license texts."
+              --notes "Portable GPL builds of ${TAG} for Linux amd64, Linux arm64 and macOS arm64: the upstream release plus the streamarr- patches at the end of debian/patches/series. Corresponding Source: the source of this tag, which holds FFmpeg's source, the patch series in debian/patches and the build recipes in builder/. Each recipe in builder/scripts.d names its bundled library's repository and exact revision, and each archive's BUILD-SOURCES.txt names the revision of every clone that the recipes leave unpinned. Each archive carries SOURCE.txt, FFmpeg's license texts and the bundled components' license texts and notices."
           fi
-          # The release is still a draft, so replacing its assets cannot affect a pinned digest.
+          if [[ "$(release_state)" != draft ]]; then
+            echo "Release ${TAG} is not a confirmed draft; its assets stay unchanged" >&2
+            exit 1
+          fi
           gh release upload "${TAG}" --repo "${GITHUB_REPOSITORY}" --clobber *.tar.xz *.sha256
           gh release download "${TAG}" --repo "${GITHUB_REPOSITORY}" --dir ../verify --pattern '*'
           (cd ../verify && shasum -a 256 -c *.sha256)
