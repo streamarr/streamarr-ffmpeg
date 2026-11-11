@@ -32,7 +32,7 @@ Index: FFmpeg/doc/filters.texi
 ===================================================================
 --- FFmpeg.orig/doc/filters.texi
 +++ FFmpeg/doc/filters.texi
-@@ -2157,6 +2157,41 @@ agapfill=start=0:max_gap=600
+@@ -2163,6 +2163,41 @@ agapfill=start=0:max_gap=600
  @end example
  @end itemize
  

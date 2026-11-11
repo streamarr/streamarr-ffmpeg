@@ -31,7 +31,7 @@ Index: FFmpeg/doc/filters.texi
 ===================================================================
 --- FFmpeg.orig/doc/filters.texi
 +++ FFmpeg/doc/filters.texi
-@@ -2073,6 +2073,90 @@ Set softness applied inside thresholding
+@@ -2073,6 +2073,96 @@ Set softness applied inside thresholding
  
  This filter supports the all above options as @ref{commands}.
  
@@ -66,6 +66,12 @@ Index: FFmpeg/doc/filters.texi
 +
 +Each step is decided alone. Steps at or below the threshold never add up to a
 +gap.
++
++The silence of a gap covers the step and whatever the joined steps before it
++have left between the output and the timestamps. For example, at 48 kHz, 299
++forward steps of 96 samples are joined and leave the output 28,704 samples
++behind the timestamps. A step of 97 samples after them is a gap, and the
++filter writes 28,801 samples of silence, which is 0.6 seconds.
 +
 +The output time base is one sample, and each output frame begins where the
 +previous one ends. A frame without a timestamp follows the previous frame
