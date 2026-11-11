@@ -21,7 +21,8 @@ of silence. The expectations come from the rules the filter documents, not from 
     5. Silence comes one frame of `packet_size` samples at a time, so memory does not grow with
        the gap, and a gap longer than `max_gap` is an error.
     6. When ffmpeg builds a new filter graph mid-stream, the new graph's filter continues the
-       output of the old one, so rules 1 to 4 hold across the change.
+       output of the old one, so rules 1 to 4 hold across the change. The old one first outputs
+       every frame it has.
 
 Exits 0 when every check passes, 1 when one fails, 2 when a fixture is unusable.
 """
@@ -881,6 +882,69 @@ def seek_past_graph_rebuild(ffmpeg):
     # sees a frame. The audio begins 2.024 s after the seek point, and the new graph's filter owes
     # the silence from start, 1 s after the seek point.
     return rebuild_problems(ffmpeg, hole=3, start=1, seek=6)
+
+
+def beside_changing_video(ffmpeg, shape, option, first, runs, after="anull"):
+    """Fills the counter in one filter graph with a video whose frame size changes at 10 s.
+
+    The audio file carries the timestamps `shape` gives. ffmpeg reads its first frame after the
+    hole, or its late first frame, while the video is still short of 10 s, so the filter is
+    writing silence when the change of size makes ffmpeg free the graph and build a new one.
+    `after` is the filter behind the fill.
+    """
+    counter = COUNTERS["s16"]
+    quiet = ["-nostdin", "-hide_banner", "-v", "error"]
+    with tempfile.TemporaryDirectory() as work:
+        video, audio = os.path.join(work, "video.mjpeg"), os.path.join(work, "audio.nut")
+        with open(video, "wb") as out:
+            for size, seconds in (("64x36", 10), ("128x72", 30)):
+                part = execute([ffmpeg] + quiet + ["-f", "lavfi", "-i",
+                                                   "testsrc2=s=%s:r=24:d=%d" % (size, seconds),
+                                                   "-c:v", "mjpeg", "-q:v", "20", "-f", "mjpeg", "-"],
+                               lambda stream: stream.read())
+                if part.code:
+                    raise Unusable("FFmpeg could not encode the video: %s" % last_lines(part.log))
+                out.write(part.result)
+        made = execute([ffmpeg] + quiet + ["-f", "lavfi", "-i", counter.lavfi(40 * SECOND, RATE),
+                                           "-af", shape, "-c:a", counter.codec, "-f", "nut", "-y",
+                                           audio])
+        if made.code:
+            raise Unusable("FFmpeg could not write the audio: %s" % last_lines(made.log))
+        graph = "[0:v]scale=64:36[v];[1:a]agapfill%s,%s,ashowinfo[a]" % (option, after)
+        done = execute([ffmpeg, "-nostdin", "-hide_banner", "-nostats", "-v", "info", "-copyts",
+                        "-f", "mjpeg", "-framerate", "24", "-i", video, "-i", audio,
+                        "-filter_complex", graph, "-map", "[v]", "-f", "null", "-",
+                        "-map", "[a]", "-c:a", counter.codec, "-f", counter.raw, "-"],
+                       lambda out: compare_samples(out, first, runs, counter, RATE))
+    if done.code:
+        return ["FFmpeg ended with status %d: %s" % (done.code, last_lines(done.log))]
+    if "Reconfiguring filter graph because video parameters changed" not in done.log:
+        raise Unusable("ffmpeg did not rebuild the filter graph at the change of frame size")
+    return check_frames(frames_of(done.log), first, runs, DEFAULT_PACKET, RATE) + done.result
+
+
+@check("rebuild-during-gap", "keeps every sample and the whole gap when ffmpeg rebuilds the filter "
+       "graph while the filter writes the gap")
+def rebuild_during_gap(ffmpeg):
+    return beside_changing_video(ffmpeg, chain(frames(4800), drop((20, 319))), "", 0,
+                                 [real(0, 2 * SECOND), silence(30 * SECOND),
+                                  real(32 * SECOND, 8 * SECOND)])
+
+
+# The trim ends the audio at 12 s, inside the gap. At the rebuild the filter still holds the frame
+# from after the gap, and no output asks for it any more. Unless ffmpeg stops asking, it never ends.
+@check("rebuild-during-gap-behind-end", "lets ffmpeg rebuild the filter graph when the filter "
+       "behind it needs no more of the gap")
+def rebuild_during_gap_behind_end(ffmpeg):
+    return beside_changing_video(ffmpeg, chain(frames(4800), drop((20, 319))), "", 0,
+                                 [real(0, 2 * SECOND), silence(10 * SECOND)], after="atrim=end=12")
+
+
+@check("rebuild-during-lead", "keeps every sample and the whole lead when ffmpeg rebuilds the "
+       "filter graph while the filter writes the leading silence")
+def rebuild_during_lead(ffmpeg):
+    return beside_changing_video(ffmpeg, chain(frames(4800), stamp("PTS+%d" % (20 * SECOND))),
+                                 "=start=0", 0, [silence(20 * SECOND), real(0, 40 * SECOND)])
 
 
 CHECKS_BY_NAME = {name: (title, function) for name, title, function in CHECKS}

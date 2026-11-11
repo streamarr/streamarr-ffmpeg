@@ -15,6 +15,15 @@ Description: fftools/ffmpeg_filter: continue the output of agapfill when a filte
  nothing, so its successor starts afresh and still writes the leading
  silence. That is the case after a seek whose discarded frames hold the
  change.
+ .
+ The filter writes a gap one frame of silence for each frame its output
+ asks for, and holds the frame after the gap, and the frames behind it,
+ until then. ffmpeg freed a graph with those frames in it when another
+ input of the same graph changed, for example the frame size of a video.
+ A gap of 30 s under way at such a change lost 4,096 to 16,384 samples
+ and the rest of the silence. The pending command reports the frames a
+ filter has not output yet, and send_frame() now asks the outputs behind
+ each agapfill filter for frames until none is pending.
 Author: Streamarr
 Forwarded: no
 Last-Update: 2026-11-11
@@ -23,7 +32,7 @@ Index: FFmpeg/doc/filters.texi
 ===================================================================
 --- FFmpeg.orig/doc/filters.texi
 +++ FFmpeg/doc/filters.texi
-@@ -2157,6 +2157,30 @@ agapfill=start=0:max_gap=600
+@@ -2157,6 +2157,41 @@ agapfill=start=0:max_gap=600
  @end example
  @end itemize
  
@@ -36,6 +45,11 @@ Index: FFmpeg/doc/filters.texi
 +the timestamp of the next output sample, the end of the last input frame by
 +its own timestamp, both in samples, and the sample rate. The report is empty
 +before the first frame.
++
++@item pending
++Report how many input frames the filter has not output yet: the frame it
++holds while it writes the silence before it, and the frames that wait behind
++that one.
 +
 +@item resume
 +Continue the output of another agapfill filter. The argument is what the
@@ -50,6 +64,12 @@ Index: FFmpeg/doc/filters.texi
 +filter of the new graph then resumes from the position of the filter in its
 +place in the old graph. A filter whose predecessor took no frame starts
 +afresh, with @option{start}.
++
++Before @command{ffmpeg} frees the old graph, it asks the outputs behind each
++agapfill filter for frames until the filter has output every frame it has, so
++a rebuild while the filter writes silence loses neither the rest of the
++silence nor a sample. Samples that other filters of the old graph hold are
++lost, as they are without this filter.
 +
  @section agate
  
@@ -138,7 +158,106 @@ Index: FFmpeg/fftools/ffmpeg_filter.c
      fgp->is_meta = graph_is_meta(fgt->graph);
  
      /* limit the lists of allowed formats to the ones selected, to
-@@ -3224,6 +3283,10 @@ static int send_frame(FilterGraph *fg, F
+@@ -3104,6 +3163,89 @@ static const char *unknown_if_null(const
+     return str ? str : "unknown";
+ }
+ 
++/* Whether frames that leave f reach sink. */
++static int filter_feeds(const AVFilterContext *f, const AVFilterContext *sink)
++{
++    if (f == sink)
++        return 1;
++
++    for (unsigned i = 0; i < f->nb_outputs; i++)
++        if (f->outputs[i] && filter_feeds(f->outputs[i]->dst, sink))
++            return 1;
++
++    return 0;
++}
++
++static int gap_fill_is_pending(AVFilterContext *f)
++{
++    char pending[32] = "0";
++
++    return avfilter_process_command(f, "pending", NULL, pending, sizeof(pending), 0) >= 0 &&
++           strcmp(pending, "0");
++}
++
++/* Ask each output that f feeds for a frame, then send on what the outputs
++ * hold. Returns whether a frame came. */
++static int pull_frames_behind(FilterGraph *fg, FilterGraphThread *fgt,
++                              const AVFilterContext *f, AVFrame *frame)
++{
++    int pulled = 0;
++
++    for (int i = 0; i < fg->nb_outputs; i++) {
++        AVFilterContext *sink = fg->outputs[i]->filter;
++        int ret;
++
++        if (!filter_feeds(f, sink))
++            continue;
++
++        ret = av_buffersink_get_frame_flags(sink, NULL, AV_BUFFERSINK_FLAG_PEEK);
++        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
++            continue;
++        if (ret < 0)
++            return ret;
++
++        pulled = 1;
++    }
++
++    for (int i = 0; i < fg->nb_outputs; i++) {
++        int ret = 0;
++
++        while (!ret) {
++            ret = fg_output_step(ofp_from_ofilter(fg->outputs[i]), fgt, frame);
++            if (ret < 0)
++                return ret;
++        }
++    }
++
++    return pulled;
++}
++
++/**
++ * An agapfill filter writes a gap one frame of silence for each frame its
++ * output asks for, and holds the frame after the gap and the frames behind it
++ * until then. Freeing the graph would take those frames with it. So ask the
++ * outputs for frames until every agapfill filter has output all it has.
++ */
++static int finish_gap_fills(FilterGraph *fg, FilterGraphThread *fgt, AVFrame *frame)
++{
++    for (unsigned i = 0; i < fgt->graph->nb_filters; i++) {
++        AVFilterContext *f = fgt->graph->filters[i];
++        int ret = 1;
++
++        if (!is_gap_fill(f))
++            continue;
++
++        /* No frame comes when a filter behind f has ended its output or
++         * waits for another input. */
++        while (ret > 0 && gap_fill_is_pending(f))
++            ret = pull_frames_behind(fg, fgt, f, frame);
++        if (ret < 0)
++            return ret;
++    }
++
++    return 0;
++}
++
+ static int send_frame(FilterGraph *fg, FilterGraphThread *fgt,
+                       InputFilter *ifilter, AVFrame *frame)
+ {
+@@ -3192,6 +3334,8 @@ static int send_frame(FilterGraph *fg, F
+         }
+ 
+         ret = fgt->graph ? read_frames(fg, fgt, tmp) : 0;
++        if (ret >= 0 && fgt->graph)
++            ret = finish_gap_fills(fg, fgt, tmp);
+         av_frame_free(&tmp);
+         if (ret < 0)
+             return ret;
+@@ -3224,6 +3368,10 @@ static int send_frame(FilterGraph *fg, F
              if (reason.len > 1)
                  reason.str[reason.len - 2] = '\0'; // remove last comma
              av_log(fg, AV_LOG_INFO, "Reconfiguring filter graph%s%s\n", reason.len ? " because " : "", reason.str);
@@ -149,7 +268,7 @@ Index: FFmpeg/fftools/ffmpeg_filter.c
          } else {
              /* Choke all input to avoid buffering excessive frames while the
               * initial filter graph is being configured, and before we have a
-@@ -3289,6 +3352,7 @@ static void fg_thread_uninit(FilterGraph
+@@ -3289,6 +3437,7 @@ static void fg_thread_uninit(FilterGraph
      av_frame_free(&fgt->frame);
      av_freep(&fgt->eof_in);
      av_freep(&fgt->eof_out);
@@ -181,7 +300,22 @@ Index: FFmpeg/libavfilter/af_agapfill.c
      int64_t out_pos;        ///< timestamp of the next output sample, in samples
      int64_t in_end;         ///< end of the previous input frame by its own timestamp, in samples
      int64_t silence_left;   ///< samples of silence still to write before the held frame
-@@ -244,6 +248,58 @@ static int config_output(AVFilterLink *o
+@@ -199,8 +203,12 @@ static int activate(AVFilterContext *ctx
+             if (!ff_outlink_frame_wanted(outlink))
+                 return FFERROR_NOT_READY;
+             ret = send_silence(ctx);
+-            if (ret < 0 || s->silence_left)
+-                return ret;
++            /* The held frame leaves in an activation of its own. A caller
++             * that asks the output for one frame at a time then finds no
++             * frame on the way there once pending reports none. */
++            if (ret >= 0 && !s->silence_left)
++                ff_filter_set_ready(ctx, 100);
++            return ret;
+         }
+         return send_held(ctx);
+     }
+@@ -244,6 +252,63 @@ static int config_output(AVFilterLink *o
      return 0;
  }
  
@@ -223,10 +357,15 @@ Index: FFmpeg/libavfilter/af_agapfill.c
 +
 +    if (!strcmp(cmd, "resume"))
 +        return resume(ctx, args);
-+    if (strcmp(cmd, "position"))
++    if (strcmp(cmd, "position") && strcmp(cmd, "pending"))
 +        return AVERROR(ENOSYS);
 +    if (!res || res_len <= 0)
 +        return AVERROR(EINVAL);
++
++    if (!strcmp(cmd, "pending")) {
++        snprintf(res, res_len, "%zu", !!s->held + ff_inlink_queued_frames(ctx->inputs[0]));
++        return 0;
++    }
 +
 +    /* Nothing to continue before the first frame. */
 +    res[0] = 0;
@@ -240,7 +379,7 @@ Index: FFmpeg/libavfilter/af_agapfill.c
  static av_cold void uninit(AVFilterContext *ctx)
  {
      AGapFillContext *s = ctx->priv;
-@@ -265,12 +321,13 @@ static const AVFilterPad agapfill_output
+@@ -265,12 +330,13 @@ static const AVFilterPad agapfill_output
  };
  
  const FFFilter ff_af_agapfill = {

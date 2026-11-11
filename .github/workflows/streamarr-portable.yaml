@@ -189,9 +189,10 @@ jobs:
 
       # streamarr-0004 adds the agapfill filter. streamarr-0005 makes the filter of a graph that
       # ffmpeg rebuilds mid-stream continue the output of the graph before it. Without it the
-      # leading silence is written twice and a gap at the rebuild stays a hole. The check makes
-      # its sources with lavfi and compares every output sample with the timeline the filter's
-      # rules give. linuxarm64 binaries cannot run on these runners.
+      # leading silence is written twice, a gap at the rebuild stays a hole, and a rebuild while
+      # the filter writes silence loses samples. The check makes its sources with lavfi and
+      # compares every output sample with the timeline the filter's rules give. linuxarm64
+      # binaries cannot run on these runners.
       - name: Check that agapfill fills gaps and keeps every sample
         if: matrix.target != 'linuxarm64'
         run: |
