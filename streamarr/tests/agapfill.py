@@ -545,6 +545,8 @@ def end_of_timestamp_range(ffmpeg):
     if done.code:
         return ["FFmpeg ended with status %d: %s" % (done.code, last_lines(done.log))]
     stamps = [pts for pts, _, _, _ in frames_of(done.log)]
+    if None in stamps:
+        return ["%d frames have no timestamp" % stamps.count(None)]
     if not stamps or stamps[0] <= 2 ** 63 - 1 - 3 * SECOND:
         raise Unusable("the audio does not reach the end of the timestamp range")
     problems = []
