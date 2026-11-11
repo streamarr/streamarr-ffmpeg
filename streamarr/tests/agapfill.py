@@ -294,13 +294,19 @@ def timeline_problems(ffmpeg, chain, first, runs, *, count, sample_format="s16",
     return check_frames(frames_of(done.log), first, runs, packet_size, rate) + done.result
 
 
+# ffmpeg's exit status for "invalid argument": the low byte of AVERROR(EINVAL), which is -22. A
+# crash or a sanitizer report after the filter's error line ends with another status.
+REFUSED = 234
+
+
 def refusal_problems(ffmpeg, chain, words, *, count):
-    """Expects FFmpeg to fail on `chain` with an error line that holds `words`."""
+    """Expects FFmpeg to refuse `chain` with an error line that holds `words`."""
     counter = COUNTERS["s16"]
     done = execute(filter_command(ffmpeg, counter.lavfi(count, RATE), chain, counter),
                    lambda out: len(out.read()))
-    if done.code == 0:
-        return ["FFmpeg ended with status 0 and wrote %d bytes, expected a failure" % done.result]
+    if done.code != REFUSED:
+        return ["FFmpeg ended with status %d after %d bytes, expected status %d: %s"
+                % (done.code, done.result, REFUSED, last_lines(done.log))]
     errors = [line for line in done.log.splitlines() if "agapfill" in line and words in line]
     if not errors:
         return ["FFmpeg failed without an agapfill error that says '%s': %s"
