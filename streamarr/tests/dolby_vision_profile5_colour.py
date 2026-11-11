@@ -17,7 +17,9 @@ code is compared with the value the profile 5 definition gives, computed here in
     6. Y = round(64 + 876 Y'), Cb = round(512 + 896 Cb), Cr = round(512 + 896 Cr)
 
 A grey patch must be within GREY_TOLERANCE codes of that value and a coloured patch within
-COLOUR_TOLERANCE. Exits 0 when every patch is, 1 when one is not, 2 when the fixture is unusable.
+COLOUR_TOLERANCE. Colours within 1 % of the gamut boundary are not checked. tonemap_cuda runs its
+direct kernels (tradeoff=0): its 3D lookup table interpolates and is not held to these tolerances.
+Exits 0 when every patch is within tolerance, 1 when one is not, 2 when the fixture is unusable.
 """
 import argparse
 import array
@@ -49,7 +51,7 @@ LMS_TO_RGB = ((3.06441879, -2.16597676, 0.10155818),
 FILTERS = {
     "tonemap_cuda": (["-init_hw_device", "cuda=cu", "-filter_hw_device", "cu"],
                      "format=p010le,hwupload,"
-                     "tonemap_cuda=t=smpte2084:p=bt2020:m=bt2020:r=tv:format=p010le,"
+                     "tonemap_cuda=t=smpte2084:p=bt2020:m=bt2020:r=tv:tradeoff=0:format=p010le,"
                      "hwdownload,format=p010le"),
 }
 

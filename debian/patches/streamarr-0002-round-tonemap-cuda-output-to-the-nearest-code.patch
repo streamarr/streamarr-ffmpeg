@@ -1,10 +1,9 @@
 Description: avfilter/tonemap_cuda: read and write samples as whole codes
  tonemap_cuda wrote every 10-bit sample about two codes low. A black
  Dolby Vision frame came out as Y 62, Cb 510, Cr 510 where BT.2100
- gives 64, 512, 512, and PQ peak white tone mapped to BT.709 came out
- as Y 937, Cb 510, Cr 510 where BT.709 gives 940, 512, 512. In 8 bits
- black came out as Y 15, Cb 127, Cr 127. The conversions between
- integer codes and floats did it:
+ gives 64, 512, 512. In 8 bits, black tone mapped to BT.709 came out
+ as Y 15, Cb 127, Cr 127. The conversions between integer codes and
+ floats did it:
  .
  rgb2yuv() rounded a narrow-range sample to a 16-bit code and then
  subtracted output_quantization_offset, 64/65535 for 10-bit output,
@@ -19,10 +18,19 @@ Description: avfilter/tonemap_cuda: read and write samples as whole codes
  that its range scaling takes. The Dolby Vision path used the texture
  value as it was, where the reshaping curves take code / (2^n - 1).
  .
- Quantize at the output depth as BT.2100 table 9 defines it, round to
- the nearest code when writing, clamp to the sample range, and scale
- every texture read to code / (2^n - 1). The quantization offset and
+ Full-range chroma was centred on 0.5, where BT.2100 table 9 puts the
+ achromatic code at 2^(n-1) of 2^n - 1.
+ .
+ Scale narrow-range output at the output depth as BT.2100 table 9
+ defines it and round once, to the nearest code, when the sample is
+ written, after the dither and the chroma average. Clamp to the sample
+ range, scale every texture read to code / (2^n - 1), and centre
+ full-range chroma on 2^(n-1) / (2^n - 1). The quantization offset and
  output constants are no longer needed.
+ .
+ Rounding once also lets the luma dither act on 8-bit narrow-range
+ output. It had no effect there, because the value it received was
+ already a whole code.
 Author: Streamarr
 Forwarded: no
 Last-Update: 2026-11-11
@@ -41,13 +49,19 @@ Index: FFmpeg/libavfilter/cuda/colorspace_common.h
  extern __constant__ const float input_uv_scale;
 -extern __constant__ const float output_quantization_factor;
 -extern __constant__ const float output_quantization_scale;
-+extern __constant__ const int depth_dst;
++extern __constant__ const int depth_src, depth_dst;
  extern __constant__ const bool hlg_eotf_bt2446b;
  
  static __inline__ __device__ float get_luma_src(float3 c, const float3& luma_src) {
-@@ -201,9 +198,6 @@ static __inline__ __device__ float3 delinearize(float3 x)
+@@ -200,17 +197,21 @@ static __inline__ __device__ float3 delinearize(float3 x)
+         return x;
  }
  
++// BT.2100 table 9, full range: the achromatic chroma code 2^(n-1) as a fraction of 2^n - 1.
++static __inline__ __device__ float full_range_chroma_zero(int depth) {
++    return (float)(1 << (depth - 1)) / (float)((1 << depth) - 1);
++}
++
  static __inline__ __device__ float3 yuv2rgb(float y, float u, float v) {
 -    y += y > 0.0f ? input_quantization_offset : 0.0f;
 -    u += u > 0.0f ? input_quantization_offset : 0.0f;
@@ -55,15 +69,27 @@ Index: FFmpeg/libavfilter/cuda/colorspace_common.h
      if (range_src == AVCOL_RANGE_MPEG) {
          y = input_y_scale * y - 0.07305936073f;
          u = input_uv_scale * u - 0.5714285714f;
-@@ -224,30 +218,33 @@ static __inline__ __device__ float3 yuv2lrgb(float3 yuv) {
+         v = input_uv_scale * v - 0.5714285714f;
+     } else {
+-        u -= 0.5f;
+-        v -= 0.5f;
++        // As elsewhere in this filter, 16-bit input is taken as 12-bit.
++        float zero = full_range_chroma_zero(depth_src == 16 ? 12 : depth_src);
++        u -= zero;
++        v -= zero;
+     }
+     float r = y * rgb_matrix[0] + u * rgb_matrix[1] + v * rgb_matrix[2];
+     float g = y * rgb_matrix[3] + u * rgb_matrix[4] + v * rgb_matrix[5];
+@@ -224,30 +225,34 @@ static __inline__ __device__ float3 yuv2lrgb(float3 yuv) {
      return linearize(rgb);
  }
  
-+// BT.2100 table 9: D = Round[(scale * E' + offset) * 2^(n-8)] at the output depth n,
-+// returned as D / (2^n - 1) for sample_to_ushort() to write back as D.
-+static __inline__ __device__ float quantize_narrow(float e, float scale, float offset) {
++// BT.2100 table 9, narrow range: D = Round[(scale * E' + offset) * 2^(n-8)] at the output depth n.
++// Returns the value before rounding as a fraction of 2^n - 1. sample_to_ushort() rounds it once,
++// after the dither and the chroma average.
++static __inline__ __device__ float scale_narrow(float e, float scale, float offset) {
 +    float levels = (float)(1 << (depth_dst - 8));
-+    return floorf((scale * e + offset) * levels + 0.5f) / (float)((1 << depth_dst) - 1);
++    return (scale * e + offset) * levels / (float)((1 << depth_dst) - 1);
 +}
 +
  static __inline__ __device__ float3 rgb2yuv(float r, float g, float b) {
@@ -74,12 +100,14 @@ Index: FFmpeg/libavfilter/cuda/colorspace_common.h
 -        y = floorf(((219.0f * y + 16.0f) * output_quantization_factor) + 0.5f) / output_quantization_scale;
 -        u = floorf(((224.0f * u + 128.0f) * output_quantization_factor) + 0.5f) / output_quantization_scale;
 -        v = floorf(((224.0f * v + 128.0f) * output_quantization_factor) + 0.5f) / output_quantization_scale;
-+        y = quantize_narrow(y, 219.0f, 16.0f);
-+        u = quantize_narrow(u, 224.0f, 128.0f);
-+        v = quantize_narrow(v, 224.0f, 128.0f);
++        y = scale_narrow(y, 219.0f, 16.0f);
++        u = scale_narrow(u, 224.0f, 128.0f);
++        v = scale_narrow(v, 224.0f, 128.0f);
      } else {
-         u += 0.5f;
-         v += 0.5f;
+-        u += 0.5f;
+-        v += 0.5f;
++        u += full_range_chroma_zero(depth_dst);
++        v += full_range_chroma_zero(depth_dst);
      }
 -    y -= y > 0.0f ? output_quantization_offset : 0.0f;
 -    u -= u > 0.0f ? output_quantization_offset : 0.0f;
@@ -91,7 +119,7 @@ Index: FFmpeg/libavfilter/cuda/colorspace_common.h
      float y = r*yuv_matrix[0] + g*yuv_matrix[1] + b*yuv_matrix[2];
      if (range_dst == AVCOL_RANGE_MPEG) {
 -        y = floorf(((219.0f * y + 16.0f) * output_quantization_factor) + 0.5f) / output_quantization_scale;
-+        y = quantize_narrow(y, 219.0f, 16.0f);
++        y = scale_narrow(y, 219.0f, 16.0f);
      }
 -    y -= y > 0.0f ? output_quantization_offset : 0.0f;
      return y;
