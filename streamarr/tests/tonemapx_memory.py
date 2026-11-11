@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Checks that tonemapx's memory does not grow with the number of frames it converts.
+"""Checks that tonemapx frees what it allocates.
 
     python3 streamarr/tests/tonemapx_memory.py --ffmpeg PATH [--cpuflags FLAGS]
+    python3 streamarr/tests/tonemapx_memory.py --ffmpeg PATH --leak-sanitizer [--cpuflags FLAGS]
 
 Everything is synthetic. FFmpeg's libx265 encodes one small black frame, and the stream is that
 access unit again and again, each copy followed by the profile 5 RPU of the colour check
@@ -9,16 +10,21 @@ access unit again and again, each copy followed by the profile 5 RPU of the colo
 transcode worker: the reshape of Dolby Vision profile 5 to BT.2020 PQ, and the tone map to SDR.
 Nothing is encoded after the filter.
 
-The filter may keep a fixed amount of memory however many frames it converts. So the peak
-resident memory of a run of LONG_FRAMES frames may exceed that of a run of SHORT_FRAMES by at most
-BYTES_PER_FRAME for each further frame. One copy of the parsed RPU, struct FFDOVIMetadataRemap, is
-2,728 bytes, so a filter that keeps one per frame grows more than five times faster than allowed.
-Both runs decode and filter on one thread each, which keeps the memory that does not depend on the
-frame count equal.
+Without --leak-sanitizer the check runs with any build, and measures. The filter may keep a fixed
+amount of memory however many frames it converts. So the peak resident memory of a run of
+LONG_FRAMES frames may exceed that of a run of SHORT_FRAMES by at most BYTES_PER_FRAME for each
+further frame. One copy of the parsed RPU, struct FFDOVIMetadataRemap, is 2,728 bytes, so a filter
+that keeps one per frame grows more than five times faster than allowed. Both runs decode and
+filter on one thread each, which keeps the memory that does not depend on the frame count equal.
+
+With --leak-sanitizer the check is exact, and needs a build with AddressSanitizer and libx265
+(configure --toolchain=gcc-asan or clang-asan). It runs SANITIZED_FRAMES frames with RPUs, and as
+many without, through both chains, and LeakSanitizer must find every allocation freed. The release
+archives are built without the sanitizer, so this mode runs only where someone builds with it.
 
 --cpuflags passes FFmpeg's -cpuflags to the filtering runs: 0 for plain C, sse4.2 for that path on
 a CPU that also has AVX2.
-Exits 0 when memory stays level, 1 when it grows, 2 when the check cannot run.
+Exits 0 when memory is freed, 1 when it is not, 2 when the check cannot run.
 """
 import argparse
 import os
@@ -36,6 +42,7 @@ CHAINS = {
 }
 SHORT_FRAMES, LONG_FRAMES = 2000, 42000
 BYTES_PER_FRAME = 512
+SANITIZED_FRAMES = 48
 # ru_maxrss is in bytes on macOS and in kilobytes on Linux.
 PEAK_UNIT = 1 if sys.platform == "darwin" else 1024
 
@@ -98,22 +105,65 @@ def growth_failures(arguments, stream):
     return failures
 
 
+def require_sanitizer(arguments):
+    configuration = run([arguments.ffmpeg, "-hide_banner", "-buildconf"]).decode()
+    if "asan" not in configuration and "-fsanitize=address" not in configuration:
+        sys.stderr.write("--leak-sanitizer needs a build configured with --toolchain=gcc-asan "
+                         "or clang-asan.\n")
+        sys.exit(2)
+
+
+def sanitizer_failures(arguments, streams):
+    environment = dict(os.environ, ASAN_OPTIONS="detect_leaks=1")
+    failures = 0
+    for source, stream in streams.items():
+        for name, graph in CHAINS.items():
+            result = subprocess.run(filtering(arguments, stream, graph, SANITIZED_FRAMES),
+                                    env=environment, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.PIPE)
+            report = result.stderr.decode(errors="replace").splitlines()
+            leaks = [index for index, line in enumerate(report) if " leak of " in line]
+            if result.returncode != 0 and not leaks:
+                sys.stderr.write("\n".join(report))
+                sys.stderr.write("\nFFmpeg exited with %d.\n" % result.returncode)
+                sys.exit(2)
+            failures += bool(leaks)
+            if not leaks:
+                print("%s, %s: every allocation was freed" % (source, name))
+            for index in leaks:
+                # The innermost frame of the allocation's stack that is in the filter's own file.
+                site = next((frame.split(" in ", 1)[1] for frame in report[index + 1:index + 8]
+                             if "vf_tonemapx" in frame), "outside vf_tonemapx.c")
+                print("%s, %s: %s %s" % (source, name, report[index].strip().rstrip(":"), site))
+    return failures
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--ffmpeg", required=True)
     parser.add_argument("--cpuflags", help="FFmpeg's -cpuflags for the filtering runs")
+    parser.add_argument("--leak-sanitizer", action="store_true",
+                        help="use LeakSanitizer; needs a build with AddressSanitizer")
     arguments = parser.parse_args()
+    if arguments.leak_sanitizer:
+        require_sanitizer(arguments)
     with tempfile.TemporaryDirectory() as folder:
-        base, profile5 = (os.path.join(folder, name) for name in ("base.hevc", "profile5.hevc"))
+        base, profile5, plain = (os.path.join(folder, name)
+                                 for name in ("base.hevc", "profile5.hevc", "plain.hevc"))
         run([arguments.ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
              "-f", "lavfi", "-i", "color=c=black:s=64x64:r=24,format=yuv420p10le",
              "-frames:v", "1", "-color_range", "pc", "-c:v", "libx265",
              "-x265-params", "lossless=1:range=full:info=0:log-level=error", "-f", "hevc", base])
         with open(base, "rb") as file:
             access_unit = file.read()
-        write_stream(profile5, access_unit + rpu_nal(), LONG_FRAMES)
+        frames = SANITIZED_FRAMES if arguments.leak_sanitizer else LONG_FRAMES
+        write_stream(profile5, access_unit + rpu_nal(), frames)
         require_reshaped_frames(arguments, profile5)
-        failures = growth_failures(arguments, profile5)
+        if arguments.leak_sanitizer:
+            write_stream(plain, access_unit, frames)
+            failures = sanitizer_failures(arguments, {"with RPUs": profile5, "without RPUs": plain})
+        else:
+            failures = growth_failures(arguments, profile5)
     sys.exit(1 if failures else 0)
 
 

@@ -1,0 +1,31 @@
+Description: avfilter/tonemapx: build only the input format list that the filter keeps
+ With an output format named, query_formats() built the list of all
+ the filter's input formats and attached it to the input link. A few
+ lines on it built the list of the input formats whose plane layout
+ matches the output format and attached that one to the same link.
+ ff_formats_ref() stores a list in the link without releasing the list
+ the link held, so the first list stayed allocated and unreachable: 48
+ bytes each time a graph with the filter is configured. With the
+ default, format=same, the filter attaches one list and did not leak.
+ .
+ Build only the second list. The formats the filter accepts and offers
+ do not change.
+Author: Streamarr
+Forwarded: no
+Last-Update: 2026-11-11
+---
+Index: FFmpeg/libavfilter/vf_tonemapx.c
+===================================================================
+--- FFmpeg.orig/libavfilter/vf_tonemapx.c
++++ FFmpeg/libavfilter/vf_tonemapx.c
+@@ -1711,10 +1711,6 @@ static int query_formats(AVFilterContext *ctx)
+         s->format = AV_PIX_FMT_NONE;
+     } else {
+         int i, j = 0;
+-        formats = ff_make_format_list(in_pix_fmts);
+-        res = ff_formats_ref(formats, &ctx->inputs[0]->outcfg.formats);
+-        if (res < 0)
+-            return res;
+         if (s->format == AV_PIX_FMT_NONE) {
+             av_log(ctx, AV_LOG_ERROR, "Unrecognized pixel format: %s\n", s->format_str);
+             return AVERROR(EINVAL);
