@@ -1,0 +1,429 @@
+Description: avfilter: add agapfill, which fills gaps between audio frames with silence
+ ffmpeg cuts the frames of an audio encoder with a fixed frame length by
+ sample count. receive_samples() in fftools/sync_queue.c takes the next
+ samples whatever their timestamps say, and audio_frame_queue in
+ libavcodec stamps packets on the same assumption. When audio frames with
+ a gap between them reach such an encoder, the first samples after the
+ gap complete the frame before it and play early by the length of the
+ gap. A resampler has the same fault through its delay line. No stock
+ filter writes the gap as silence without also trimming audio whose
+ timestamps overlap and holding the whole gap in memory.
+ .
+ agapfill makes the timeline continuous ahead of such consumers and
+ never drops a sample. It compares the timestamp of each frame with the
+ end of the previous frame. A forward step above the threshold, 2 ms by
+ default, is a gap, and the filter writes silence up to the frame's own
+ timestamp. Any other step, an overlap or a backward step included,
+ writes no silence, and the frame follows the previous one. Each step is
+ decided alone, so drift never adds up to a gap. The start option puts
+ silence from a given time up to the first frame.
+ .
+ The filter writes silence one frame at a time, when the next filter
+ asks for a frame, so memory does not grow with the gap. max_gap makes a
+ longer gap an error.
+ .
+ streamarr/tests/agapfill.py checks the filter.
+Author: Streamarr
+Forwarded: no
+Last-Update: 2026-11-11
+---
+Index: FFmpeg/doc/filters.texi
+===================================================================
+--- FFmpeg.orig/doc/filters.texi
++++ FFmpeg/doc/filters.texi
+@@ -2073,6 +2073,90 @@ Set softness applied inside thresholding
+ 
+ This filter supports the all above options as @ref{commands}.
+ 
++@section agapfill
++
++Fill gaps between audio frames with silence, so that the output is one
++continuous run of samples.
++
++Some encoders and filters count samples and ignore timestamps. When two audio
++frames with a gap between them reach one of those, the samples after the gap
++follow the samples before it directly, and play early by the length of the
++gap. This filter writes the missing time as silence first.
++
++The filter never drops or trims a sample. It compares the timestamp of each
++frame with the end of the previous frame, which is that frame's own timestamp
++plus its length.
++
++@itemize
++@item
++A forward step longer than @option{threshold} is a gap. The filter writes
++silence up to the timestamp of the later frame, so that frame is output at its
++own time. When earlier overlaps have already carried the output past that
++timestamp, the filter writes no silence.
++
++@item
++Any other step writes no silence, and the later frame follows the previous
++frame directly. That covers rounded timestamps, timestamps that drift against
++the sample count, frames that overlap and timestamps that go backward. After
++such steps the output times differ from the input timestamps by the sum of
++the steps, until the next gap puts a frame at its own time again.
++@end itemize
++
++Each step is decided alone. Steps at or below the threshold never add up to a
++gap.
++
++The output time base is one sample, and each output frame begins where the
++previous one ends. A frame without a timestamp follows the previous frame
++directly. The filter writes no silence after the last frame. Use @code{apad}
++for that.
++
++The filter writes silence one frame at a time, when the next filter asks for
++a frame. It holds at most one input frame and one frame of silence, however
++long the gap is.
++
++The filter accepts the following options:
++
++@table @option
++@item threshold
++Set the longest forward step between two frames that is not a gap. Default is
++2 milliseconds. When the input time base is not one sample, the value must be
++at least one tick of that time base plus one sample. Timestamps rounded to
++that time base differ by that much where the audio has no gap.
++
++@item start
++Set the time at which the output begins when the first frame is later. The
++filter writes silence from this time up to the first frame, however short
++that stretch is. A time between two samples counts as the later sample. When
++the first frame is at or before this time, the filter writes no leading
++silence and outputs the frame whole. By default the output begins at the first
++frame.
++
++@item max_gap
++Set the longest run of silence the filter may write. The filter fails when a
++gap or the leading silence is longer. Default is 0, which sets no limit.
++
++@item packet_size
++Set the number of samples in each frame of silence. Default is 4096.
++@end table
++
++@subsection Examples
++
++@itemize
++@item
++Fill every gap in the audio ahead of an encoder that takes frames of a fixed
++length:
++@example
++ffmpeg -i input.mkv -af agapfill -c:a flac output.flac
++@end example
++
++@item
++Also write silence from zero up to audio that starts late, and fail on a gap
++of more than ten minutes:
++@example
++agapfill=start=0:max_gap=600
++@end example
++@end itemize
++
+ @section agate
+ 
+ A gate is mainly used to reduce lower parts of a signal. This kind of signal
+Index: FFmpeg/libavfilter/Makefile
+===================================================================
+--- FFmpeg.orig/libavfilter/Makefile
++++ FFmpeg/libavfilter/Makefile
+@@ -66,6 +66,7 @@ OBJS-$(CONFIG_AFIR_FILTER)
+ OBJS-$(CONFIG_AFORMAT_FILTER)                += af_aformat.o
+ OBJS-$(CONFIG_AFREQSHIFT_FILTER)             += af_afreqshift.o
+ OBJS-$(CONFIG_AFWTDN_FILTER)                 += af_afwtdn.o
++OBJS-$(CONFIG_AGAPFILL_FILTER)               += af_agapfill.o
+ OBJS-$(CONFIG_AGATE_FILTER)                  += af_agate.o
+ OBJS-$(CONFIG_AIIR_FILTER)                   += af_aiir.o
+ OBJS-$(CONFIG_AINTEGRAL_FILTER)              += af_aderivative.o
+Index: FFmpeg/libavfilter/af_agapfill.c
+===================================================================
+--- /dev/null
++++ FFmpeg/libavfilter/af_agapfill.c
+@@ -0,0 +1,276 @@
++/*
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++/**
++ * @file
++ * Fill gaps between audio frames with silence, without dropping a sample.
++ */
++
++#include "libavutil/common.h"
++#include "libavutil/mathematics.h"
++#include "libavutil/opt.h"
++#include "libavutil/samplefmt.h"
++
++#include "audio.h"
++#include "avfilter.h"
++#include "filters.h"
++
++typedef struct AGapFillContext {
++    const AVClass *class;
++
++    int64_t threshold;      ///< longest forward step that is not a gap, in microseconds
++    int64_t start;          ///< time from which silence leads the first frame, in microseconds; INT64_MAX when unset
++    int64_t max_gap;        ///< longest silence to write, in microseconds; 0 for no limit
++    int packet_size;        ///< samples in each frame of silence
++
++    int started;            ///< the first frame has arrived
++    int64_t out_pos;        ///< timestamp of the next output sample, in samples
++    int64_t in_end;         ///< end of the previous input frame by its own timestamp, in samples
++    int64_t silence_left;   ///< samples of silence still to write before the held frame
++    AVFrame *held;          ///< input frame that waits for the silence before it
++
++    int64_t nb_gaps;        ///< runs of silence written, the leading one included
++    int64_t nb_silence;     ///< samples of silence in those runs
++    int64_t nb_joined;      ///< steps other than zero that wrote no silence
++    int64_t max_offset;     ///< largest distance of a frame from its own timestamp, in samples
++} AGapFillContext;
++
++#define OFFSET(x) offsetof(AGapFillContext, x)
++#define A AV_OPT_FLAG_AUDIO_PARAM | AV_OPT_FLAG_FILTERING_PARAM
++
++static const AVOption agapfill_options[] = {
++    { "threshold",   "set the longest forward step between frames that is not a gap", OFFSET(threshold),   AV_OPT_TYPE_DURATION, { .i64 = 2000 },      0,         INT64_MAX, A },
++    { "start",       "set the time from which silence leads the first frame",         OFFSET(start),       AV_OPT_TYPE_DURATION, { .i64 = INT64_MAX }, INT64_MIN, INT64_MAX, A },
++    { "max_gap",     "set the longest silence to write, 0 for no limit",              OFFSET(max_gap),     AV_OPT_TYPE_DURATION, { .i64 = 0 },         0,         INT64_MAX, A },
++    { "packet_size", "set the number of samples in each frame of silence",            OFFSET(packet_size), AV_OPT_TYPE_INT,      { .i64 = 4096 },      1,         65536,     A },
++    { NULL }
++};
++
++AVFILTER_DEFINE_CLASS(agapfill);
++
++static int is_longer(const AVFilterLink *link, int64_t samples, int64_t microseconds)
++{
++    return av_compare_ts(samples, (AVRational){ 1, link->sample_rate },
++                         microseconds, AV_TIME_BASE_Q) > 0;
++}
++
++/**
++ * Find where the frame begins on the output timeline and how much silence
++ * the filter writes before the frame. The filter then holds the frame.
++ */
++static int place_frame(AVFilterContext *ctx, AVFrame *frame)
++{
++    AVFilterLink *inlink = ctx->inputs[0];
++    AGapFillContext *s = ctx->priv;
++    const AVRational sample = { 1, inlink->sample_rate };
++    int64_t pts = AV_NOPTS_VALUE, silence = 0;
++
++    if (frame->pts != AV_NOPTS_VALUE)
++        pts = av_rescale_q_rnd(frame->pts, inlink->time_base, sample, AV_ROUND_NEAR_INF);
++
++    if (!s->started) {
++        int64_t start = INT64_MAX;
++
++        if (s->start != INT64_MAX)
++            start = av_rescale_q_rnd(s->start, AV_TIME_BASE_Q, sample, AV_ROUND_UP);
++        if (pts == AV_NOPTS_VALUE)
++            pts = start != INT64_MAX ? start : 0;
++        /* No threshold applies here: the timeline begins exactly at start. */
++        if (pts > start)
++            silence = av_sat_sub64(pts, start);
++        s->out_pos = pts - silence;
++        s->started = 1;
++    } else {
++        int64_t step;
++
++        if (pts == AV_NOPTS_VALUE)
++            pts = s->in_end;
++        /* The step alone decides. Steps below the threshold never add up to
++         * a gap, and an overlap or a backward step trims nothing. */
++        step = av_sat_sub64(pts, s->in_end);
++        if (step > 0 && is_longer(inlink, step, s->threshold))
++            silence = FFMAX(av_sat_sub64(pts, s->out_pos), 0);
++        else if (step)
++            s->nb_joined++;
++    }
++
++    if (silence && s->max_gap > 0 && is_longer(inlink, silence, s->max_gap)) {
++        av_log(ctx, AV_LOG_ERROR,
++               "The frame at sample %"PRId64" needs %"PRId64" samples of silence "
++               "before it, which is longer than max_gap.\n", pts, silence);
++        return AVERROR(EINVAL);
++    }
++    if (silence) {
++        s->nb_gaps++;
++        s->nb_silence += silence;
++        av_log(ctx, AV_LOG_VERBOSE,
++               "Writing %"PRId64" samples of silence from sample %"PRId64".\n",
++               silence, s->out_pos);
++    }
++
++    s->max_offset   = FFMAX(s->max_offset,
++                            FFABS(av_sat_sub64(av_sat_add64(s->out_pos, silence), pts)));
++    s->in_end       = av_sat_add64(pts, frame->nb_samples);
++    s->silence_left = silence;
++    s->held         = frame;
++
++    return 0;
++}
++
++static int send_silence(AVFilterContext *ctx)
++{
++    AVFilterLink *outlink = ctx->outputs[0];
++    AGapFillContext *s = ctx->priv;
++    const int nb_samples = FFMIN(s->silence_left, s->packet_size);
++    AVFrame *frame = ff_get_audio_buffer(outlink, nb_samples);
++
++    if (!frame)
++        return AVERROR(ENOMEM);
++
++    av_samples_set_silence(frame->extended_data, 0, nb_samples,
++                           frame->ch_layout.nb_channels, frame->format);
++    frame->pts      = s->out_pos;
++    frame->duration = nb_samples;
++
++    s->out_pos      += nb_samples;
++    s->silence_left -= nb_samples;
++
++    return ff_filter_frame(outlink, frame);
++}
++
++static int send_held(AVFilterContext *ctx)
++{
++    AGapFillContext *s = ctx->priv;
++    AVFrame *frame = s->held;
++
++    s->held         = NULL;
++    frame->pts      = s->out_pos;
++    frame->duration = frame->nb_samples;
++
++    s->out_pos += frame->nb_samples;
++
++    return ff_filter_frame(ctx->outputs[0], frame);
++}
++
++static int activate(AVFilterContext *ctx)
++{
++    AVFilterLink *inlink = ctx->inputs[0];
++    AVFilterLink *outlink = ctx->outputs[0];
++    AGapFillContext *s = ctx->priv;
++    int64_t pts;
++    int ret, status;
++
++    FF_FILTER_FORWARD_STATUS_BACK(outlink, inlink);
++
++    if (!s->held) {
++        AVFrame *frame;
++
++        ret = ff_inlink_consume_frame(inlink, &frame);
++        if (ret < 0)
++            return ret;
++        if (ret > 0) {
++            ret = place_frame(ctx, frame);
++            if (ret < 0) {
++                av_frame_free(&frame);
++                return ret;
++            }
++        }
++    }
++
++    if (s->held) {
++        if (s->silence_left) {
++            /* One frame of silence for each frame the next filter asks for,
++             * so that no part of a long gap waits in a queue. */
++            if (!ff_outlink_frame_wanted(outlink))
++                return FFERROR_NOT_READY;
++            ret = send_silence(ctx);
++            if (ret < 0 || s->silence_left)
++                return ret;
++        }
++        return send_held(ctx);
++    }
++
++    if (ff_inlink_acknowledge_status(inlink, &status, &pts)) {
++        if (s->started)
++            pts = s->out_pos;
++        else if (pts != AV_NOPTS_VALUE)
++            pts = av_rescale_q(pts, inlink->time_base, outlink->time_base);
++        ff_outlink_set_status(outlink, status, pts);
++        return 0;
++    }
++
++    FF_FILTER_FORWARD_WANTED(outlink, inlink);
++
++    return FFERROR_NOT_READY;
++}
++
++static int config_output(AVFilterLink *outlink)
++{
++    AVFilterContext *ctx = outlink->src;
++    AVFilterLink *inlink = ctx->inputs[0];
++    AGapFillContext *s = ctx->priv;
++    const AVRational sample = { 1, inlink->sample_rate };
++
++    /* A timestamp in another time base is up to one of its ticks away from
++     * the sample it stamps, and rounding it to a sample moves it by up to one
++     * sample more. A threshold below that sum would read rounding as gaps. */
++    if (av_cmp_q(inlink->time_base, sample) &&
++        av_compare_ts(s->threshold, AV_TIME_BASE_Q,
++                      1, av_add_q(inlink->time_base, sample)) < 0) {
++        av_log(ctx, AV_LOG_ERROR,
++               "The threshold is below one tick of the input time base %d/%d "
++               "plus one sample, so rounded timestamps would count as gaps.\n",
++               inlink->time_base.num, inlink->time_base.den);
++        return AVERROR(EINVAL);
++    }
++
++    outlink->time_base = sample;
++
++    return 0;
++}
++
++static av_cold void uninit(AVFilterContext *ctx)
++{
++    AGapFillContext *s = ctx->priv;
++
++    av_frame_free(&s->held);
++    if (s->started)
++        av_log(ctx, AV_LOG_VERBOSE,
++               "gaps:%"PRId64" silence_samples:%"PRId64" joined_steps:%"PRId64" "
++               "max_offset_samples:%"PRId64"\n",
++               s->nb_gaps, s->nb_silence, s->nb_joined, s->max_offset);
++}
++
++static const AVFilterPad agapfill_outputs[] = {
++    {
++        .name         = "default",
++        .type         = AVMEDIA_TYPE_AUDIO,
++        .config_props = config_output,
++    },
++};
++
++const FFFilter ff_af_agapfill = {
++    .p.name        = "agapfill",
++    .p.description = NULL_IF_CONFIG_SMALL("Fill gaps between audio frames with silence."),
++    .p.priv_class  = &agapfill_class,
++    .priv_size     = sizeof(AGapFillContext),
++    .activate      = activate,
++    .uninit        = uninit,
++    FILTER_INPUTS(ff_audio_default_filterpad),
++    FILTER_OUTPUTS(agapfill_outputs),
++};
+Index: FFmpeg/libavfilter/allfilters.c
+===================================================================
+--- FFmpeg.orig/libavfilter/allfilters.c
++++ FFmpeg/libavfilter/allfilters.c
+@@ -51,6 +51,7 @@ extern const FFFilter ff_af_afir;
+ extern const FFFilter ff_af_aformat;
+ extern const FFFilter ff_af_afreqshift;
+ extern const FFFilter ff_af_afwtdn;
++extern const FFFilter ff_af_agapfill;
+ extern const FFFilter ff_af_agate;
+ extern const FFFilter ff_af_aiir;
+ extern const FFFilter ff_af_aintegral;
