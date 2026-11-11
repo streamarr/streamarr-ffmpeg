@@ -187,9 +187,10 @@ jobs:
             -map 1:a -c copy -f null - \
             -map 1:v -c copy -f null -
 
-      # streamarr-0004 adds the agapfill filter. The check makes its sources with lavfi and
-      # compares every output sample with the timeline the filter's rules give. linuxarm64
-      # binaries cannot run on these runners.
+      # streamarr-0004 adds the agapfill filter. Without streamarr-0005 a filter graph that ffmpeg
+      # rebuilds mid-stream writes the leading silence a second time. The check makes its sources
+      # with lavfi and compares every output sample with the timeline the filter's rules give.
+      # linuxarm64 binaries cannot run on these runners.
       - name: Check that agapfill fills gaps and keeps every sample
         if: matrix.target != 'linuxarm64'
         run: |

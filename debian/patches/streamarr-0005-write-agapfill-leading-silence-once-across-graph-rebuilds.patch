@@ -1,0 +1,136 @@
+Description: fftools/ffmpeg_filter: tell agapfill when a rebuilt graph continues an earlier one
+ ffmpeg builds a new filter graph when the parameters of the audio
+ change mid-stream, for example when an AC-3 stream changes from 5.1 to
+ stereo. The agapfill filter of the new graph starts from nothing. With
+ its start option it wrote the leading silence a second time, from the
+ start time up to the frame at the change. A source of 10.05 s that
+ begins at 2 s came out as 19.07 s.
+ .
+ configure_filtergraph() now sends the command "resume" to every
+ agapfill filter of a graph that replaces an earlier one. The filter
+ then ignores start and begins at its first frame.
+ .
+ A gap that falls exactly at such a change is not filled, because the
+ new filter does not know where the old one ended. ffmpeg also drops
+ the samples that the filters of the old graph still held.
+Author: Streamarr
+Forwarded: no
+Last-Update: 2026-11-11
+---
+Index: FFmpeg/doc/filters.texi
+===================================================================
+--- FFmpeg.orig/doc/filters.texi
++++ FFmpeg/doc/filters.texi
+@@ -2157,6 +2157,19 @@ agapfill=start=0:max_gap=600
+ @end example
+ @end itemize
+ 
++@subsection Commands
++
++This filter supports the following command:
++@table @option
++@item resume
++Tell the filter that its graph continues the output of an earlier graph. The
++filter then ignores @option{start} and begins at its first frame, because the
++earlier graph has already written the leading silence. The command takes no
++argument and has no effect after the first frame. @command{ffmpeg} sends it
++to every agapfill filter of a filter graph that it builds in place of an
++earlier one, for example when the channel layout of the input changes.
++@end table
++
+ @section agate
+ 
+ A gate is mainly used to reduce lower parts of a signal. This kind of signal
+Index: FFmpeg/fftools/ffmpeg_filter.c
+===================================================================
+--- FFmpeg.orig/fftools/ffmpeg_filter.c
++++ FFmpeg/fftools/ffmpeg_filter.c
+@@ -2085,6 +2085,7 @@ static int configure_filtergraph(FilterG
+     int ret = AVERROR_BUG, i, simple = filtergraph_is_simple(fg);
+     int have_input_eof = 0;
+     const char *graph_desc = fg->graph_desc;
++    const int rebuilt = !!fgt->graph;
+ 
+     cleanup_filtergraph(fg, fgt);
+     fgt->graph = avfilter_graph_alloc();
+@@ -2158,6 +2159,11 @@ static int configure_filtergraph(FilterG
+     if ((ret = avfilter_graph_config(fgt->graph, NULL)) < 0)
+         goto fail;
+ 
++    /* The graph that this one replaces has already written the silence that
++     * leads the audio. An agapfill filter must not write that silence again. */
++    if (rebuilt)
++        avfilter_graph_send_command(fgt->graph, "agapfill", "resume", NULL, NULL, 0, 0);
++
+     fgp->is_meta = graph_is_meta(fgt->graph);
+ 
+     /* limit the lists of allowed formats to the ones selected, to
+Index: FFmpeg/libavfilter/af_agapfill.c
+===================================================================
+--- FFmpeg.orig/libavfilter/af_agapfill.c
++++ FFmpeg/libavfilter/af_agapfill.c
+@@ -21,6 +21,8 @@
+  * Fill gaps between audio frames with silence, without dropping a sample.
+  */
+ 
++#include <string.h>
++
+ #include "libavutil/common.h"
+ #include "libavutil/mathematics.h"
+ #include "libavutil/opt.h"
+@@ -39,6 +41,7 @@ typedef struct AGapFillContext {
+     int packet_size;        ///< samples in each frame of silence
+ 
+     int started;            ///< the first frame has arrived
++    int resumed;            ///< the graph replaces an earlier one, which wrote the leading silence
+     int64_t out_pos;        ///< timestamp of the next output sample, in samples
+     int64_t in_end;         ///< end of the previous input frame by its own timestamp, in samples
+     int64_t silence_left;   ///< samples of silence still to write before the held frame
+@@ -86,7 +89,7 @@ static int place_frame(AVFilterContext *
+     if (!s->started) {
+         int64_t start = INT64_MAX;
+ 
+-        if (s->start != INT64_MAX)
++        if (s->start != INT64_MAX && !s->resumed)
+             start = av_rescale_q_rnd(s->start, AV_TIME_BASE_Q, sample, AV_ROUND_UP);
+         if (pts == AV_NOPTS_VALUE)
+             pts = start != INT64_MAX ? start : 0;
+@@ -244,6 +247,18 @@ static int config_output(AVFilterLink *o
+     return 0;
+ }
+ 
++static int process_command(AVFilterContext *ctx, const char *cmd, const char *args,
++                           char *res, int res_len, int flags)
++{
++    AGapFillContext *s = ctx->priv;
++
++    if (strcmp(cmd, "resume"))
++        return AVERROR(ENOSYS);
++    s->resumed = 1;
++
++    return 0;
++}
++
+ static av_cold void uninit(AVFilterContext *ctx)
+ {
+     AGapFillContext *s = ctx->priv;
+@@ -265,12 +280,13 @@ static const AVFilterPad agapfill_output
+ };
+ 
+ const FFFilter ff_af_agapfill = {
+-    .p.name        = "agapfill",
+-    .p.description = NULL_IF_CONFIG_SMALL("Fill gaps between audio frames with silence."),
+-    .p.priv_class  = &agapfill_class,
+-    .priv_size     = sizeof(AGapFillContext),
+-    .activate      = activate,
+-    .uninit        = uninit,
++    .p.name          = "agapfill",
++    .p.description   = NULL_IF_CONFIG_SMALL("Fill gaps between audio frames with silence."),
++    .p.priv_class    = &agapfill_class,
++    .priv_size       = sizeof(AGapFillContext),
++    .activate        = activate,
++    .uninit          = uninit,
++    .process_command = process_command,
+     FILTER_INPUTS(ff_audio_default_filterpad),
+     FILTER_OUTPUTS(agapfill_outputs),
+ };

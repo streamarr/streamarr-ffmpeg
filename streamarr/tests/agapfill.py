@@ -739,6 +739,53 @@ def formats(ffmpeg):
     return problems
 
 
+# --- When ffmpeg rebuilds the filter graph ------------------------------------------------------
+
+@check("graph-rebuild", "writes the leading silence once when ffmpeg rebuilds the filter graph")
+def graph_rebuild(ffmpeg):
+    # An AC-3 stream that changes from 5.1 to stereo after 5 s, stamped 2 s late. ffmpeg builds a
+    # new filter graph at the change, and the new agapfill starts from nothing. Unless ffmpeg tells
+    # it that the graph continues an earlier one, it writes silence from zero a second time.
+    lead = 2 * SECOND
+    with tempfile.TemporaryDirectory() as work:
+        stream = b""
+        for layout, channels in (("5.1", 6), ("stereo", 2)):
+            tones = "|".join("0.3*sin(2*PI*%d*t)" % (220 * (channel + 1))
+                             for channel in range(channels))
+            path = os.path.join(work, layout + ".ac3")
+            done = execute([ffmpeg, "-nostdin", "-hide_banner", "-v", "error", "-f", "lavfi", "-i",
+                            "aevalsrc=exprs='%s':s=%d:c=%s:d=5" % (tones, RATE, layout),
+                            "-c:a", "ac3", "-b:a", "384k", "-f", "ac3", "-y", path])
+            if done.code:
+                raise Unusable("FFmpeg could not encode AC-3: %s" % last_lines(done.log))
+            with open(path, "rb") as part:
+                stream += part.read()
+        joined = os.path.join(work, "joined.ac3")
+        with open(joined, "wb") as out:
+            out.write(stream)
+
+        def decode(filters):
+            return execute([ffmpeg, "-nostdin", "-hide_banner", "-nostats", "-v", "info", "-i",
+                            joined, "-af", chain(filters, "ashowinfo"), "-ac", "2",
+                            "-c:a", "pcm_s16le", "-f", "s16le", "-"], lambda out: out.read())
+
+        plain = decode("anull")
+        filled = decode(chain("asetpts=PTS+%d" % lead, "agapfill=start=0"))
+    if plain.code or "Reconfiguring filter graph" not in plain.log:
+        raise Unusable("ffmpeg did not rebuild the filter graph at the change of layout")
+    if filled.code:
+        return ["FFmpeg ended with status %d: %s" % (filled.code, last_lines(filled.log))]
+    source = sum(length for _, length, _, _ in frames_of(plain.log))
+    problems = check_frames(frames_of(filled.log), 0, [silence(lead), real(0, source)],
+                            DEFAULT_PACKET, RATE)
+    if len(filled.result) != (lead + source) * 4:
+        problems.append("the output holds %d samples, expected %d of silence and %d of source"
+                        % (len(filled.result) // 4, lead, source))
+    if any(filled.result[:lead * 4]):
+        problems.append("the first 2 s are not silence")
+    return problems
+
+
 CHECKS_BY_NAME = {name: (title, function) for name, title, function in CHECKS}
 
 
