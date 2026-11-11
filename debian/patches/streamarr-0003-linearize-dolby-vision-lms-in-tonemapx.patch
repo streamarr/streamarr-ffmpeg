@@ -17,14 +17,18 @@ Description: avfilter/tonemapx: linearize Dolby Vision L'M'S' before the LMS to 
  enhancement layer residual, profile 5 among them.
  .
  Apply the PQ EOTF to L'M'S', then the matrix, then the PQ OETF. Both
- curves are read from tables with linear interpolation: 16384 steps of
- the signal for the EOTF, and 64 steps per octave of the linear value
- over 40 octaves for the OETF. The C, SSE4.2 and NEON paths share one
- scalar routine, and the AVX2 path gathers from the same tables.
+ curves are read from tables with linear interpolation: 16384 steps
+ per unit of the signal for the EOTF, and 64 steps per octave of the
+ linear value over 40 octaves for the OETF. The C, SSE4.2 and NEON
+ paths share one scalar routine, and the AVX2 path gathers from the
+ same tables.
  .
- L'M'S' is clamped to the PQ signal range before the EOTF, and linear
- RGB below zero comes out as zero on every path. The vector paths used
- to carry negative R'G'B' on, where the C path already clipped it.
+ The EOTF table runs to a signal of 1.375. L'M'S' of a bright saturated
+ pixel is above 1, up to 1.36 with the profile 5 matrix, and clamping
+ it to 1 before the matrix gives a different colour from the GPU
+ filters, which do not clamp there. Linear RGB below zero comes out as
+ zero on every path. The vector paths used to carry negative R'G'B'
+ on, where the C path already clipped it.
 Author: Streamarr
 Forwarded: no
 Last-Update: 2026-11-11
@@ -225,7 +229,7 @@ Index: FFmpeg/libavfilter/vf_tonemapx.c
 +    }
 +
 +    for (unsigned i = 0; i < PQ_EOTF_LUT_SIZE; i++) {
-+        double p = pow(FFMIN(i / (double)PQ_EOTF_LUT_STEPS, 1.0), 1.0 / m2);
++        double p = pow(FFMIN(i, PQ_EOTF_LUT_STEPS) / (double)PQ_EOTF_LUT_UNIT, 1.0 / m2);
 +        eotf[i] = pow(FFMAX(p - c1, 0.0) / (c2 - c3 * p), 1.0 / m1);
 +    }
 +    for (unsigned i = 0; i < PQ_OETF_LUT_SIZE; i++) {
@@ -305,7 +309,7 @@ Index: FFmpeg/libavfilter/vf_tonemapx.h
  
  #define X86_64_V2 __attribute__((target("sse4.2")))
  #define X86_64_V3 __attribute__((target("avx2,fma")))
-@@ -83,8 +85,72 @@ typedef struct TonemapIntParams {
+@@ -83,8 +85,76 @@ typedef struct TonemapIntParams {
      float *dovi_pbuf;
      double (*lms2rgb_matrix)[3][3];
      float (*ycc_offset)[3];
@@ -315,12 +319,16 @@ Index: FFmpeg/libavfilter/vf_tonemapx.h
  
 +/*
 + * Tables for the PQ EOTF and its inverse, both with 1.0 as 10000 nits.
-+ * The EOTF table has one entry per step of 1 / PQ_EOTF_LUT_STEPS of the signal, and one more
-+ * so that the entry above the last can be read. The inverse table has 64 entries per octave of
++ * The EOTF table has one entry per 1 / PQ_EOTF_LUT_UNIT of the signal up to PQ_EOTF_LUT_MAX, and
++ * one more so that the entry above the last can be read. It runs past 1.0 because L'M'S' does:
++ * with the profile 5 matrix a saturated bright pixel reaches 1.36, and the EOTF formula still
++ * holds there. The inverse table has 64 entries per octave of
 + * the linear value from 2^-PQ_OETF_LUT_OCTAVES up to 1.0, at the values whose float bit patterns
 + * are 2^17 apart, and one more for the same reason. Both are read with linear interpolation.
 + */
-+#define PQ_EOTF_LUT_STEPS 16384
++#define PQ_EOTF_LUT_UNIT 16384
++#define PQ_EOTF_LUT_MAX 1.375f
++#define PQ_EOTF_LUT_STEPS 22528 // PQ_EOTF_LUT_UNIT * PQ_EOTF_LUT_MAX
 +#define PQ_EOTF_LUT_SIZE (PQ_EOTF_LUT_STEPS + 2)
 +#define PQ_OETF_LUT_OCTAVES 40
 +#define PQ_OETF_LUT_SHIFT 17
@@ -330,7 +338,7 @@ Index: FFmpeg/libavfilter/vf_tonemapx.h
 +
 +static av_always_inline float tonemapx_pq_eotf(const float *lut, float v)
 +{
-+    float pos = av_clipf(v, 0.0f, 1.0f) * PQ_EOTF_LUT_STEPS;
++    float pos = av_clipf(v, 0.0f, PQ_EOTF_LUT_MAX) * PQ_EOTF_LUT_UNIT;
 +    int i = (int)pos;
 +
 +    return lut[i] + (pos - (float)i) * (lut[i + 1] - lut[i]);
@@ -357,8 +365,8 @@ Index: FFmpeg/libavfilter/vf_tonemapx.h
 +
 +/*
 + * Dolby Vision L'M'S' to BT.2020 R'G'B', both PQ coded: PQ EOTF, the LMS to RGB matrix on
-+ * linear light, PQ OETF. The matrix is only correct on linear values. L'M'S' is clamped to the
-+ * PQ signal range first, and linear RGB outside 0..1 comes out as 0 or 1.
++ * linear light, PQ OETF. The matrix is only correct on linear values. Linear RGB outside 0..1
++ * comes out as 0 or 1.
 + */
 +static av_always_inline void tonemapx_lms2rgb(float *r, float *g, float *b,
 +                                              float l, float m, float s,
@@ -388,8 +396,8 @@ Index: FFmpeg/libavfilter/x86/vf_tonemapx_intrin_avx.c
  
 +X86_64_V3 inline static __m256 pq_eotfx8(const float *lut, __m256 v)
 +{
-+    __m256 pos = _mm256_mul_ps(_mm256_min_ps(_mm256_max_ps(v, _mm256_setzero_ps()), _mm256_set1_ps(1.0f)),
-+                               _mm256_set1_ps(PQ_EOTF_LUT_STEPS));
++    __m256 pos = _mm256_mul_ps(_mm256_min_ps(_mm256_max_ps(v, _mm256_setzero_ps()), _mm256_set1_ps(PQ_EOTF_LUT_MAX)),
++                               _mm256_set1_ps(PQ_EOTF_LUT_UNIT));
 +    __m256i i = _mm256_cvttps_epi32(pos);
 +    __m256 lo = _mm256_i32gather_ps(lut, i, 4);
 +    __m256 hi = _mm256_i32gather_ps(lut + 1, i, 4);
