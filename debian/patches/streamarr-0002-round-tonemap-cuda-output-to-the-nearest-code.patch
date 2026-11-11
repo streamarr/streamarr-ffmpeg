@@ -1,0 +1,197 @@
+Description: avfilter/tonemap_cuda: read and write samples as whole codes
+ tonemap_cuda wrote every 10-bit sample about two codes low. A black
+ Dolby Vision frame came out as Y 62, Cb 510, Cr 510 where BT.2100
+ gives 64, 512, 512, and PQ peak white tone mapped to BT.709 came out
+ as Y 937, Cb 510, Cr 510 where BT.709 gives 940, 512, 512. In 8 bits
+ black came out as Y 15, Cb 127, Cr 127. The conversions between
+ integer codes and floats did it:
+ .
+ rgb2yuv() rounded a narrow-range sample to a 16-bit code and then
+ subtracted output_quantization_offset, 64/65535 for 10-bit output,
+ which is one whole 10-bit code.
+ .
+ sample_to_ushort() multiplied that 16-bit fraction by 1023, where
+ 65535/64 = 1023.98 undoes it, and truncated instead of rounding.
+ .
+ A 16-bit texture returns an n-bit code as code * 2^(16-n) / 65535.
+ yuv2rgb() added input_quantization_offset, one whole code, where a
+ factor of 65535 / ((2^n - 1) * 2^(16-n)) gives the code / (2^n - 1)
+ that its range scaling takes. The Dolby Vision path used the texture
+ value as it was, where the reshaping curves take code / (2^n - 1).
+ .
+ Quantize at the output depth as BT.2100 table 9 defines it, round to
+ the nearest code when writing, clamp to the sample range, and scale
+ every texture read to code / (2^n - 1). The quantization offset and
+ output constants are no longer needed.
+Author: Streamarr
+Forwarded: no
+Last-Update: 2026-11-11
+---
+Index: FFmpeg/libavfilter/cuda/colorspace_common.h
+===================================================================
+--- FFmpeg.orig/libavfilter/cuda/colorspace_common.h
++++ FFmpeg/libavfilter/cuda/colorspace_common.h
+@@ -54,12 +54,9 @@ extern __constant__ const bool rgb2rgb_passthrough;
+ extern __constant__ const float rgb2rgb_matrix[9];
+ extern __constant__ const float lms2rgb_matrix[9];
+ extern __constant__ const float yuv_matrix[9], rgb_matrix[9];
+-extern __constant__ const float input_quantization_offset;
+-extern __constant__ const float output_quantization_offset;
+ extern __constant__ const float input_y_scale;
+ extern __constant__ const float input_uv_scale;
+-extern __constant__ const float output_quantization_factor;
+-extern __constant__ const float output_quantization_scale;
++extern __constant__ const int depth_dst;
+ extern __constant__ const bool hlg_eotf_bt2446b;
+ 
+ static __inline__ __device__ float get_luma_src(float3 c, const float3& luma_src) {
+@@ -201,9 +198,6 @@ static __inline__ __device__ float3 delinearize(float3 x)
+ }
+ 
+ static __inline__ __device__ float3 yuv2rgb(float y, float u, float v) {
+-    y += y > 0.0f ? input_quantization_offset : 0.0f;
+-    u += u > 0.0f ? input_quantization_offset : 0.0f;
+-    v += v > 0.0f ? input_quantization_offset : 0.0f;
+     if (range_src == AVCOL_RANGE_MPEG) {
+         y = input_y_scale * y - 0.07305936073f;
+         u = input_uv_scale * u - 0.5714285714f;
+@@ -224,30 +218,33 @@ static __inline__ __device__ float3 yuv2lrgb(float3 yuv) {
+     return linearize(rgb);
+ }
+ 
++// BT.2100 table 9: D = Round[(scale * E' + offset) * 2^(n-8)] at the output depth n,
++// returned as D / (2^n - 1) for sample_to_ushort() to write back as D.
++static __inline__ __device__ float quantize_narrow(float e, float scale, float offset) {
++    float levels = (float)(1 << (depth_dst - 8));
++    return floorf((scale * e + offset) * levels + 0.5f) / (float)((1 << depth_dst) - 1);
++}
++
+ static __inline__ __device__ float3 rgb2yuv(float r, float g, float b) {
+     float y = r*yuv_matrix[0] + g*yuv_matrix[1] + b*yuv_matrix[2];
+     float u = r*yuv_matrix[3] + g*yuv_matrix[4] + b*yuv_matrix[5];
+     float v = r*yuv_matrix[6] + g*yuv_matrix[7] + b*yuv_matrix[8];
+     if (range_dst == AVCOL_RANGE_MPEG) {
+-        y = floorf(((219.0f * y + 16.0f) * output_quantization_factor) + 0.5f) / output_quantization_scale;
+-        u = floorf(((224.0f * u + 128.0f) * output_quantization_factor) + 0.5f) / output_quantization_scale;
+-        v = floorf(((224.0f * v + 128.0f) * output_quantization_factor) + 0.5f) / output_quantization_scale;
++        y = quantize_narrow(y, 219.0f, 16.0f);
++        u = quantize_narrow(u, 224.0f, 128.0f);
++        v = quantize_narrow(v, 224.0f, 128.0f);
+     } else {
+         u += 0.5f;
+         v += 0.5f;
+     }
+-    y -= y > 0.0f ? output_quantization_offset : 0.0f;
+-    u -= u > 0.0f ? output_quantization_offset : 0.0f;
+-    v -= v > 0.0f ? output_quantization_offset : 0.0f;
+     return make_float3(y, u, v);
+ }
+ 
+ static __inline__ __device__ float rgb2y(float r, float g, float b) {
+     float y = r*yuv_matrix[0] + g*yuv_matrix[1] + b*yuv_matrix[2];
+     if (range_dst == AVCOL_RANGE_MPEG) {
+-        y = floorf(((219.0f * y + 16.0f) * output_quantization_factor) + 0.5f) / output_quantization_scale;
++        y = quantize_narrow(y, 219.0f, 16.0f);
+     }
+-    y -= y > 0.0f ? output_quantization_offset : 0.0f;
+     return y;
+ }
+ 
+Index: FFmpeg/libavfilter/cuda/pixfmt.h
+===================================================================
+--- FFmpeg.orig/libavfilter/cuda/pixfmt.h
++++ FFmpeg/libavfilter/cuda/pixfmt.h
+@@ -181,7 +181,7 @@ static __inline__ __device__ void write_2x2(const FFCUDAFrame& frame, int x, int
+ 
+ static __inline__ __device__ unsigned short sample_to_ushort(float flt)
+ {
+-    return (unsigned short)(flt * ((1 << depth_dst) - 1));
++    return (unsigned short)(min(max(flt, 0.0f), 1.0f) * ((1 << depth_dst) - 1) + 0.5f);
+ }
+ 
+ static __inline__ __device__ ushort3 pixel_to_ushort3(float3 flt)
+@@ -211,15 +211,27 @@ static __inline__ __device__ float read_dither(cudaTextureObject_t ditherTex, fl
+     return tex2D<float>(ditherTex, (float)x * dither_size_recip, (float)y * dither_size_recip);
+ }
+ 
++// A 16-bit texture holds an n-bit code as code * 2^(16-n) and reads as that over 65535.
++// This scales a read back to code / (2^n - 1), which the range scaling and the Dolby Vision
++// reshaping take. As elsewhere in this filter, 16-bit input is taken as 12-bit.
++static __inline__ __device__ float tex_to_code_scale()
++{
++    int depth = depth_src == 16 ? 12 : depth_src;
++    if (depth <= 8)
++        return 1.0f;
++    return 65535.0f / (float)(((1 << depth) - 1) << (16 - depth));
++}
++
+ static __inline__ __device__ float3 read_tex_px_flt(const FFCUDAFrame& frame, int x, int y)
+ {
+     float ncoord_x = (float)x / (float)frame.width;
+     float ncoord_y = (float)y / (float)frame.height;
++    float scale = tex_to_code_scale();
+ 
+     float px_y = tex2D<float>(frame.tex[0], x, y);
+     float2 px_uv = tex2D<float2>(frame.tex[1], ncoord_x, ncoord_y);
+ 
+-    return make_float3(px_y, px_uv.x, px_uv.y);
++    return make_float3(px_y * scale, px_uv.x * scale, px_uv.y * scale);
+ }
+ 
+ #endif /* AVFILTER_CUDA_PIXFMT_H */
+Index: FFmpeg/libavfilter/vf_tonemap_cuda.c
+===================================================================
+--- FFmpeg.orig/libavfilter/vf_tonemap_cuda.c
++++ FFmpeg/libavfilter/vf_tonemap_cuda.c
+@@ -544,12 +544,8 @@ static av_cold int compile(AVFilterLink *inlink)
+     enum AVColorPrimaries in_pri = s->in_pri, out_pri = s->out_pri;
+     enum AVColorRange in_range = s->in_range, out_range = s->out_range;
+     int d = s->in_desc->comp[0].depth > s->out_desc->comp[0].depth && s->dither_tex;
+-    float input_quantization_offset = 0.0f;
+-    float output_quantization_offset = 0.0f;
+     float input_y_scale = 1.0f;
+     float input_uv_scale = 1.0f;
+-    float output_quantization_factor = 1.0f;
+-    float output_quantization_scale = 255.0f;
+     char info_log[4096], error_log[4096];
+     CUjit_option options[] = { CU_JIT_INFO_LOG_BUFFER,
+                                CU_JIT_ERROR_LOG_BUFFER,
+@@ -669,25 +665,13 @@ static av_cold int compile(AVFilterLink *inlink)
+     if (s->in_desc->comp[0].depth == 16) {
+         // Assume 16bit is actually 12bit for now as that is what the hardware decoders producing
+         // and what videos are actually encoded in
+-        input_quantization_offset = QUANTIZATION_OFFSET(12);
+         input_y_scale = INPUT_Y_SCALE(12);
+         input_uv_scale = INPUT_UV_SCALE(12);
+     } else {
+-        input_quantization_offset = QUANTIZATION_OFFSET(s->in_desc->comp[0].depth);
+         input_y_scale = INPUT_Y_SCALE(s->in_desc->comp[0].depth);
+         input_uv_scale = INPUT_UV_SCALE(s->in_desc->comp[0].depth);
+     }
+ 
+-    if (s->out_desc->comp[0].depth == 10) {
+-        // Don't handle 12b offset for now and assume 16b output is real 16b out to make it consistent with other filters
+-        output_quantization_offset = QUANTIZATION_OFFSET(10);
+-    }
+-
+-    if (s->out_desc->comp[0].depth > 8) {
+-        output_quantization_factor = 256.0f; // 2^(16-8)
+-        output_quantization_scale = 65535.0f; // 2^16 - 1
+-    }
+-
+     av_bprint_init(&constants, 2048, AV_BPRINT_SIZE_UNLIMITED);
+ 
+     av_bprintf(&constants, ".version 3.2\n");
+@@ -723,12 +707,8 @@ static av_cold int compile(AVFilterLink *inlink)
+     CONSTANT(".f32 dither_quantization = %.1f", (float)((1 << s->out_desc->comp[0].depth) - 1));
+     CONSTANT(".f32 tone_param          = %.4f", s->final_param);
+     CONSTANT(".f32 desat_param         = %.4f", s->desat_param);
+-    CONSTANT(".f32 input_quantization_offset = %.13lf", input_quantization_offset);
+     CONSTANT(".f32 input_y_scale = %.13lf", input_y_scale);
+     CONSTANT(".f32 input_uv_scale = %.13lf", input_uv_scale);
+-    CONSTANT(".f32 output_quantization_offset = %.13lf", output_quantization_offset);
+-    CONSTANT(".f32 output_quantization_factor = %.13lf", output_quantization_factor);
+-    CONSTANT(".f32 output_quantization_scale = %.13lf", output_quantization_scale);
+     CONSTANT_M("rgb_matrix", (s->dovi ? s->dovi->nonlinear : rgb_matrix));
+     CONSTANT_M("yuv_matrix", yuv_matrix);
+     CONSTANT_A(".u8 rgb2rgb_passthrough = %i", 1, in_pri == out_pri);
