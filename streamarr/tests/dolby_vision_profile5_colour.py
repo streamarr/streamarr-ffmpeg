@@ -49,6 +49,8 @@ LMS_TO_RGB = ((3.06441879, -2.16597676, 0.10155818),
               (0.01736321, -0.04725154, 1.03004253))
 
 FILTERS = {
+    "tonemapx": ([], "format=yuv420p10le,"
+                     "tonemapx=t=smpte2084:p=bt2020:m=bt2020:r=tv:format=yuv420p10le"),
     "tonemap_cuda": (["-init_hw_device", "cuda=cu", "-filter_hw_device", "cu"],
                      "format=p010le,hwupload,"
                      "tonemap_cuda=t=smpte2084:p=bt2020:m=bt2020:r=tv:tradeoff=0:format=p010le,"
