@@ -11,20 +11,23 @@ transcode worker: the reshape of Dolby Vision profile 5 to BT.2020 PQ, and the t
 Nothing is encoded after the filter.
 
 Without --leak-sanitizer the check runs with any build, and measures. The filter may keep a fixed
-amount of memory however many frames it converts. So the peak resident memory of a run of
-LONG_FRAMES frames may exceed that of a run of SHORT_FRAMES by at most BYTES_PER_FRAME for each
-further frame. One copy of the parsed RPU, struct FFDOVIMetadataRemap, is 2,728 bytes, so a filter
-that keeps one per frame grows more than five times faster than allowed. Both runs decode and
-filter on one thread each, which keeps the memory that does not depend on the frame count equal.
+amount of memory however many frames it converts. The growth of a chain is the peak resident
+memory of a run of LONG_FRAMES frames less that of a run of SHORT_FRAMES, for each further frame.
+A chain with tonemapx may grow at most BYTES_PER_FRAME faster than the same decoding without the
+filter. One copy of the parsed RPU, struct FFDOVIMetadataRemap, is 2,728 bytes, so a filter that
+keeps one per frame grows more than five times faster than allowed. Every run decodes and filters
+on one thread each, which keeps the memory that does not depend on the frame count equal.
 
-With --leak-sanitizer the check is exact, and needs a build with AddressSanitizer and libx265
-(configure --toolchain=gcc-asan or clang-asan). It runs SANITIZED_FRAMES frames with RPUs, and as
-many without, through both chains, and LeakSanitizer must find every allocation freed. The release
-archives are built without the sanitizer, so this mode runs only where someone builds with it.
+With --leak-sanitizer the check is exact, and needs a Linux build with AddressSanitizer and
+libx265 (configure --toolchain=gcc-asan or clang-asan): Apple's clang has no LeakSanitizer. It
+runs SANITIZED_FRAMES frames with RPUs, and as many without, through both chains, and
+LeakSanitizer must find every allocation freed. The release archives are built without the
+sanitizer, so this mode runs only where someone builds with it.
 
 --cpuflags passes FFmpeg's -cpuflags to the filtering runs: 0 for plain C, sse4.2 for that path on
 a CPU that also has AVX2.
-Exits 0 when memory is freed, 1 when it is not, 2 when the check cannot run.
+Exits 0 when memory is freed, 1 when it is not, 2 when the check cannot run: the fixture is
+unusable, FFmpeg fails, or decoding alone grows by more than BYTES_PER_FRAME.
 """
 import argparse
 import os
@@ -40,6 +43,7 @@ CHAINS = {
     "tone map to SDR": "tonemapx=tonemap=mobius:peak=100:desat=0:t=bt709:m=bt709:p=bt709:r=tv:"
                        "format=yuv420p",
 }
+DECODING_ALONE = "format=yuv420p10le"
 SHORT_FRAMES, LONG_FRAMES = 2000, 42000
 BYTES_PER_FRAME = 512
 SANITIZED_FRAMES = 48
@@ -60,8 +64,12 @@ def require_reshaped_frames(arguments, stream):
     result = subprocess.run([arguments.ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "info",
                              "-i", stream, "-frames:v", "1", "-vf", "showinfo", "-f", "null", "-"],
                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    metadata = [line for line in result.stderr.decode(errors="replace").splitlines()
-                if "Dolby Vision Metadata" in line]
+    log = result.stderr.decode(errors="replace")
+    if result.returncode != 0:
+        sys.stderr.write(log)
+        sys.stderr.write("FFmpeg exited with %d.\n" % result.returncode)
+        sys.exit(2)
+    metadata = [line for line in log.splitlines() if "Dolby Vision Metadata" in line]
     if not any("vdr_rpu_profile=0;" in line and "disable_residual_flag=1" in line
                for line in metadata):
         sys.stderr.write("The decoded frames carry no profile 5 metadata, so the fixture is "
@@ -90,18 +98,27 @@ def peak_resident_bytes(command):
     return usage.ru_maxrss * PEAK_UNIT
 
 
+def growth_per_frame(arguments, stream, graph):
+    short, long = (peak_resident_bytes(filtering(arguments, stream, graph, frames))
+                   for frames in (SHORT_FRAMES, LONG_FRAMES))
+    return short, long, (long - short) / (LONG_FRAMES - SHORT_FRAMES)
+
+
 def growth_failures(arguments, stream):
+    _, _, decoding = growth_per_frame(arguments, stream, DECODING_ALONE)
+    if decoding > BYTES_PER_FRAME:
+        sys.stderr.write("Decoding alone grows by %.0f bytes a frame, so the check cannot tell "
+                         "what tonemapx keeps.\n" % decoding)
+        sys.exit(2)
     failures = 0
     for name, graph in CHAINS.items():
-        short, long = (peak_resident_bytes(filtering(arguments, stream, graph, frames))
-                       for frames in (SHORT_FRAMES, LONG_FRAMES))
-        per_frame = (long - short) / (LONG_FRAMES - SHORT_FRAMES)
-        grew = per_frame > BYTES_PER_FRAME
+        short, long, per_frame = growth_per_frame(arguments, stream, graph)
+        grew = per_frame - decoding > BYTES_PER_FRAME
         failures += grew
-        print("%s: peak resident memory %.1f MB after %d frames and %.1f MB after %d, "
-              "%.0f bytes for each further frame (%d allowed)%s"
-              % (name, short / 2**20, SHORT_FRAMES, long / 2**20, LONG_FRAMES, per_frame,
-                 BYTES_PER_FRAME, ": the filter keeps memory for every frame" if grew else ""))
+        print("%s: peak resident memory %.1f MB after %d frames and %.1f MB after %d, %.0f bytes "
+              "for each further frame, %.0f without tonemapx (%d more allowed)%s"
+              % (name, short / 2**20, SHORT_FRAMES, long / 2**20, LONG_FRAMES, per_frame, decoding,
+                 BYTES_PER_FRAME, ": tonemapx keeps memory for every frame" if grew else ""))
     return failures
 
 
@@ -114,7 +131,8 @@ def require_sanitizer(arguments):
 
 
 def sanitizer_failures(arguments, streams):
-    environment = dict(os.environ, ASAN_OPTIONS="detect_leaks=1")
+    options = [os.environ["ASAN_OPTIONS"]] if os.environ.get("ASAN_OPTIONS") else []
+    environment = dict(os.environ, ASAN_OPTIONS=":".join(options + ["detect_leaks=1"]))
     failures = 0
     for source, stream in streams.items():
         for name, graph in CHAINS.items():
