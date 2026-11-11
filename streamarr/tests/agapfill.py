@@ -39,6 +39,8 @@ DEFAULT_PACKET = 4096
 CHUNK = 1 << 16
 RSS_UNIT = 1 if sys.platform == "darwin" else 1024
 ADDRESS_SPACE = 4 << 30
+# No check needs more than a few seconds. The limit only ends a run that would never end.
+TIME_LIMIT = 120
 SHOWINFO = re.compile(r"Parsed_ashowinfo\S* @ \S+ n:\d+ pts:(-?\d+|NOPTS) pts_time:(\S+) fmt:(\S+) "
                       r"channels:\d+ chlayout:\S+ rate:\d+ nb_samples:(\d+)")
 
@@ -144,7 +146,7 @@ class Finished:
         return int(match.group(2)) * RSS_UNIT
 
 
-def execute(command, consume=None, timeout=600, measure=False):
+def execute(command, consume=None, timeout=TIME_LIMIT, measure=False):
     """Runs FFmpeg. `consume` reads its standard output. Returns its status, log and result."""
     if measure:
         command = [sys.executable, "-c", MEASURE] + command
@@ -279,11 +281,11 @@ def filter_command(ffmpeg, source, chain, counter):
 
 
 def timeline_problems(ffmpeg, chain, first, runs, *, count, sample_format="s16", rate=RATE,
-                      packet_size=DEFAULT_PACKET, timeout=600):
+                      packet_size=DEFAULT_PACKET):
     """Runs the counter through `chain` and compares the output with the expected timeline."""
     counter = COUNTERS[sample_format]
     command = filter_command(ffmpeg, counter.lavfi(count, rate), chain, counter)
-    done = execute(command, lambda out: compare_samples(out, first, runs, counter, rate), timeout)
+    done = execute(command, lambda out: compare_samples(out, first, runs, counter, rate))
     if done.code:
         return ["FFmpeg ended with status %d: %s" % (done.code, last_lines(done.log))]
     return check_frames(frames_of(done.log), first, runs, packet_size, rate) + done.result
@@ -516,7 +518,7 @@ timeline_check("packet-size", "writes silence in frames of packet_size samples",
 timeline_check("downstream-end", "stops filling when the filter after it needs no more",
                chain(frames(4800), stamp("PTS+48000*1e12*gte(N,96000)")), "", 0,
                [real(0, 96000), silence(1344000)], after="atrim=end_sample=1440000",
-               count=4 * SECOND, timeout=120)
+               count=4 * SECOND)
 
 # --- Time bases ---------------------------------------------------------------------------------
 
@@ -539,8 +541,8 @@ def measured_gap(ffmpeg, shift, runs):
     counter = COUNTERS["s16"]
     shape = chain(frames(4800), stamp("PTS+%d*gte(N,96000)" % shift), "agapfill")
     command = filter_command(ffmpeg, counter.lavfi(4 * SECOND, RATE), shape, counter)
-    done = execute(command, lambda out: compare_samples(out, 0, runs, counter, RATE), 1800,
-                   measure=True)
+    done = execute(command, lambda out: compare_samples(out, 0, runs, counter, RATE),
+                   timeout=5 * TIME_LIMIT, measure=True)
     if done.code:
         return done, ["FFmpeg ended with status %d: %s" % (done.code, last_lines(done.log))]
     return done, check_frames(frames_of(done.log), 0, runs, DEFAULT_PACKET, RATE) + done.result
@@ -812,13 +814,14 @@ def main():
             problems = function(arguments.ffmpeg)
         except Unusable as reason:
             unusable += 1
-            print("UNUSABLE %s: %s\n     %s" % (name, title, reason))
+            print("UNUSABLE %s: %s\n     %s" % (name, title, reason), flush=True)
             continue
         if problems:
             failed += 1
-            print("FAILED   %s: agapfill %s\n     %s" % (name, title, "\n     ".join(problems)))
+            print("FAILED   %s: agapfill %s\n     %s" % (name, title, "\n     ".join(problems)),
+                  flush=True)
         else:
-            print("ok       %s: agapfill %s" % (name, title))
+            print("ok       %s: agapfill %s" % (name, title), flush=True)
     print("%d of %d checks failed, %d unusable" % (failed, len(selected), unusable))
     if unusable:
         return 2
