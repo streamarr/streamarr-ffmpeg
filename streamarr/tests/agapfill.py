@@ -523,6 +523,36 @@ timeline_check("downstream-end", "stops filling when the filter after it needs n
                [real(0, 96000), silence(1344000)], after="atrim=end_sample=1440000",
                count=4 * SECOND)
 
+@check("end-of-timestamp-range", "stops at the largest timestamp instead of wrapping to the "
+       "smallest")
+def end_of_timestamp_range(ffmpeg):
+    # 3 s of audio stamped from 75,775 samples before the largest timestamp, which is far beyond
+    # any real media. Past that value the output cannot stay continuous. It must not go backward.
+    counter = COUNTERS["s16"]
+    # ffmpeg adds a frame's length to its timestamp. The last filter stamps the frames from
+    # zero, so that this sum stays in range.
+    shape = chain(frames(4800), stamp("PTS+9.2233720368547e18"), "agapfill", "ashowinfo",
+                  stamp("N"))
+    command = filter_command(ffmpeg, counter.lavfi(3 * SECOND, RATE), "anull", counter)
+    command[command.index("-af") + 1] = shape
+    done = execute(command, lambda out: out.read())
+    if done.code:
+        return ["FFmpeg ended with status %d: %s" % (done.code, last_lines(done.log))]
+    stamps = [pts for pts, _, _, _ in frames_of(done.log)]
+    if not stamps or stamps[0] <= 2 ** 63 - 1 - 3 * SECOND:
+        raise Unusable("the audio does not reach the end of the timestamp range")
+    problems = []
+    backward = [(before, after) for before, after in zip(stamps, stamps[1:]) if after < before]
+    if backward:
+        problems.append("the frame stamped %d follows the frame stamped %d" % backward[0][::-1])
+    width = counter.width
+    audio = b"".join(done.result[at:at + width] for at in range(0, len(done.result), width)
+                     if any(done.result[at:at + width]))
+    if audio != counter.samples(0, 3 * SECOND):
+        problems.append("the output does not hold every source sample once and in order")
+    return problems
+
+
 # --- Time bases ---------------------------------------------------------------------------------
 
 timeline_check("millisecond-time-base", "inserts nothing when timestamps are rounded to 1 ms",

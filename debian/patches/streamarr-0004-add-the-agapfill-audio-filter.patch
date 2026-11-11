@@ -288,7 +288,7 @@ Index: FFmpeg/libavfilter/af_agapfill.c
 +    frame->pts      = s->out_pos;
 +    frame->duration = nb_samples;
 +
-+    s->out_pos      += nb_samples;
++    s->out_pos       = av_sat_add64(s->out_pos, nb_samples);
 +    s->silence_left -= nb_samples;
 +
 +    return ff_filter_frame(outlink, frame);
@@ -303,7 +303,7 @@ Index: FFmpeg/libavfilter/af_agapfill.c
 +    frame->pts      = s->out_pos;
 +    frame->duration = frame->nb_samples;
 +
-+    s->out_pos += frame->nb_samples;
++    s->out_pos = av_sat_add64(s->out_pos, frame->nb_samples);
 +
 +    return ff_filter_frame(ctx->outputs[0], frame);
 +}
