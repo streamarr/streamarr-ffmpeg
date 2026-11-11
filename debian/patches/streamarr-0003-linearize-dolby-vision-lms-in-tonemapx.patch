@@ -8,17 +8,23 @@ Description: avfilter/tonemapx: linearize Dolby Vision L'M'S' before the LMS to 
  The output color accuracy will be affected due to this".
  .
  The rows of the matrix sum to one, so a neutral pixel came out right
- and the error grew with saturation. With a profile 5 source and BT.2020
- PQ output, a colour 90 base-layer codes from neutral came out 4 luma
- codes too high on average and up to 14, and colours near the gamut
- boundary up to 119 luma codes too high. Every output of the filter for
- a Dolby Vision source was affected, tone mapped SDR included.
+ and the error grew with saturation. Measured on flat synthetic patches
+ of a profile 5 source with BT.2020 PQ output, a colour 90 base-layer
+ codes from neutral came out 4 luma codes too high on average and up
+ to 14, and colours 260 codes from neutral up to 119 too high. The
+ conversion is shared by every output of the filter for the sources
+ whose reshaping it applies, which are those with RPU profile 0 and no
+ enhancement layer residual, profile 5 among them.
  .
  Apply the PQ EOTF to L'M'S', then the matrix, then the PQ OETF. Both
  curves are read from tables with linear interpolation: 16384 steps of
  the signal for the EOTF, and 64 steps per octave of the linear value
  over 40 octaves for the OETF. The C, SSE4.2 and NEON paths share one
  scalar routine, and the AVX2 path gathers from the same tables.
+ .
+ L'M'S' is clamped to the PQ signal range before the EOTF, and linear
+ RGB below zero comes out as zero on every path. The vector paths used
+ to carry negative R'G'B' on, where the C path already clipped it.
 Author: Streamarr
 Forwarded: no
 Last-Update: 2026-11-11
@@ -196,7 +202,7 @@ Index: FFmpeg/libavfilter/vf_tonemapx.c
  }
  
  inline static void reshape_dovi_yuv(float* dest, float* src, const TonemapIntParams *ctx)
-@@ -571,6 +569,31 @@ static int compute_trc_luts(TonemapxContext *s, enum AVColorTransferCharacterist
+@@ -571,6 +569,39 @@ static int compute_trc_luts(TonemapxContext *s, enum AVColorTransferCharacterist
      return 0;
  }
  
@@ -205,22 +211,30 @@ Index: FFmpeg/libavfilter/vf_tonemapx.c
 +    const double m1 = 2610.0 / 16384, m2 = 2523.0 / 4096 * 128;
 +    const double c1 = 3424.0 / 4096, c2 = 2413.0 / 4096 * 32, c3 = 2392.0 / 4096 * 32;
 +
-+    if (s->pq_eotf_lut && s->pq_oetf_lut)
++    float *eotf, *oetf;
++
++    if (s->pq_eotf_lut)
 +        return 0;
 +
-+    if (!s->pq_eotf_lut && !(s->pq_eotf_lut = av_calloc(PQ_EOTF_LUT_SIZE, sizeof(float))))
++    eotf = av_malloc_array(PQ_EOTF_LUT_SIZE, sizeof(*eotf));
++    oetf = av_malloc_array(PQ_OETF_LUT_SIZE, sizeof(*oetf));
++    if (!eotf || !oetf) {
++        av_free(eotf);
++        av_free(oetf);
 +        return AVERROR(ENOMEM);
-+    if (!s->pq_oetf_lut && !(s->pq_oetf_lut = av_calloc(PQ_OETF_LUT_SIZE, sizeof(float))))
-+        return AVERROR(ENOMEM);
++    }
 +
 +    for (unsigned i = 0; i < PQ_EOTF_LUT_SIZE; i++) {
 +        double p = pow(FFMIN(i / (double)PQ_EOTF_LUT_STEPS, 1.0), 1.0 / m2);
-+        s->pq_eotf_lut[i] = pow(FFMAX(p - c1, 0.0) / (c2 - c3 * p), 1.0 / m1);
++        eotf[i] = pow(FFMAX(p - c1, 0.0) / (c2 - c3 * p), 1.0 / m1);
 +    }
 +    for (unsigned i = 0; i < PQ_OETF_LUT_SIZE; i++) {
 +        double p = pow(av_int2float(PQ_OETF_LUT_MIN_BITS + (FFMIN(i, PQ_OETF_LUT_STEPS) << PQ_OETF_LUT_SHIFT)), m1);
-+        s->pq_oetf_lut[i] = pow((c1 + c2 * p) / (1.0 + c3 * p), m2);
++        oetf[i] = pow((c1 + c2 * p) / (1.0 + c3 * p), m2);
 +    }
++
++    s->pq_eotf_lut = eotf;
++    s->pq_oetf_lut = oetf;
 +
 +    return 0;
 +}
@@ -228,7 +242,7 @@ Index: FFmpeg/libavfilter/vf_tonemapx.c
  static int compute_tonemap_lut(TonemapxContext *s, enum AVColorTransferCharacteristic trc_src,
                                 enum AVColorTransferCharacteristic trc_dst)
  {
-@@ -689,10 +712,10 @@ static inline void dovi2rgb(int y00, int y01, int y10, int y11, int u, int v,
+@@ -689,10 +720,10 @@ static inline void dovi2rgb(int y00, int y01, int y10, int y11, int u, int v,
      ycc2rgb(c3, yuv3[0], yuv3[1], yuv3[2], params->dovi->nonlinear, *params->ycc_offset);
      ycc2rgb(c4, yuv4[0], yuv4[1], yuv4[2], params->dovi->nonlinear, *params->ycc_offset);
  
@@ -243,7 +257,7 @@ Index: FFmpeg/libavfilter/vf_tonemapx.c
  
      // DoVi always uses full range
      r[0] = av_clip_uintp2((int)(c1[0] * JPEG_SCALE), 15);
-@@ -1382,7 +1405,9 @@ TonemapIntParams params = {                                     \
+@@ -1382,7 +1413,9 @@ TonemapIntParams params = {                                     \
  .dovi = s->dovi,                                                \
  .dovi_pbuf = s->dovi_pbuf,                                      \
  .lms2rgb_matrix = &s->lms2rgb_matrix,                           \
@@ -254,16 +268,22 @@ Index: FFmpeg/libavfilter/vf_tonemapx.c
  };
  
  static int filter_slice_planar8(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
-@@ -1547,6 +1572,8 @@ static int filter_frame(AVFilterLink *link, AVFrame *in)
-                 goto fail;
- 
-             ff_map_dovi_metadata(s->dovi, metadata);
+@@ -1541,7 +1574,13 @@ static int filter_frame(AVFilterLink *link, AVFrame *in)
+         // such videos usually have vdr_rpu_profile == 0, for example profile 5 videos
+         // this could be wrong as there is no public documentation on this field
+         if (rpu->disable_residual_flag && rpu->vdr_rpu_profile == 0) {
+-            struct FFDOVIMetadataRemap *dovi = av_malloc(sizeof(*dovi));
++            struct FFDOVIMetadataRemap *dovi;
++
++            // Before s->dovi is set: a later frame takes the Dolby Vision path whenever it is.
 +            if ((ret = compute_dovi_pq_luts(s)) < 0)
 +                goto fail;
-             in->color_trc = AVCOL_TRC_SMPTE2084;
-             in->colorspace = AVCOL_SPC_BT2020_NCL;
-             in->color_primaries = AVCOL_PRI_BT2020;
-@@ -1649,6 +1676,8 @@ static void uninit(AVFilterContext *ctx)
++
++            dovi = av_malloc(sizeof(*dovi));
+             s->dovi = dovi;
+             if (!s->dovi)
+                 goto fail;
+@@ -1649,6 +1688,8 @@ static void uninit(AVFilterContext *ctx)
      av_freep(&s->lin_lut);
      av_freep(&s->delin_lut);
      av_freep(&s->tonemap_lut);
@@ -285,7 +305,7 @@ Index: FFmpeg/libavfilter/vf_tonemapx.h
  
  #define X86_64_V2 __attribute__((target("sse4.2")))
  #define X86_64_V3 __attribute__((target("avx2,fma")))
-@@ -83,8 +85,71 @@ typedef struct TonemapIntParams {
+@@ -83,8 +85,72 @@ typedef struct TonemapIntParams {
      float *dovi_pbuf;
      double (*lms2rgb_matrix)[3][3];
      float (*ycc_offset)[3];
@@ -337,7 +357,8 @@ Index: FFmpeg/libavfilter/vf_tonemapx.h
 +
 +/*
 + * Dolby Vision L'M'S' to BT.2020 R'G'B', both PQ coded: PQ EOTF, the LMS to RGB matrix on
-+ * linear light, PQ OETF. The matrix is only correct on linear values.
++ * linear light, PQ OETF. The matrix is only correct on linear values. L'M'S' is clamped to the
++ * PQ signal range first, and linear RGB outside 0..1 comes out as 0 or 1.
 + */
 +static av_always_inline void tonemapx_lms2rgb(float *r, float *g, float *b,
 +                                              float l, float m, float s,

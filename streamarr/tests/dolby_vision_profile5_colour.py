@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Checks the colours a filter writes when it converts Dolby Vision profile 5 to BT.2020 PQ.
 
-    python3 streamarr/tests/dolby_vision_profile5_colour.py --ffmpeg PATH --filter NAME [--keep DIR]
+    python3 streamarr/tests/dolby_vision_profile5_colour.py --ffmpeg PATH --filter NAME
+                                                            [--cpuflags FLAGS] [--keep DIR]
 
 Everything is synthetic. The picture is a frame of flat patches, each one base-layer code triple
 (I, P, T): a grey ramp and three rings of colours around neutral. FFmpeg's libx265 encodes it
@@ -19,6 +20,8 @@ code is compared with the value the profile 5 definition gives, computed here in
 A grey patch must be within GREY_TOLERANCE codes of that value and a coloured patch within
 COLOUR_TOLERANCE. Colours within 1 % of the gamut boundary are not checked. tonemap_cuda runs its
 direct kernels (tradeoff=0): its 3D lookup table interpolates and is not held to these tolerances.
+--cpuflags passes FFmpeg's -cpuflags to the filtering run, which picks the code path of a CPU
+filter: 0 for plain C, sse4.2 for that path on a CPU that also has AVX2.
 Exits 0 when every patch is within tolerance, 1 when one is not, 2 when the fixture is unusable.
 """
 import argparse
@@ -274,6 +277,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--ffmpeg", required=True)
     parser.add_argument("--filter", required=True, choices=sorted(FILTERS))
+    parser.add_argument("--cpuflags", help="FFmpeg's -cpuflags for the filtering run")
     parser.add_argument("--keep", help="write the fixture and the output to this directory")
     arguments = parser.parse_args()
     triples = patch_triples()
@@ -297,8 +301,9 @@ def main():
             sys.stderr.write("The decoded base layer differs from the patches, so the fixture is unusable.\n")
             sys.exit(2)
         device, graph = FILTERS[arguments.filter]
-        output = run(ffmpeg + device + ["-i", stream, "-vf", graph, "-frames:v", "1",
-                                        "-pix_fmt", "yuv420p10le", "-f", "rawvideo", "-"])
+        cpuflags = ["-cpuflags", arguments.cpuflags] if arguments.cpuflags is not None else []
+        output = run(ffmpeg + cpuflags + device + ["-i", stream, "-vf", graph, "-frames:v", "1",
+                                                   "-pix_fmt", "yuv420p10le", "-f", "rawvideo", "-"])
         if arguments.keep:
             with open(os.path.join(folder, arguments.filter + ".yuv"), "wb") as file:
                 file.write(output)
