@@ -20,6 +20,8 @@ of silence. The expectations come from the rules the filter documents, not from 
     4. `start` puts silence from that time up to the first frame.
     5. Silence comes one frame of `packet_size` samples at a time, so memory does not grow with
        the gap, and a gap longer than `max_gap` is an error.
+    6. When ffmpeg builds a new filter graph mid-stream, the new graph's filter continues the
+       output of the old one, so rules 1 to 4 hold across the change.
 
 Exits 0 when every check passes, 1 when one fails, 2 when a fixture is unusable.
 """
@@ -741,6 +743,34 @@ def formats(ffmpeg):
     return problems
 
 
+# --- Continuing the output of another agapfill --------------------------------------------------
+
+def resume_command(position, at=0):
+    """Sends agapfill the resume command when the first frame at or after `at` seconds passes."""
+    return "asendcmd=c='%s agapfill resume %s'" % (at, position)
+
+
+# The other filter stood at 2 s of output and 8 s of input, counted at 44.1 kHz. The audio begins
+# at 8 s, so its first frame is a step of nothing and follows at 2 s.
+timeline_check("resume-command", "continues from the position of another filter, given in that "
+               "filter's sample rate, and ignores start",
+               chain(LATE_BY_8_SECONDS, resume_command("88200/352800/44100")), "start=0",
+               2 * SECOND, [real(0, 10 * SECOND)], count=10 * SECOND)
+
+timeline_check("resume-command-before-gap", "fills the gap between the other filter's last frame "
+               "and its own first frame",
+               chain(LATE_BY_8_SECONDS, resume_command("96000/96000/48000")), "", 2 * SECOND,
+               [silence(6 * SECOND), real(0, 10 * SECOND)], count=10 * SECOND)
+
+timeline_check("resume-command-after-first-frame", "ignores the resume command once it has taken "
+               "a frame", chain(LATE_BY_8_SECONDS, resume_command("0/0/48000", at=9)), "",
+               8 * SECOND, [real(0, 10 * SECOND)], count=10 * SECOND)
+
+timeline_check("resume-command-incomplete", "starts afresh when the resume command names no "
+               "whole position", chain(LATE_BY_8_SECONDS, resume_command("96000/96000")), "start=0", 0,
+               [silence(8 * SECOND), real(0, 10 * SECOND)], count=10 * SECOND)
+
+
 # --- When ffmpeg rebuilds the filter graph ------------------------------------------------------
 
 def timeline_by_the_rules(frame_list, start=None, threshold=RATE * 2 // 1000):
@@ -782,7 +812,7 @@ def changing_layout(ffmpeg, work, hole):
     return path
 
 
-def rebuild_problems(ffmpeg, *, hole, ahead="anull", start=None):
+def rebuild_problems(ffmpeg, *, hole, ahead="anull", start=None, seek=None):
     """Fills audio that changes layout and compares the output with the rules' timeline.
 
     `ahead` is the filter chain ahead of the fill. The reference is the same decode without the
@@ -794,9 +824,10 @@ def rebuild_problems(ffmpeg, *, hole, ahead="anull", start=None):
         source = changing_layout(ffmpeg, work, hole)
 
         def decode(filters):
-            return execute([ffmpeg, "-nostdin", "-hide_banner", "-nostats", "-v", "info", "-i",
-                            source, "-af", chain(filters, "ashowinfo"), "-ac", "2",
-                            "-c:a", "pcm_s16le", "-f", "s16le", "-"], lambda out: out.read())
+            position = ["-ss", str(seek)] if seek is not None else []
+            return execute([ffmpeg, "-nostdin", "-hide_banner", "-nostats", "-v", "info"] + position
+                           + ["-i", source, "-af", chain(filters, "ashowinfo"), "-ac", "2",
+                              "-c:a", "pcm_s16le", "-f", "s16le", "-"], lambda out: out.read())
 
         plain, filled = decode(ahead), decode(chain(ahead, fill))
     if plain.code or "Reconfiguring filter graph" not in plain.log:
@@ -825,6 +856,31 @@ def graph_rebuild(ffmpeg):
     # An AC-3 stream that changes from 5.1 to stereo after 5 s, stamped 2 s late. Unless the new
     # graph's filter continues the old one's output, it writes silence from zero a second time.
     return rebuild_problems(ffmpeg, hole=0, ahead="asetpts=PTS+%d" % (2 * SECOND), start=0)
+
+
+@check("overlap-at-graph-rebuild", "keeps the output continuous when timestamps overlap where "
+       "ffmpeg rebuilds the filter graph")
+def overlap_at_graph_rebuild(ffmpeg):
+    # The stereo part is stamped 24 ms before the 5.1 part ends. Unless the new graph's filter
+    # continues the old one's output, its first frame steps back by those 24 ms.
+    return rebuild_problems(ffmpeg, hole=-0.024)
+
+
+@check("gap-at-graph-rebuild", "fills a gap that falls where ffmpeg rebuilds the filter graph")
+def gap_at_graph_rebuild(ffmpeg):
+    # The stereo part is stamped 3 s after the 5.1 part ends. Only the old graph's filter knows
+    # where the audio stopped. Unless the new one learns it, the 3 s stay a hole.
+    return rebuild_problems(ffmpeg, hole=3)
+
+
+@check("seek-past-graph-rebuild", "writes the leading silence when ffmpeg rebuilds the filter "
+       "graph before the first frame arrives")
+def seek_past_graph_rebuild(ffmpeg):
+    # A seek to 6 s, inside a hole from 5.024 s to 8.024 s. ffmpeg decodes from before the change
+    # of layout and discards those frames ahead of the filter, so the first graph's filter never
+    # sees a frame. The audio begins 2.024 s after the seek point, and the new graph's filter owes
+    # the silence from start, 1 s after the seek point.
+    return rebuild_problems(ffmpeg, hole=3, start=1, seek=6)
 
 
 CHECKS_BY_NAME = {name: (title, function) for name, title, function in CHECKS}
