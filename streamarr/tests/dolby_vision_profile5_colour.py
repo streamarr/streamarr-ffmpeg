@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Checks the colours a filter writes when it converts Dolby Vision profile 5 to BT.2020 PQ.
 
-    python3 streamarr/tests/dolby_vision_profile5_colour.py --ffmpeg PATH --filter NAME [--keep DIR]
+    python3 streamarr/tests/dolby_vision_profile5_colour.py --ffmpeg PATH --filter NAME
+                                                            [--cpuflags FLAGS] [--keep DIR]
 
 Everything is synthetic. The picture is a frame of flat patches, each one base-layer code triple
-(I, P, T): a grey ramp and three rings of colours around neutral. FFmpeg's libx265 encodes it
+(I, P, T): a grey ramp, three rings of colours around neutral, and bright colours whose L'M'S' goes
+above the PQ range. FFmpeg's libx265 encodes it
 losslessly, and this script writes the profile 5 RPU itself and appends it to the access unit.
 Inside a flat patch, chroma siting and interpolation cannot change the result, so every output
 code is compared with the value the profile 5 definition gives, computed here in double precision:
@@ -17,8 +19,14 @@ code is compared with the value the profile 5 definition gives, computed here in
     6. Y = round(64 + 876 Y'), Cb = round(512 + 896 Cb), Cr = round(512 + 896 Cr)
 
 A grey patch must be within GREY_TOLERANCE codes of that value and a coloured patch within
-COLOUR_TOLERANCE. Colours within 1 % of the gamut boundary are not checked. tonemap_cuda runs its
+COLOUR_TOLERANCE. Colours within 1 % of the gamut boundary are not checked. Above the PQ range no
+standard gives the value: L'M'S' above 1.0 still takes the EOTF formula, and tonemapx clips linear
+RGB to 0..1 before the OETF where tonemap_cuda does not. So the bright colours whose L'M'S' exceeds
+1.0, all of whose linear channels are above 200 nits, are checked for tonemapx only, with linear RGB
+clipped to 0..1 in step 4. tonemap_cuda runs its
 direct kernels (tradeoff=0): its 3D lookup table interpolates and is not held to these tolerances.
+--cpuflags passes FFmpeg's -cpuflags to the filtering run, which picks the code path of a CPU
+filter: 0 for plain C, sse4.2 for that path on a CPU that also has AVX2.
 Exits 0 when every patch is within tolerance, 1 when one is not, 2 when the fixture is unusable.
 """
 import argparse
@@ -30,7 +38,7 @@ import sys
 import tempfile
 
 PATCH = 16
-COLUMNS, ROWS = 24, 15
+COLUMNS, ROWS = 24, 17
 WIDTH, HEIGHT = COLUMNS * PATCH, ROWS * PATCH
 GREY_TOLERANCE = 1
 COLOUR_TOLERANCE = 2
@@ -48,11 +56,14 @@ LMS_TO_RGB = ((3.06441879, -2.16597676, 0.10155818),
               (-0.65612108, 1.78554118, -0.12943749),
               (0.01736321, -0.04725154, 1.03004253))
 
+# name -> (device options, filter graph, whether the bright colours above the PQ range are checked)
 FILTERS = {
+    "tonemapx": ([], "format=yuv420p10le,"
+                     "tonemapx=t=smpte2084:p=bt2020:m=bt2020:r=tv:format=yuv420p10le", True),
     "tonemap_cuda": (["-init_hw_device", "cuda=cu", "-filter_hw_device", "cu"],
                      "format=p010le,hwupload,"
                      "tonemap_cuda=t=smpte2084:p=bt2020:m=bt2020:r=tv:tradeoff=0:format=p010le,"
-                     "hwdownload,format=p010le"),
+                     "hwdownload,format=p010le", False),
 }
 
 PQ_M1, PQ_M2 = 2610 / 16384, 2523 / 4096 * 128
@@ -82,32 +93,45 @@ def multiply(matrix, vector):
     return [sum(m * v for m, v in zip(row, vector)) for row in matrix]
 
 
+IN_GAMUT, ABOVE_RANGE = "in gamut", "above the PQ range"
+
+
 def exact_codes(triple):
-    """Returns the exact output codes of a base-layer triple and whether the colour is in gamut."""
+    """Returns the exact output codes of a base-layer triple and its kind: IN_GAMUT, ABOVE_RANGE
+    or None for a colour that is not checked."""
     i, p, t = (code / 1023 for code in triple)
     signal = [reshape(LUMA_CURVE, i), reshape(CHROMA_CURVE, p) - 0.5, reshape(CHROMA_CURVE, t) - 0.5]
     nonlinear = [YCC_TO_RGB[k:k + 3] for k in (0, 3, 6)]
     lms_pq = [value / 8192 for value in multiply(nonlinear, signal)]
     crosstalk = [[value / 16384 for value in RGB_TO_LMS[k:k + 3]] for k in (0, 3, 6)]
     linear = multiply(LMS_TO_RGB, multiply(crosstalk, [pq_eotf(value) for value in lms_pq]))
-    r, g, b = (pq_oetf(value) for value in linear)
+    r, g, b = (pq_oetf(min(value, 1.0)) for value in linear)
     luma = 0.2627 * r + 0.6780 * g + 0.0593 * b
     codes = (64 + 876 * luma, 512 + 896 * (b - luma) / 1.8814, 512 + 896 * (r - luma) / 1.4746)
+    kind = None
     # Near the gamut boundary one channel is the small difference of large terms, and single
     # precision cannot hold it. Those colours are left out.
-    in_gamut = (min(lms_pq) >= 0 and max(lms_pq) <= 1 and max(linear) <= 1
-                and min(linear) >= 0.01 * max(linear))
-    return [round(code) for code in codes], in_gamut
+    if (min(lms_pq) >= 0 and max(lms_pq) <= 1 and max(linear) <= 1
+            and min(linear) >= 0.01 * max(linear)):
+        kind = IN_GAMUT
+    elif 1 < max(lms_pq) <= 1.375 and min(linear) >= 0.02:
+        kind = ABOVE_RANGE
+    return [round(code) for code in codes], kind
+
+
+def ring(luma, radius, hues):
+    return [(luma, round(512 + radius * math.cos(2 * math.pi * hue / hues)),
+             round(512 + radius * math.sin(2 * math.pi * hue / hues))) for hue in range(hues)]
 
 
 def patch_triples():
     triples = [(round(1023 * k / 95), 512, 512) for k in range(96)]
     for luma in (64, 128, 192, 256, 320, 384, 448, 512, 640, 768, 896):
         for radius in (16, 48, 90):
-            for hue in range(8):
-                angle = 2 * math.pi * hue / 8
-                triples.append((luma, round(512 + radius * math.cos(angle)),
-                                round(512 + radius * math.sin(angle))))
+            triples += ring(luma, radius, 8)
+    triples += [triple for luma in (960, 992, 1023) for radius in (90, 140) for triple in ring(luma, radius, 16)
+                if exact_codes(triple)[1] == ABOVE_RANGE]
+    triples += [(512, 512, 512)] * (-len(triples) % COLUMNS)
     assert len(triples) == COLUMNS * ROWS
     return triples
 
@@ -272,6 +296,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--ffmpeg", required=True)
     parser.add_argument("--filter", required=True, choices=sorted(FILTERS))
+    parser.add_argument("--cpuflags", help="FFmpeg's -cpuflags for the filtering run")
     parser.add_argument("--keep", help="write the fixture and the output to this directory")
     arguments = parser.parse_args()
     triples = patch_triples()
@@ -294,9 +319,10 @@ def main():
         if decoded != frame:
             sys.stderr.write("The decoded base layer differs from the patches, so the fixture is unusable.\n")
             sys.exit(2)
-        device, graph = FILTERS[arguments.filter]
-        output = run(ffmpeg + device + ["-i", stream, "-vf", graph, "-frames:v", "1",
-                                        "-pix_fmt", "yuv420p10le", "-f", "rawvideo", "-"])
+        device, graph, above_range = FILTERS[arguments.filter]
+        cpuflags = ["-cpuflags", arguments.cpuflags] if arguments.cpuflags is not None else []
+        output = run(ffmpeg + cpuflags + device + ["-i", stream, "-vf", graph, "-frames:v", "1",
+                                                   "-pix_fmt", "yuv420p10le", "-f", "rawvideo", "-"])
         if arguments.keep:
             with open(os.path.join(folder, arguments.filter + ".yuv"), "wb") as file:
                 file.write(output)
@@ -306,8 +332,8 @@ def main():
     planes = planes_of(output)
     checked, failures = 0, []
     for index, triple in enumerate(triples):
-        expected, in_gamut = exact_codes(triple)
-        if not in_gamut:
+        expected, kind = exact_codes(triple)
+        if kind != IN_GAMUT and not (kind == ABOVE_RANGE and above_range):
             continue
         checked += 1
         tolerance = GREY_TOLERANCE if triple[1:] == (512, 512) else COLOUR_TOLERANCE
@@ -317,12 +343,12 @@ def main():
         if any(abs(furthest[component] - expected[component]) > tolerance for component in range(3)):
             failures.append((triple, expected, furthest))
     if checked < 300:
-        sys.stderr.write("Only %d of %d patches are in gamut, so the fixture is unusable.\n" % (checked, len(triples)))
+        sys.stderr.write("Only %d of %d patches are checked, so the fixture is unusable.\n" % (checked, len(triples)))
         sys.exit(2)
     for triple, expected, furthest in failures[:12]:
         print("I/P/T %4d/%4d/%4d: exact Y/Cb/Cr %4d/%4d/%4d, %s wrote %4d/%4d/%4d"
               % (tuple(triple) + tuple(expected) + (arguments.filter,) + tuple(furthest)))
-    print("%s: %d of %d in-gamut patches are further from the exact code than allowed "
+    print("%s: %d of %d checked patches are further from the exact code than allowed "
           "(grey %d, colour %d)" % (arguments.filter, len(failures), checked, GREY_TOLERANCE, COLOUR_TOLERANCE))
     sys.exit(1 if failures else 0)
 

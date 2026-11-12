@@ -1,0 +1,720 @@
+Description: avfilter/tonemapx: linearize Dolby Vision L'M'S' before the LMS to RGB matrix
+ tonemapx converted Dolby Vision L'M'S' to R'G'B' by applying the LMS
+ to RGB matrix to the PQ-coded values. The matrix is defined on linear
+ light: the conversion is PQ EOTF, matrix, PQ OETF, as libplacebo and
+ this tree's tonemap_cuda and tonemap_opencl do it. The comment on
+ lms2rgb() named the shortcut: "This implementation does not do the
+ costly linearization and de-linearization for performance reasons.
+ The output color accuracy will be affected due to this".
+ .
+ The rows of the matrix sum to one, so a neutral pixel came out right
+ and the error grew with saturation. Measured on flat synthetic patches
+ of a profile 5 source with BT.2020 PQ output, a colour 90 base-layer
+ codes from neutral came out 4 luma codes too high on average and up
+ to 14, and colours 260 codes from neutral up to 119 too high. The
+ conversion is shared by every output of the filter for the sources
+ whose reshaping it applies, which are those with RPU profile 0 and no
+ enhancement layer residual, profile 5 among them.
+ .
+ Apply the PQ EOTF to L'M'S', then the matrix, then the PQ OETF. Both
+ curves are read from tables with linear interpolation: 16384 steps
+ per unit of the signal for the EOTF, and 64 steps per octave of the
+ linear value over 40 octaves for the OETF. The C, SSE4.2 and NEON
+ paths share one scalar routine, and the AVX2 path gathers from the
+ same tables.
+ .
+ The EOTF table runs to a signal of 1.375. L'M'S' of a bright saturated
+ pixel is above 1, up to 1.36 with the profile 5 matrix, and clamping
+ it to 1 before the matrix gives a different colour from the GPU
+ filters, which do not clamp there. Linear RGB below zero comes out as
+ zero on every path. The vector paths used to carry negative R'G'B'
+ on, where the C path already clipped it. Linear RGB above one comes
+ out as one. tonemap_cuda does not clip there, so on colours brighter
+ than 10,000 nits the two filters still differ. No standard gives
+ these values.
+Author: Streamarr
+Forwarded: no
+Last-Update: 2026-11-11
+---
+Index: FFmpeg/libavfilter/aarch64/vf_tonemapx_intrin_neon.c
+===================================================================
+--- FFmpeg.orig/libavfilter/aarch64/vf_tonemapx_intrin_neon.c
++++ FFmpeg/libavfilter/aarch64/vf_tonemapx_intrin_neon.c
+@@ -210,19 +210,21 @@ inline static void ycc2rgbx4(float32x4_t* dy, float32x4_t* dcb, float32x4_t* dcr
+ 
+ inline static void lms2rgbx4(float32x4_t* dl, float32x4_t* dm, float32x4_t* ds,
+                              float32x4_t l, float32x4_t m, float32x4_t s,
+-                             const double lms2rgb_matrix[3][3])
++                             const TonemapIntParams *params)
+ {
+-    *dl = vmulq_n_f32(l, (float)lms2rgb_matrix[0][0]);
+-    *dl = vfmaq_n_f32(*dl, m, (float)lms2rgb_matrix[0][1]);
+-    *dl = vfmaq_n_f32(*dl, s, (float)lms2rgb_matrix[0][2]);
++    float lms[3][4];
++    float rgb[3][4];
+ 
+-    *dm = vmulq_n_f32(l, (float)lms2rgb_matrix[1][0]);
+-    *dm = vfmaq_n_f32(*dm, m, (float)lms2rgb_matrix[1][1]);
+-    *dm = vfmaq_n_f32(*dm, s, (float)lms2rgb_matrix[1][2]);
++    vst1q_f32(lms[0], l);
++    vst1q_f32(lms[1], m);
++    vst1q_f32(lms[2], s);
+ 
+-    *ds = vmulq_n_f32(l, (float)lms2rgb_matrix[2][0]);
+-    *ds = vfmaq_n_f32(*ds, m, (float)lms2rgb_matrix[2][1]);
+-    *ds = vfmaq_n_f32(*ds, s, (float)lms2rgb_matrix[2][2]);
++    for (int i = 0; i < 4; i++)
++        tonemapx_lms2rgb(&rgb[0][i], &rgb[1][i], &rgb[2][i], lms[0][i], lms[1][i], lms[2][i], params);
++
++    *dl = vld1q_f32(rgb[0]);
++    *dm = vld1q_f32(rgb[1]);
++    *ds = vld1q_f32(rgb[2]);
+ }
+ 
+ // Hardcoded for 10bit inputs
+@@ -558,7 +560,7 @@ void tonemap_frame_dovi_2_420p_neon(uint8_t *dsty, uint8_t *dstu, uint8_t *dstv,
+             tx4 = vcombine_f32(vget_high_f32(ia1), vget_high_f32(ia2));
+ 
+             ycc2rgbx4(&lx4, &mx4, &sx4, ix4, px4, tx4, params->dovi->nonlinear, *params->ycc_offset);
+-            lms2rgbx4(&rx4a, &gx4a, &bx4a, lx4, mx4, sx4, *params->lms2rgb_matrix);
++            lms2rgbx4(&rx4a, &gx4a, &bx4a, lx4, mx4, sx4, params);
+ 
+             rx4a = vmulq_n_f32(rx4a, JPEG_SCALE);
+             gx4a = vmulq_n_f32(gx4a, JPEG_SCALE);
+@@ -589,7 +591,7 @@ void tonemap_frame_dovi_2_420p_neon(uint8_t *dsty, uint8_t *dstu, uint8_t *dstv,
+             tx4 = vcombine_f32(vget_high_f32(ia1), vget_high_f32(ia2));
+ 
+             ycc2rgbx4(&lx4, &mx4, &sx4, ix4, px4, tx4, params->dovi->nonlinear, *params->ycc_offset);
+-            lms2rgbx4(&rx4b, &gx4b, &bx4b, lx4, mx4, sx4, *params->lms2rgb_matrix);
++            lms2rgbx4(&rx4b, &gx4b, &bx4b, lx4, mx4, sx4, params);
+ 
+             rx4b = vmulq_n_f32(rx4b, JPEG_SCALE);
+             gx4b = vmulq_n_f32(gx4b, JPEG_SCALE);
+@@ -628,7 +630,7 @@ void tonemap_frame_dovi_2_420p_neon(uint8_t *dsty, uint8_t *dstu, uint8_t *dstv,
+             tx4 = vcombine_f32(vget_high_f32(ia1), vget_high_f32(ia2));
+ 
+             ycc2rgbx4(&lx4, &mx4, &sx4, ix4, px4, tx4, params->dovi->nonlinear, *params->ycc_offset);
+-            lms2rgbx4(&rx4a, &gx4a, &bx4a, lx4, mx4, sx4, *params->lms2rgb_matrix);
++            lms2rgbx4(&rx4a, &gx4a, &bx4a, lx4, mx4, sx4, params);
+ 
+             rx4a = vmulq_n_f32(rx4a, JPEG_SCALE);
+             gx4a = vmulq_n_f32(gx4a, JPEG_SCALE);
+@@ -659,7 +661,7 @@ void tonemap_frame_dovi_2_420p_neon(uint8_t *dsty, uint8_t *dstu, uint8_t *dstv,
+             tx4 = vcombine_f32(vget_high_f32(ia1), vget_high_f32(ia2));
+ 
+             ycc2rgbx4(&lx4, &mx4, &sx4, ix4, px4, tx4, params->dovi->nonlinear, *params->ycc_offset);
+-            lms2rgbx4(&rx4b, &gx4b, &bx4b, lx4, mx4, sx4, *params->lms2rgb_matrix);
++            lms2rgbx4(&rx4b, &gx4b, &bx4b, lx4, mx4, sx4, params);
+ 
+             rx4b = vmulq_n_f32(rx4b, JPEG_SCALE);
+             gx4b = vmulq_n_f32(gx4b, JPEG_SCALE);
+@@ -1346,7 +1348,7 @@ void tonemap_frame_dovi_2_420p10_neon(uint16_t *dsty, uint16_t *dstu, uint16_t *
+             tx4 = vcombine_f32(vget_high_f32(ia1), vget_high_f32(ia2));
+ 
+             ycc2rgbx4(&lx4, &mx4, &sx4, ix4, px4, tx4, params->dovi->nonlinear, *params->ycc_offset);
+-            lms2rgbx4(&rx4a, &gx4a, &bx4a, lx4, mx4, sx4, *params->lms2rgb_matrix);
++            lms2rgbx4(&rx4a, &gx4a, &bx4a, lx4, mx4, sx4, params);
+ 
+             rx4a = vmulq_n_f32(rx4a, JPEG_SCALE);
+             gx4a = vmulq_n_f32(gx4a, JPEG_SCALE);
+@@ -1377,7 +1379,7 @@ void tonemap_frame_dovi_2_420p10_neon(uint16_t *dsty, uint16_t *dstu, uint16_t *
+             tx4 = vcombine_f32(vget_high_f32(ia1), vget_high_f32(ia2));
+ 
+             ycc2rgbx4(&lx4, &mx4, &sx4, ix4, px4, tx4, params->dovi->nonlinear, *params->ycc_offset);
+-            lms2rgbx4(&rx4b, &gx4b, &bx4b, lx4, mx4, sx4, *params->lms2rgb_matrix);
++            lms2rgbx4(&rx4b, &gx4b, &bx4b, lx4, mx4, sx4, params);
+ 
+             rx4b = vmulq_n_f32(rx4b, JPEG_SCALE);
+             gx4b = vmulq_n_f32(gx4b, JPEG_SCALE);
+@@ -1415,7 +1417,7 @@ void tonemap_frame_dovi_2_420p10_neon(uint16_t *dsty, uint16_t *dstu, uint16_t *
+             tx4 = vcombine_f32(vget_high_f32(ia1), vget_high_f32(ia2));
+ 
+             ycc2rgbx4(&lx4, &mx4, &sx4, ix4, px4, tx4, params->dovi->nonlinear, *params->ycc_offset);
+-            lms2rgbx4(&rx4a, &gx4a, &bx4a, lx4, mx4, sx4, *params->lms2rgb_matrix);
++            lms2rgbx4(&rx4a, &gx4a, &bx4a, lx4, mx4, sx4, params);
+ 
+             rx4a = vmulq_n_f32(rx4a, JPEG_SCALE);
+             gx4a = vmulq_n_f32(gx4a, JPEG_SCALE);
+@@ -1446,7 +1448,7 @@ void tonemap_frame_dovi_2_420p10_neon(uint16_t *dsty, uint16_t *dstu, uint16_t *
+             tx4 = vcombine_f32(vget_high_f32(ia1), vget_high_f32(ia2));
+ 
+             ycc2rgbx4(&lx4, &mx4, &sx4, ix4, px4, tx4, params->dovi->nonlinear, *params->ycc_offset);
+-            lms2rgbx4(&rx4b, &gx4b, &bx4b, lx4, mx4, sx4, *params->lms2rgb_matrix);
++            lms2rgbx4(&rx4b, &gx4b, &bx4b, lx4, mx4, sx4, params);
+ 
+             rx4b = vmulq_n_f32(rx4b, JPEG_SCALE);
+             gx4b = vmulq_n_f32(gx4b, JPEG_SCALE);
+@@ -1699,7 +1701,7 @@ void tonemap_frame_dovi_2_420hdr_neon(uint16_t *dsty, uint16_t *dstu, uint16_t *
+             tx4 = vcombine_f32(vget_high_f32(ia1), vget_high_f32(ia2));
+ 
+             ycc2rgbx4(&lx4, &mx4, &sx4, ix4, px4, tx4, params->dovi->nonlinear, *params->ycc_offset);
+-            lms2rgbx4(&rx4a, &gx4a, &bx4a, lx4, mx4, sx4, *params->lms2rgb_matrix);
++            lms2rgbx4(&rx4a, &gx4a, &bx4a, lx4, mx4, sx4, params);
+ 
+             rx4a = vmulq_n_f32(rx4a, JPEG_SCALE);
+             gx4a = vmulq_n_f32(gx4a, JPEG_SCALE);
+@@ -1730,7 +1732,7 @@ void tonemap_frame_dovi_2_420hdr_neon(uint16_t *dsty, uint16_t *dstu, uint16_t *
+             tx4 = vcombine_f32(vget_high_f32(ia1), vget_high_f32(ia2));
+ 
+             ycc2rgbx4(&lx4, &mx4, &sx4, ix4, px4, tx4, params->dovi->nonlinear, *params->ycc_offset);
+-            lms2rgbx4(&rx4b, &gx4b, &bx4b, lx4, mx4, sx4, *params->lms2rgb_matrix);
++            lms2rgbx4(&rx4b, &gx4b, &bx4b, lx4, mx4, sx4, params);
+ 
+             rx4b = vmulq_n_f32(rx4b, JPEG_SCALE);
+             gx4b = vmulq_n_f32(gx4b, JPEG_SCALE);
+@@ -1768,7 +1770,7 @@ void tonemap_frame_dovi_2_420hdr_neon(uint16_t *dsty, uint16_t *dstu, uint16_t *
+             tx4 = vcombine_f32(vget_high_f32(ia1), vget_high_f32(ia2));
+ 
+             ycc2rgbx4(&lx4, &mx4, &sx4, ix4, px4, tx4, params->dovi->nonlinear, *params->ycc_offset);
+-            lms2rgbx4(&rx4a, &gx4a, &bx4a, lx4, mx4, sx4, *params->lms2rgb_matrix);
++            lms2rgbx4(&rx4a, &gx4a, &bx4a, lx4, mx4, sx4, params);
+ 
+             rx4a = vmulq_n_f32(rx4a, JPEG_SCALE);
+             gx4a = vmulq_n_f32(gx4a, JPEG_SCALE);
+@@ -1799,7 +1801,7 @@ void tonemap_frame_dovi_2_420hdr_neon(uint16_t *dsty, uint16_t *dstu, uint16_t *
+             tx4 = vcombine_f32(vget_high_f32(ia1), vget_high_f32(ia2));
+ 
+             ycc2rgbx4(&lx4, &mx4, &sx4, ix4, px4, tx4, params->dovi->nonlinear, *params->ycc_offset);
+-            lms2rgbx4(&rx4b, &gx4b, &bx4b, lx4, mx4, sx4, *params->lms2rgb_matrix);
++            lms2rgbx4(&rx4b, &gx4b, &bx4b, lx4, mx4, sx4, params);
+ 
+             rx4b = vmulq_n_f32(rx4b, JPEG_SCALE);
+             gx4b = vmulq_n_f32(gx4b, JPEG_SCALE);
+Index: FFmpeg/libavfilter/vf_tonemapx.c
+===================================================================
+--- FFmpeg.orig/libavfilter/vf_tonemapx.c
++++ FFmpeg/libavfilter/vf_tonemapx.c
+@@ -99,6 +99,8 @@ typedef struct TonemapxContext {
+     float *lin_lut;
+     float *tonemap_lut;
+     uint16_t *delin_lut;
++    float *pq_eotf_lut;
++    float *pq_oetf_lut;
+     int in_yuv_off, out_yuv_off;
+ 
+     struct FFDOVIMetadataRemap *dovi;
+@@ -322,13 +324,9 @@ inline static void ycc2rgb(float* dest, float y, float cb, float cr, const doubl
+     dest[2] = (y * (float)nonlinear[2][0] + cb * (float)nonlinear[2][1] + cr * (float)nonlinear[2][2]) - ycc_offset[2];
+ }
+ 
+-// This implementation does not do the costly linearization and de-linearization for performance reasons
+-// The output color accuracy will be affected due to this
+-inline static void lms2rgb(float* dest, float l, float m, float s, const double linear[3][3], const double lms2rgb_matrix[3][3])
++inline static void lms2rgb(float* dest, float l, float m, float s, const TonemapIntParams *params)
+ {
+-    dest[0] = l * (float)lms2rgb_matrix[0][0] + m * (float)lms2rgb_matrix[0][1] + s * (float)lms2rgb_matrix[0][2];
+-    dest[1] = l * (float)lms2rgb_matrix[1][0] + m * (float)lms2rgb_matrix[1][1] + s * (float)lms2rgb_matrix[1][2];
+-    dest[2] = l * (float)lms2rgb_matrix[2][0] + m * (float)lms2rgb_matrix[2][1] + s * (float)lms2rgb_matrix[2][2];
++    tonemapx_lms2rgb(&dest[0], &dest[1], &dest[2], l, m, s, params);
+ }
+ 
+ inline static void reshape_dovi_yuv(float* dest, float* src, const TonemapIntParams *ctx)
+@@ -571,6 +569,39 @@ static int compute_trc_luts(TonemapxContext *s, enum AVColorTransferCharacterist
+     return 0;
+ }
+ 
++static int compute_dovi_pq_luts(TonemapxContext *s)
++{
++    const double m1 = 2610.0 / 16384, m2 = 2523.0 / 4096 * 128;
++    const double c1 = 3424.0 / 4096, c2 = 2413.0 / 4096 * 32, c3 = 2392.0 / 4096 * 32;
++
++    float *eotf, *oetf;
++
++    if (s->pq_eotf_lut)
++        return 0;
++
++    eotf = av_malloc_array(PQ_EOTF_LUT_SIZE, sizeof(*eotf));
++    oetf = av_malloc_array(PQ_OETF_LUT_SIZE, sizeof(*oetf));
++    if (!eotf || !oetf) {
++        av_free(eotf);
++        av_free(oetf);
++        return AVERROR(ENOMEM);
++    }
++
++    for (unsigned i = 0; i < PQ_EOTF_LUT_SIZE; i++) {
++        double p = pow(FFMIN(i, PQ_EOTF_LUT_STEPS) / (double)PQ_EOTF_LUT_UNIT, 1.0 / m2);
++        eotf[i] = pow(FFMAX(p - c1, 0.0) / (c2 - c3 * p), 1.0 / m1);
++    }
++    for (unsigned i = 0; i < PQ_OETF_LUT_SIZE; i++) {
++        double p = pow(av_int2float(PQ_OETF_LUT_MIN_BITS + (FFMIN(i, PQ_OETF_LUT_STEPS) << PQ_OETF_LUT_SHIFT)), m1);
++        oetf[i] = pow((c1 + c2 * p) / (1.0 + c3 * p), m2);
++    }
++
++    s->pq_eotf_lut = eotf;
++    s->pq_oetf_lut = oetf;
++
++    return 0;
++}
++
+ static int compute_tonemap_lut(TonemapxContext *s, enum AVColorTransferCharacteristic trc_src,
+                                enum AVColorTransferCharacteristic trc_dst)
+ {
+@@ -689,10 +720,10 @@ static inline void dovi2rgb(int y00, int y01, int y10, int y11, int u, int v,
+     ycc2rgb(c3, yuv3[0], yuv3[1], yuv3[2], params->dovi->nonlinear, *params->ycc_offset);
+     ycc2rgb(c4, yuv4[0], yuv4[1], yuv4[2], params->dovi->nonlinear, *params->ycc_offset);
+ 
+-    lms2rgb(c1, c1[0], c1[1], c1[2], params->dovi->linear, *params->lms2rgb_matrix);
+-    lms2rgb(c2, c2[0], c2[1], c2[2], params->dovi->linear, *params->lms2rgb_matrix);
+-    lms2rgb(c3, c3[0], c3[1], c3[2], params->dovi->linear, *params->lms2rgb_matrix);
+-    lms2rgb(c4, c4[0], c4[1], c4[2], params->dovi->linear, *params->lms2rgb_matrix);
++    lms2rgb(c1, c1[0], c1[1], c1[2], params);
++    lms2rgb(c2, c2[0], c2[1], c2[2], params);
++    lms2rgb(c3, c3[0], c3[1], c3[2], params);
++    lms2rgb(c4, c4[0], c4[1], c4[2], params);
+ 
+     // DoVi always uses full range
+     r[0] = av_clip_uintp2((int)(c1[0] * JPEG_SCALE), 15);
+@@ -1382,7 +1413,9 @@ TonemapIntParams params = {                                     \
+ .dovi = s->dovi,                                                \
+ .dovi_pbuf = s->dovi_pbuf,                                      \
+ .lms2rgb_matrix = &s->lms2rgb_matrix,                           \
+-.ycc_offset = &s->ycc_offset                                    \
++.ycc_offset = &s->ycc_offset,                                   \
++.pq_eotf_lut = s->pq_eotf_lut,                                  \
++.pq_oetf_lut = s->pq_oetf_lut                                   \
+ };
+ 
+ static int filter_slice_planar8(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
+@@ -1541,7 +1574,13 @@ static int filter_frame(AVFilterLink *link, AVFrame *in)
+         // such videos usually have vdr_rpu_profile == 0, for example profile 5 videos
+         // this could be wrong as there is no public documentation on this field
+         if (rpu->disable_residual_flag && rpu->vdr_rpu_profile == 0) {
+-            struct FFDOVIMetadataRemap *dovi = av_malloc(sizeof(*dovi));
++            struct FFDOVIMetadataRemap *dovi;
++
++            // Before s->dovi is set: a later frame takes the Dolby Vision path whenever it is.
++            if ((ret = compute_dovi_pq_luts(s)) < 0)
++                goto fail;
++
++            dovi = av_malloc(sizeof(*dovi));
+             s->dovi = dovi;
+             if (!s->dovi)
+                 goto fail;
+@@ -1649,6 +1688,8 @@ static void uninit(AVFilterContext *ctx)
+     av_freep(&s->lin_lut);
+     av_freep(&s->delin_lut);
+     av_freep(&s->tonemap_lut);
++    av_freep(&s->pq_eotf_lut);
++    av_freep(&s->pq_oetf_lut);
+ 
+     if (s->dovi)
+         av_freep(&s->dovi);
+Index: FFmpeg/libavfilter/vf_tonemapx.h
+===================================================================
+--- FFmpeg.orig/libavfilter/vf_tonemapx.h
++++ FFmpeg/libavfilter/vf_tonemapx.h
+@@ -21,6 +21,8 @@
+ 
+ #include "config.h"
+ #include "colorspace.h"
++#include "libavutil/common.h"
++#include "libavutil/intfloat.h"
+ 
+ #define X86_64_V2 __attribute__((target("sse4.2")))
+ #define X86_64_V3 __attribute__((target("avx2,fma")))
+@@ -83,8 +85,76 @@ typedef struct TonemapIntParams {
+     float *dovi_pbuf;
+     double (*lms2rgb_matrix)[3][3];
+     float (*ycc_offset)[3];
++    const float *pq_eotf_lut;
++    const float *pq_oetf_lut;
+ } TonemapIntParams;
+ 
++/*
++ * Tables for the PQ EOTF and its inverse, both with 1.0 as 10000 nits.
++ * The EOTF table has one entry per 1 / PQ_EOTF_LUT_UNIT of the signal up to PQ_EOTF_LUT_MAX, and
++ * one more so that the entry above the last can be read. It runs past 1.0 because L'M'S' does:
++ * with the profile 5 matrix a saturated bright pixel reaches 1.36, and the EOTF formula still
++ * holds there. The inverse table has 64 entries per octave of
++ * the linear value from 2^-PQ_OETF_LUT_OCTAVES up to 1.0, at the values whose float bit patterns
++ * are 2^17 apart, and one more for the same reason. Both are read with linear interpolation.
++ */
++#define PQ_EOTF_LUT_UNIT 16384
++#define PQ_EOTF_LUT_STEPS (PQ_EOTF_LUT_UNIT * 11 / 8)
++#define PQ_EOTF_LUT_MAX ((float)PQ_EOTF_LUT_STEPS / PQ_EOTF_LUT_UNIT) // 1.375, exact in float
++#define PQ_EOTF_LUT_SIZE (PQ_EOTF_LUT_STEPS + 2)
++#define PQ_OETF_LUT_OCTAVES 40
++#define PQ_OETF_LUT_SHIFT 17
++#define PQ_OETF_LUT_STEPS (PQ_OETF_LUT_OCTAVES << (23 - PQ_OETF_LUT_SHIFT))
++#define PQ_OETF_LUT_SIZE (PQ_OETF_LUT_STEPS + 2)
++#define PQ_OETF_LUT_MIN_BITS ((uint32_t)(127 - PQ_OETF_LUT_OCTAVES) << 23)
++
++static av_always_inline float tonemapx_pq_eotf(const float *lut, float v)
++{
++    float pos = av_clipf(v, 0.0f, PQ_EOTF_LUT_MAX) * PQ_EOTF_LUT_UNIT;
++    int i = (int)pos;
++
++    return lut[i] + (pos - (float)i) * (lut[i + 1] - lut[i]);
++}
++
++static av_always_inline float tonemapx_pq_oetf(const float *lut, float x)
++{
++    uint32_t bits, i;
++
++    if (!(x < 1.0f))
++        return x == x ? lut[PQ_OETF_LUT_STEPS] : 0.0f;
++
++    bits = av_float2int(x);
++    // Negative values have the sign bit set and compare above every positive value.
++    if (bits < PQ_OETF_LUT_MIN_BITS || bits >> 31)
++        return FFMAX(x, 0.0f) * lut[0] / av_int2float(PQ_OETF_LUT_MIN_BITS);
++
++    bits -= PQ_OETF_LUT_MIN_BITS;
++    i = bits >> PQ_OETF_LUT_SHIFT;
++
++    return lut[i] + (float)(bits & ((1 << PQ_OETF_LUT_SHIFT) - 1)) * (1.0f / (1 << PQ_OETF_LUT_SHIFT))
++                    * (lut[i + 1] - lut[i]);
++}
++
++/*
++ * Dolby Vision L'M'S' to BT.2020 R'G'B', both PQ coded: PQ EOTF, the LMS to RGB matrix on
++ * linear light, PQ OETF. The matrix is only correct on linear values. L'M'S' is clamped to
++ * 0..PQ_EOTF_LUT_MAX first, and linear RGB outside 0..1 comes out as 0 or 1.
++ */
++static av_always_inline void tonemapx_lms2rgb(float *r, float *g, float *b,
++                                              float l, float m, float s,
++                                              const TonemapIntParams *params)
++{
++    const double (*matrix)[3] = *params->lms2rgb_matrix;
++
++    l = tonemapx_pq_eotf(params->pq_eotf_lut, l);
++    m = tonemapx_pq_eotf(params->pq_eotf_lut, m);
++    s = tonemapx_pq_eotf(params->pq_eotf_lut, s);
++
++    *r = tonemapx_pq_oetf(params->pq_oetf_lut, l * (float)matrix[0][0] + m * (float)matrix[0][1] + s * (float)matrix[0][2]);
++    *g = tonemapx_pq_oetf(params->pq_oetf_lut, l * (float)matrix[1][0] + m * (float)matrix[1][1] + s * (float)matrix[1][2]);
++    *b = tonemapx_pq_oetf(params->pq_oetf_lut, l * (float)matrix[2][0] + m * (float)matrix[2][1] + s * (float)matrix[2][2]);
++}
++
+ enum SIMDVariant {
+     SIMD_NONE = -1,
+     SIMD_NEON,
+Index: FFmpeg/libavfilter/x86/vf_tonemapx_intrin_avx.c
+===================================================================
+--- FFmpeg.orig/libavfilter/x86/vf_tonemapx_intrin_avx.c
++++ FFmpeg/libavfilter/x86/vf_tonemapx_intrin_avx.c
+@@ -225,21 +225,62 @@ X86_64_V3 inline static void ycc2rgbx8(__m256* dy, __m256* dcb, __m256* dcr,
+     *dcr = _mm256_sub_ps(*dcr, _mm256_set1_ps(ycc_offset[2]));
+ }
+ 
++X86_64_V3 inline static __m256 pq_eotfx8(const float *lut, __m256 v)
++{
++    __m256 pos = _mm256_mul_ps(_mm256_min_ps(_mm256_max_ps(v, _mm256_setzero_ps()), _mm256_set1_ps(PQ_EOTF_LUT_MAX)),
++                               _mm256_set1_ps(PQ_EOTF_LUT_UNIT));
++    __m256i i = _mm256_cvttps_epi32(pos);
++    __m256 lo = _mm256_i32gather_ps(lut, i, 4);
++    __m256 hi = _mm256_i32gather_ps(lut + 1, i, 4);
++
++    return _mm256_fmadd_ps(_mm256_sub_ps(pos, _mm256_cvtepi32_ps(i)), _mm256_sub_ps(hi, lo), lo);
++}
++
++X86_64_V3 inline static __m256 pq_oetfx8(const float *lut, __m256 x)
++{
++    const float min_value = av_int2float(PQ_OETF_LUT_MIN_BITS);
++    __m256 min = _mm256_set1_ps(min_value);
++    __m256 clamped = _mm256_min_ps(_mm256_max_ps(x, min), _mm256_set1_ps(1.0f));
++    __m256i bits = _mm256_sub_epi32(_mm256_castps_si256(clamped), _mm256_set1_epi32(PQ_OETF_LUT_MIN_BITS));
++    __m256i i = _mm256_srli_epi32(bits, PQ_OETF_LUT_SHIFT);
++    __m256 frac = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_and_si256(bits, _mm256_set1_epi32((1 << PQ_OETF_LUT_SHIFT) - 1))),
++                                _mm256_set1_ps(1.0f / (1 << PQ_OETF_LUT_SHIFT)));
++    __m256 lo = _mm256_i32gather_ps(lut, i, 4);
++    __m256 hi = _mm256_i32gather_ps(lut + 1, i, 4);
++    __m256 inside = _mm256_fmadd_ps(frac, _mm256_sub_ps(hi, lo), lo);
++    // Below the table the curve is taken as a straight line to zero.
++    __m256 below = _mm256_mul_ps(_mm256_max_ps(x, _mm256_setzero_ps()), _mm256_set1_ps(lut[0] / min_value));
++
++    return _mm256_blendv_ps(inside, below, _mm256_cmp_ps(x, min, _CMP_LT_OQ));
++}
++
++// The vector form of tonemapx_lms2rgb().
+ X86_64_V3 inline static void lms2rgbx8(__m256* dl, __m256* dm, __m256* ds,
+                                        __m256 l, __m256 m, __m256 s,
+-                                       const double lms2rgb_matrix[3][3])
++                                       const TonemapIntParams *params)
+ {
+-    *dl = _mm256_mul_ps(l, _mm256_set1_ps((float)lms2rgb_matrix[0][0]));
+-    *dl = _mm256_fmadd_ps(m, _mm256_set1_ps((float)lms2rgb_matrix[0][1]), *dl);
+-    *dl = _mm256_fmadd_ps(s, _mm256_set1_ps((float)lms2rgb_matrix[0][2]), *dl);
++    const double (*matrix)[3] = *params->lms2rgb_matrix;
++    __m256 r, g, b;
++
++    l = pq_eotfx8(params->pq_eotf_lut, l);
++    m = pq_eotfx8(params->pq_eotf_lut, m);
++    s = pq_eotfx8(params->pq_eotf_lut, s);
++
++    r = _mm256_mul_ps(l, _mm256_set1_ps((float)matrix[0][0]));
++    r = _mm256_fmadd_ps(m, _mm256_set1_ps((float)matrix[0][1]), r);
++    r = _mm256_fmadd_ps(s, _mm256_set1_ps((float)matrix[0][2]), r);
++
++    g = _mm256_mul_ps(l, _mm256_set1_ps((float)matrix[1][0]));
++    g = _mm256_fmadd_ps(m, _mm256_set1_ps((float)matrix[1][1]), g);
++    g = _mm256_fmadd_ps(s, _mm256_set1_ps((float)matrix[1][2]), g);
+ 
+-    *dm = _mm256_mul_ps(l, _mm256_set1_ps((float)lms2rgb_matrix[1][0]));
+-    *dm = _mm256_fmadd_ps(m, _mm256_set1_ps((float)lms2rgb_matrix[1][1]), *dm);
+-    *dm = _mm256_fmadd_ps(s, _mm256_set1_ps((float)lms2rgb_matrix[1][2]), *dm);
++    b = _mm256_mul_ps(l, _mm256_set1_ps((float)matrix[2][0]));
++    b = _mm256_fmadd_ps(m, _mm256_set1_ps((float)matrix[2][1]), b);
++    b = _mm256_fmadd_ps(s, _mm256_set1_ps((float)matrix[2][2]), b);
+ 
+-    *ds = _mm256_mul_ps(l, _mm256_set1_ps((float)lms2rgb_matrix[2][0]));
+-    *ds = _mm256_fmadd_ps(m, _mm256_set1_ps((float)lms2rgb_matrix[2][1]), *ds);
+-    *ds = _mm256_fmadd_ps(s, _mm256_set1_ps((float)lms2rgb_matrix[2][2]), *ds);
++    *dl = pq_oetfx8(params->pq_oetf_lut, r);
++    *dm = pq_oetfx8(params->pq_oetf_lut, g);
++    *ds = pq_oetfx8(params->pq_oetf_lut, b);
+ }
+ 
+ X86_64_V3 inline static void reshapeiptx8(__m128* ipt0, __m128* ipt1, __m128* ipt2, __m128* ipt3,
+@@ -542,7 +583,7 @@ X86_64_V3 void tonemap_frame_dovi_2_420p_avx(uint8_t *dsty, uint8_t *dstu, uint8
+                              &ix8, &px8, &tx8);
+ 
+             ycc2rgbx8(&lx8, &mx8, &sx8, ix8, px8, tx8, params->dovi->nonlinear, *params->ycc_offset);
+-            lms2rgbx8(&rx8a, &gx8a, &bx8a, lx8, mx8, sx8, *params->lms2rgb_matrix);
++            lms2rgbx8(&rx8a, &gx8a, &bx8a, lx8, mx8, sx8, params);
+ 
+             rx8a = _mm256_mul_ps(rx8a, _mm256_set1_ps(JPEG_SCALE));
+             gx8a = _mm256_mul_ps(gx8a, _mm256_set1_ps(JPEG_SCALE));
+@@ -565,7 +606,7 @@ X86_64_V3 void tonemap_frame_dovi_2_420p_avx(uint8_t *dsty, uint8_t *dstu, uint8
+                              &ix8, &px8, &tx8);
+ 
+             ycc2rgbx8(&lx8, &mx8, &sx8, ix8, px8, tx8, params->dovi->nonlinear, *params->ycc_offset);
+-            lms2rgbx8(&rx8a, &gx8a, &bx8a, lx8, mx8, sx8, *params->lms2rgb_matrix);
++            lms2rgbx8(&rx8a, &gx8a, &bx8a, lx8, mx8, sx8, params);
+ 
+             rx8a = _mm256_mul_ps(rx8a, _mm256_set1_ps(JPEG_SCALE));
+             gx8a = _mm256_mul_ps(gx8a, _mm256_set1_ps(JPEG_SCALE));
+@@ -588,7 +629,7 @@ X86_64_V3 void tonemap_frame_dovi_2_420p_avx(uint8_t *dsty, uint8_t *dstu, uint8
+                              &ix8, &px8, &tx8);
+ 
+             ycc2rgbx8(&lx8, &mx8, &sx8, ix8, px8, tx8, params->dovi->nonlinear, *params->ycc_offset);
+-            lms2rgbx8(&rx8b, &gx8b, &bx8b, lx8, mx8, sx8, *params->lms2rgb_matrix);
++            lms2rgbx8(&rx8b, &gx8b, &bx8b, lx8, mx8, sx8, params);
+ 
+             rx8b = _mm256_mul_ps(rx8b, _mm256_set1_ps(JPEG_SCALE));
+             gx8b = _mm256_mul_ps(gx8b, _mm256_set1_ps(JPEG_SCALE));
+@@ -611,7 +652,7 @@ X86_64_V3 void tonemap_frame_dovi_2_420p_avx(uint8_t *dsty, uint8_t *dstu, uint8
+                              &ix8, &px8, &tx8);
+ 
+             ycc2rgbx8(&lx8, &mx8, &sx8, ix8, px8, tx8, params->dovi->nonlinear, *params->ycc_offset);
+-            lms2rgbx8(&rx8b, &gx8b, &bx8b, lx8, mx8, sx8, *params->lms2rgb_matrix);
++            lms2rgbx8(&rx8b, &gx8b, &bx8b, lx8, mx8, sx8, params);
+ 
+             rx8b = _mm256_mul_ps(rx8b, _mm256_set1_ps(JPEG_SCALE));
+             gx8b = _mm256_mul_ps(gx8b, _mm256_set1_ps(JPEG_SCALE));
+@@ -869,7 +910,7 @@ X86_64_V3 void tonemap_frame_dovi_2_420p10_avx(uint16_t *dsty, uint16_t *dstu, u
+                              &ix8, &px8, &tx8);
+ 
+             ycc2rgbx8(&lx8, &mx8, &sx8, ix8, px8, tx8, params->dovi->nonlinear, *params->ycc_offset);
+-            lms2rgbx8(&rx8a, &gx8a, &bx8a, lx8, mx8, sx8, *params->lms2rgb_matrix);
++            lms2rgbx8(&rx8a, &gx8a, &bx8a, lx8, mx8, sx8, params);
+ 
+             rx8a = _mm256_mul_ps(rx8a, _mm256_set1_ps(JPEG_SCALE));
+             gx8a = _mm256_mul_ps(gx8a, _mm256_set1_ps(JPEG_SCALE));
+@@ -892,7 +933,7 @@ X86_64_V3 void tonemap_frame_dovi_2_420p10_avx(uint16_t *dsty, uint16_t *dstu, u
+                              &ix8, &px8, &tx8);
+ 
+             ycc2rgbx8(&lx8, &mx8, &sx8, ix8, px8, tx8, params->dovi->nonlinear, *params->ycc_offset);
+-            lms2rgbx8(&rx8a, &gx8a, &bx8a, lx8, mx8, sx8, *params->lms2rgb_matrix);
++            lms2rgbx8(&rx8a, &gx8a, &bx8a, lx8, mx8, sx8, params);
+ 
+             rx8a = _mm256_mul_ps(rx8a, _mm256_set1_ps(JPEG_SCALE));
+             gx8a = _mm256_mul_ps(gx8a, _mm256_set1_ps(JPEG_SCALE));
+@@ -915,7 +956,7 @@ X86_64_V3 void tonemap_frame_dovi_2_420p10_avx(uint16_t *dsty, uint16_t *dstu, u
+                              &ix8, &px8, &tx8);
+ 
+             ycc2rgbx8(&lx8, &mx8, &sx8, ix8, px8, tx8, params->dovi->nonlinear, *params->ycc_offset);
+-            lms2rgbx8(&rx8b, &gx8b, &bx8b, lx8, mx8, sx8, *params->lms2rgb_matrix);
++            lms2rgbx8(&rx8b, &gx8b, &bx8b, lx8, mx8, sx8, params);
+ 
+             rx8b = _mm256_mul_ps(rx8b, _mm256_set1_ps(JPEG_SCALE));
+             gx8b = _mm256_mul_ps(gx8b, _mm256_set1_ps(JPEG_SCALE));
+@@ -938,7 +979,7 @@ X86_64_V3 void tonemap_frame_dovi_2_420p10_avx(uint16_t *dsty, uint16_t *dstu, u
+                              &ix8, &px8, &tx8);
+ 
+             ycc2rgbx8(&lx8, &mx8, &sx8, ix8, px8, tx8, params->dovi->nonlinear, *params->ycc_offset);
+-            lms2rgbx8(&rx8b, &gx8b, &bx8b, lx8, mx8, sx8, *params->lms2rgb_matrix);
++            lms2rgbx8(&rx8b, &gx8b, &bx8b, lx8, mx8, sx8, params);
+ 
+             rx8b = _mm256_mul_ps(rx8b, _mm256_set1_ps(JPEG_SCALE));
+             gx8b = _mm256_mul_ps(gx8b, _mm256_set1_ps(JPEG_SCALE));
+@@ -1189,7 +1230,7 @@ X86_64_V3 void tonemap_frame_dovi_2_420hdr_avx(uint16_t *dsty, uint16_t *dstu, u
+                              &ix8, &px8, &tx8);
+ 
+             ycc2rgbx8(&lx8, &mx8, &sx8, ix8, px8, tx8, params->dovi->nonlinear, *params->ycc_offset);
+-            lms2rgbx8(&rx8a, &gx8a, &bx8a, lx8, mx8, sx8, *params->lms2rgb_matrix);
++            lms2rgbx8(&rx8a, &gx8a, &bx8a, lx8, mx8, sx8, params);
+ 
+             rx8a = _mm256_mul_ps(rx8a, _mm256_set1_ps(JPEG_SCALE));
+             gx8a = _mm256_mul_ps(gx8a, _mm256_set1_ps(JPEG_SCALE));
+@@ -1212,7 +1253,7 @@ X86_64_V3 void tonemap_frame_dovi_2_420hdr_avx(uint16_t *dsty, uint16_t *dstu, u
+                              &ix8, &px8, &tx8);
+ 
+             ycc2rgbx8(&lx8, &mx8, &sx8, ix8, px8, tx8, params->dovi->nonlinear, *params->ycc_offset);
+-            lms2rgbx8(&rx8a, &gx8a, &bx8a, lx8, mx8, sx8, *params->lms2rgb_matrix);
++            lms2rgbx8(&rx8a, &gx8a, &bx8a, lx8, mx8, sx8, params);
+ 
+             rx8a = _mm256_mul_ps(rx8a, _mm256_set1_ps(JPEG_SCALE));
+             gx8a = _mm256_mul_ps(gx8a, _mm256_set1_ps(JPEG_SCALE));
+@@ -1235,7 +1276,7 @@ X86_64_V3 void tonemap_frame_dovi_2_420hdr_avx(uint16_t *dsty, uint16_t *dstu, u
+                              &ix8, &px8, &tx8);
+ 
+             ycc2rgbx8(&lx8, &mx8, &sx8, ix8, px8, tx8, params->dovi->nonlinear, *params->ycc_offset);
+-            lms2rgbx8(&rx8b, &gx8b, &bx8b, lx8, mx8, sx8, *params->lms2rgb_matrix);
++            lms2rgbx8(&rx8b, &gx8b, &bx8b, lx8, mx8, sx8, params);
+ 
+             rx8b = _mm256_mul_ps(rx8b, _mm256_set1_ps(JPEG_SCALE));
+             gx8b = _mm256_mul_ps(gx8b, _mm256_set1_ps(JPEG_SCALE));
+@@ -1258,7 +1299,7 @@ X86_64_V3 void tonemap_frame_dovi_2_420hdr_avx(uint16_t *dsty, uint16_t *dstu, u
+                              &ix8, &px8, &tx8);
+ 
+             ycc2rgbx8(&lx8, &mx8, &sx8, ix8, px8, tx8, params->dovi->nonlinear, *params->ycc_offset);
+-            lms2rgbx8(&rx8b, &gx8b, &bx8b, lx8, mx8, sx8, *params->lms2rgb_matrix);
++            lms2rgbx8(&rx8b, &gx8b, &bx8b, lx8, mx8, sx8, params);
+ 
+             rx8b = _mm256_mul_ps(rx8b, _mm256_set1_ps(JPEG_SCALE));
+             gx8b = _mm256_mul_ps(gx8b, _mm256_set1_ps(JPEG_SCALE));
+Index: FFmpeg/libavfilter/x86/vf_tonemapx_intrin_sse.c
+===================================================================
+--- FFmpeg.orig/libavfilter/x86/vf_tonemapx_intrin_sse.c
++++ FFmpeg/libavfilter/x86/vf_tonemapx_intrin_sse.c
+@@ -264,19 +264,21 @@ X86_64_V2 inline static void ycc2rgbx4(__m128* dy, __m128* dcb, __m128* dcr,
+ 
+ X86_64_V2 inline static void lms2rgbx4(__m128* dl, __m128* dm, __m128* ds,
+                                        __m128 l, __m128 m, __m128 s,
+-                                       const double lms2rgb_matrix[3][3])
++                                       const TonemapIntParams *params)
+ {
+-    *dl = _mm_mul_ps(l, _mm_set1_ps((float)lms2rgb_matrix[0][0]));
+-    *dl = _mm_add_ps(*dl, _mm_mul_ps(m, _mm_set1_ps((float)lms2rgb_matrix[0][1])));
+-    *dl = _mm_add_ps(*dl, _mm_mul_ps(s, _mm_set1_ps((float)lms2rgb_matrix[0][2])));
++    float lms[3][4];
++    float rgb[3][4];
+ 
+-    *dm = _mm_mul_ps(l, _mm_set1_ps((float)lms2rgb_matrix[1][0]));
+-    *dm = _mm_add_ps(*dm, _mm_mul_ps(m, _mm_set1_ps((float)lms2rgb_matrix[1][1])));
+-    *dm = _mm_add_ps(*dm, _mm_mul_ps(s, _mm_set1_ps((float)lms2rgb_matrix[1][2])));
++    _mm_storeu_ps(lms[0], l);
++    _mm_storeu_ps(lms[1], m);
++    _mm_storeu_ps(lms[2], s);
+ 
+-    *ds = _mm_mul_ps(l, _mm_set1_ps((float)lms2rgb_matrix[2][0]));
+-    *ds = _mm_add_ps(*ds, _mm_mul_ps(m, _mm_set1_ps((float)lms2rgb_matrix[2][1])));
+-    *ds = _mm_add_ps(*ds, _mm_mul_ps(s, _mm_set1_ps((float)lms2rgb_matrix[2][2])));
++    for (int i = 0; i < 4; i++)
++        tonemapx_lms2rgb(&rgb[0][i], &rgb[1][i], &rgb[2][i], lms[0][i], lms[1][i], lms[2][i], params);
++
++    *dl = _mm_loadu_ps(rgb[0]);
++    *dm = _mm_loadu_ps(rgb[1]);
++    *ds = _mm_loadu_ps(rgb[2]);
+ }
+ 
+ X86_64_V2 static inline void tonemap_int32x4_sse(__m128i r_in, __m128i g_in, __m128i b_in,
+@@ -526,7 +528,7 @@ X86_64_V2 void tonemap_frame_dovi_2_420p_sse(uint8_t *dsty, uint8_t *dstu, uint8
+             tx4 = _mm_shuffle_ps(ia1, ia2, _MM_SHUFFLE(3, 2, 3, 2));
+ 
+             ycc2rgbx4(&lx4, &mx4, &sx4, ix4, px4, tx4, params->dovi->nonlinear, *params->ycc_offset);
+-            lms2rgbx4(&rx4a, &gx4a, &bx4a, lx4, mx4, sx4, *params->lms2rgb_matrix);
++            lms2rgbx4(&rx4a, &gx4a, &bx4a, lx4, mx4, sx4, params);
+ 
+             rx4a = _mm_mul_ps(rx4a, _mm_set1_ps(JPEG_SCALE));
+             gx4a = _mm_mul_ps(gx4a, _mm_set1_ps(JPEG_SCALE));
+@@ -569,7 +571,7 @@ X86_64_V2 void tonemap_frame_dovi_2_420p_sse(uint8_t *dsty, uint8_t *dstu, uint8
+             tx4 = _mm_shuffle_ps(ia1, ia2, _MM_SHUFFLE(3, 2, 3, 2));
+ 
+             ycc2rgbx4(&lx4, &mx4, &sx4, ix4, px4, tx4, params->dovi->nonlinear, *params->ycc_offset);
+-            lms2rgbx4(&rx4a, &gx4a, &bx4a, lx4, mx4, sx4, *params->lms2rgb_matrix);
++            lms2rgbx4(&rx4a, &gx4a, &bx4a, lx4, mx4, sx4, params);
+ 
+             rx4a = _mm_mul_ps(rx4a, _mm_set1_ps(JPEG_SCALE));
+             gx4a = _mm_mul_ps(gx4a, _mm_set1_ps(JPEG_SCALE));
+@@ -612,7 +614,7 @@ X86_64_V2 void tonemap_frame_dovi_2_420p_sse(uint8_t *dsty, uint8_t *dstu, uint8
+             tx4 = _mm_shuffle_ps(ia1, ia2, _MM_SHUFFLE(3, 2, 3, 2));
+ 
+             ycc2rgbx4(&lx4, &mx4, &sx4, ix4, px4, tx4, params->dovi->nonlinear, *params->ycc_offset);
+-            lms2rgbx4(&rx4b, &gx4b, &bx4b, lx4, mx4, sx4, *params->lms2rgb_matrix);
++            lms2rgbx4(&rx4b, &gx4b, &bx4b, lx4, mx4, sx4, params);
+ 
+             rx4b = _mm_mul_ps(rx4b, _mm_set1_ps(JPEG_SCALE));
+             gx4b = _mm_mul_ps(gx4b, _mm_set1_ps(JPEG_SCALE));
+@@ -655,7 +657,7 @@ X86_64_V2 void tonemap_frame_dovi_2_420p_sse(uint8_t *dsty, uint8_t *dstu, uint8
+             tx4 = _mm_shuffle_ps(ia1, ia2, _MM_SHUFFLE(3, 2, 3, 2));
+ 
+             ycc2rgbx4(&lx4, &mx4, &sx4, ix4, px4, tx4, params->dovi->nonlinear, *params->ycc_offset);
+-            lms2rgbx4(&rx4b, &gx4b, &bx4b, lx4, mx4, sx4, *params->lms2rgb_matrix);
++            lms2rgbx4(&rx4b, &gx4b, &bx4b, lx4, mx4, sx4, params);
+ 
+             rx4b = _mm_mul_ps(rx4b, _mm_set1_ps(JPEG_SCALE));
+             gx4b = _mm_mul_ps(gx4b, _mm_set1_ps(JPEG_SCALE));
+@@ -927,7 +929,7 @@ X86_64_V2 void tonemap_frame_dovi_2_420p10_sse(uint16_t *dsty, uint16_t *dstu, u
+             tx4 = _mm_shuffle_ps(ia1, ia2, _MM_SHUFFLE(3, 2, 3, 2));
+ 
+             ycc2rgbx4(&lx4, &mx4, &sx4, ix4, px4, tx4, params->dovi->nonlinear, *params->ycc_offset);
+-            lms2rgbx4(&rx4a, &gx4a, &bx4a, lx4, mx4, sx4, *params->lms2rgb_matrix);
++            lms2rgbx4(&rx4a, &gx4a, &bx4a, lx4, mx4, sx4, params);
+ 
+             rx4a = _mm_mul_ps(rx4a, _mm_set1_ps(JPEG_SCALE));
+             gx4a = _mm_mul_ps(gx4a, _mm_set1_ps(JPEG_SCALE));
+@@ -970,7 +972,7 @@ X86_64_V2 void tonemap_frame_dovi_2_420p10_sse(uint16_t *dsty, uint16_t *dstu, u
+             tx4 = _mm_shuffle_ps(ia1, ia2, _MM_SHUFFLE(3, 2, 3, 2));
+ 
+             ycc2rgbx4(&lx4, &mx4, &sx4, ix4, px4, tx4, params->dovi->nonlinear, *params->ycc_offset);
+-            lms2rgbx4(&rx4a, &gx4a, &bx4a, lx4, mx4, sx4, *params->lms2rgb_matrix);
++            lms2rgbx4(&rx4a, &gx4a, &bx4a, lx4, mx4, sx4, params);
+ 
+             rx4a = _mm_mul_ps(rx4a, _mm_set1_ps(JPEG_SCALE));
+             gx4a = _mm_mul_ps(gx4a, _mm_set1_ps(JPEG_SCALE));
+@@ -1013,7 +1015,7 @@ X86_64_V2 void tonemap_frame_dovi_2_420p10_sse(uint16_t *dsty, uint16_t *dstu, u
+             tx4 = _mm_shuffle_ps(ia1, ia2, _MM_SHUFFLE(3, 2, 3, 2));
+ 
+             ycc2rgbx4(&lx4, &mx4, &sx4, ix4, px4, tx4, params->dovi->nonlinear, *params->ycc_offset);
+-            lms2rgbx4(&rx4b, &gx4b, &bx4b, lx4, mx4, sx4, *params->lms2rgb_matrix);
++            lms2rgbx4(&rx4b, &gx4b, &bx4b, lx4, mx4, sx4, params);
+ 
+             rx4b = _mm_mul_ps(rx4b, _mm_set1_ps(JPEG_SCALE));
+             gx4b = _mm_mul_ps(gx4b, _mm_set1_ps(JPEG_SCALE));
+@@ -1056,7 +1058,7 @@ X86_64_V2 void tonemap_frame_dovi_2_420p10_sse(uint16_t *dsty, uint16_t *dstu, u
+             tx4 = _mm_shuffle_ps(ia1, ia2, _MM_SHUFFLE(3, 2, 3, 2));
+ 
+             ycc2rgbx4(&lx4, &mx4, &sx4, ix4, px4, tx4, params->dovi->nonlinear, *params->ycc_offset);
+-            lms2rgbx4(&rx4b, &gx4b, &bx4b, lx4, mx4, sx4, *params->lms2rgb_matrix);
++            lms2rgbx4(&rx4b, &gx4b, &bx4b, lx4, mx4, sx4, params);
+ 
+             rx4b = _mm_mul_ps(rx4b, _mm_set1_ps(JPEG_SCALE));
+             gx4b = _mm_mul_ps(gx4b, _mm_set1_ps(JPEG_SCALE));
+@@ -1322,7 +1324,7 @@ X86_64_V2 void tonemap_frame_dovi_2_420hdr_sse(uint16_t *dsty, uint16_t *dstu, u
+             tx4 = _mm_shuffle_ps(ia1, ia2, _MM_SHUFFLE(3, 2, 3, 2));
+ 
+             ycc2rgbx4(&lx4, &mx4, &sx4, ix4, px4, tx4, params->dovi->nonlinear, *params->ycc_offset);
+-            lms2rgbx4(&rx4a, &gx4a, &bx4a, lx4, mx4, sx4, *params->lms2rgb_matrix);
++            lms2rgbx4(&rx4a, &gx4a, &bx4a, lx4, mx4, sx4, params);
+ 
+             rx4a = _mm_mul_ps(rx4a, _mm_set1_ps(JPEG_SCALE));
+             gx4a = _mm_mul_ps(gx4a, _mm_set1_ps(JPEG_SCALE));
+@@ -1365,7 +1367,7 @@ X86_64_V2 void tonemap_frame_dovi_2_420hdr_sse(uint16_t *dsty, uint16_t *dstu, u
+             tx4 = _mm_shuffle_ps(ia1, ia2, _MM_SHUFFLE(3, 2, 3, 2));
+ 
+             ycc2rgbx4(&lx4, &mx4, &sx4, ix4, px4, tx4, params->dovi->nonlinear, *params->ycc_offset);
+-            lms2rgbx4(&rx4a, &gx4a, &bx4a, lx4, mx4, sx4, *params->lms2rgb_matrix);
++            lms2rgbx4(&rx4a, &gx4a, &bx4a, lx4, mx4, sx4, params);
+ 
+             rx4a = _mm_mul_ps(rx4a, _mm_set1_ps(JPEG_SCALE));
+             gx4a = _mm_mul_ps(gx4a, _mm_set1_ps(JPEG_SCALE));
+@@ -1408,7 +1410,7 @@ X86_64_V2 void tonemap_frame_dovi_2_420hdr_sse(uint16_t *dsty, uint16_t *dstu, u
+             tx4 = _mm_shuffle_ps(ia1, ia2, _MM_SHUFFLE(3, 2, 3, 2));
+ 
+             ycc2rgbx4(&lx4, &mx4, &sx4, ix4, px4, tx4, params->dovi->nonlinear, *params->ycc_offset);
+-            lms2rgbx4(&rx4b, &gx4b, &bx4b, lx4, mx4, sx4, *params->lms2rgb_matrix);
++            lms2rgbx4(&rx4b, &gx4b, &bx4b, lx4, mx4, sx4, params);
+ 
+             rx4b = _mm_mul_ps(rx4b, _mm_set1_ps(JPEG_SCALE));
+             gx4b = _mm_mul_ps(gx4b, _mm_set1_ps(JPEG_SCALE));
+@@ -1451,7 +1453,7 @@ X86_64_V2 void tonemap_frame_dovi_2_420hdr_sse(uint16_t *dsty, uint16_t *dstu, u
+             tx4 = _mm_shuffle_ps(ia1, ia2, _MM_SHUFFLE(3, 2, 3, 2));
+ 
+             ycc2rgbx4(&lx4, &mx4, &sx4, ix4, px4, tx4, params->dovi->nonlinear, *params->ycc_offset);
+-            lms2rgbx4(&rx4b, &gx4b, &bx4b, lx4, mx4, sx4, *params->lms2rgb_matrix);
++            lms2rgbx4(&rx4b, &gx4b, &bx4b, lx4, mx4, sx4, params);
+ 
+             rx4b = _mm_mul_ps(rx4b, _mm_set1_ps(JPEG_SCALE));
+             gx4b = _mm_mul_ps(gx4b, _mm_set1_ps(JPEG_SCALE));

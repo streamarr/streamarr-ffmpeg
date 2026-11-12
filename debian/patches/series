@@ -106,3 +106,4 @@
 0106-unref-the-last-frame-on-filter-graph-cleanup.patch
 streamarr-0001-unchoke-every-destination-of-a-stream.patch
 streamarr-0002-round-tonemap-cuda-output-to-the-nearest-code.patch
+streamarr-0003-linearize-dolby-vision-lms-in-tonemapx.patch
