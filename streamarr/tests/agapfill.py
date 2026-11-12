@@ -1273,7 +1273,8 @@ def held_problems(frame_list, data, counter, gap, end, lost=0, begin=0):
     sample stamped last is source sample `source`. The output begins at `begin`, and before the
     gap each sample is the source sample its timestamp names. By rule 6 the real audio the fill
     still held becomes silence, at most HELD_LIMIT samples, and the audio after it keeps its own
-    time up to `end`. The filter behind the fill loses what it held, so the timeline may step
+    time up to `end`. When last is `end`, the audio the fill held was the last, and the silence
+    runs to the end. The filter behind the fill loses what it held, so the timeline may step
     forward once inside the silence, by at most `lost` samples.
     """
     first, last, source = gap
@@ -1297,8 +1298,10 @@ def held_problems(frame_list, data, counter, gap, end, lost=0, begin=0):
         at += length
     if at * width != len(data):
         return problems + ["the frames hold %d samples, the output %d" % (at, len(data) // width)]
-    if resumed is None:
+    if resumed is None and last != end:
         return problems + ["the output holds no audio after the gap"]
+    if resumed is None:
+        resumed = end
     if not last <= resumed <= last + HELD_LIMIT:
         return problems + ["after the gap the first sample that is not silence is stamped %d "
                            "(%.6f s) and is %s, expected a stamp from %d to %d"
@@ -1308,9 +1311,12 @@ def held_problems(frame_list, data, counter, gap, end, lost=0, begin=0):
         pts, step = steps[0]
         return problems + ["the output timeline breaks %d times: first by %d samples at a frame "
                            "stamped %d" % (len(steps), step, pts)]
-    print("         the fill held %d samples (%.3f s) of real audio, now silence; the timeline "
-          "steps forward by %d samples" % (resumed - last, (resumed - last) / RATE,
-                                           sum(step for _, step in steps)))
+    count = resumed - last
+    held = "the fill held %d samples (%.3f s) of real audio" % (count, count / RATE)
+    if last == end:
+        held = "the fill held the last of the audio"
+    print("         %s, now silence; the timeline steps forward by %d samples"
+          % (held, sum(step for _, step in steps)))
 
     def expected(pts, length):
         """Source up to the gap, silence up to where the audio resumes, then the audio after it."""
