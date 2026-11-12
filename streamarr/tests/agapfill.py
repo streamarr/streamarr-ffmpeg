@@ -54,6 +54,8 @@ TIME_LIMIT = 120
 FILE_SIZE = 256 << 20
 SHOWINFO = re.compile(r"Parsed_ashowinfo\S* @ \S+ n:\d+ pts:(-?\d+|NOPTS) pts_time:(\S+) fmt:(\S+) "
                       r"channels:\d+ chlayout:\S+ rate:\d+ nb_samples:(\d+)")
+# A line that an agapfill filter logged, under its default name or the one the graph gives it.
+FILL_LINE = re.compile(r"\[(Parsed_)?agapfill\S* @ ")
 
 
 class Unusable(Exception):
@@ -983,16 +985,18 @@ def ac3_parts(ffmpeg, work, parts):
     return path
 
 
-def rebuild_problems(ffmpeg, *, hole, ahead="anull", start=None, seek=None, names=("agapfill",)):
+def rebuild_problems(ffmpeg, *, hole, ahead="anull", after="anull", start=None, seek=None,
+                     names=("agapfill",)):
     """Fills audio that changes layout and compares the output with the rules' timeline.
 
-    `ahead` is the filter chain ahead of the fill. The fill is one agapfill filter for each of
+    `ahead` is the filter chain ahead of the fill, and `after` the one behind it, where a trim can
+    end a run that would write silence without end. The fill is one agapfill filter for each of
     `names`, one after the other. The reference is the same decode without the fill: its frames
     are the input, and its samples are the real audio. ffmpeg builds a new filter graph at the
     change of layout.
     """
     option = "" if start is None else "=start=%d" % start
-    fill = chain(*(name + option for name in names))
+    fill = chain(*(name + option for name in names), after)
     with tempfile.TemporaryDirectory() as work:
         source = ac3_parts(ffmpeg, work, [("5.1", RATE, 0), ("stereo", RATE, hole)])
 
@@ -1006,7 +1010,10 @@ def rebuild_problems(ffmpeg, *, hole, ahead="anull", start=None, seek=None, name
     if plain.code or "Reconfiguring filter graph" not in plain.log:
         raise Unusable("ffmpeg did not rebuild the filter graph at the change of layout")
     if filled.code:
-        return ["FFmpeg ended with status %d: %s" % (filled.code, last_lines(filled.log))]
+        # At this log level agapfill logs only its errors, and ffmpeg's last lines leave them out.
+        said = [line for line in filled.log.splitlines() if FILL_LINE.match(line)]
+        return ["FFmpeg ended with status %d: %s"
+                % (filled.code, " | ".join(said[:1] + [last_lines(filled.log)]))]
     first, runs = timeline_by_the_rules(frames_of(plain.log),
                                         None if start is None else start * RATE)
     problems = check_frames(frames_of(filled.log), first, runs, DEFAULT_PACKET, RATE)
