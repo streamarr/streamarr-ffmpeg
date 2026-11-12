@@ -369,10 +369,10 @@ def timeline_problems(ffmpeg, chain, first, runs, *, count, sample_format="s16",
 REFUSED = 234
 
 
-def refusal_problems(ffmpeg, chain, words, *, count):
+def refusal_problems(ffmpeg, chain, words, *, count, rate=RATE):
     """Expects FFmpeg to refuse `chain` with an error line that holds `words`."""
     counter = COUNTERS["s16"]
-    done = execute(filter_command(ffmpeg, counter.lavfi(count, RATE), chain, counter), byte_count)
+    done = execute(filter_command(ffmpeg, counter.lavfi(count, rate), chain, counter), byte_count)
     if done.code != REFUSED:
         return ["FFmpeg ended with status %d after %d bytes, expected status %d: %s"
                 % (done.code, done.result, REFUSED, last_lines(done.log))]
@@ -427,10 +427,11 @@ def timeline_check(name, title, shape, options, first, runs, *, after=None, **se
         return timeline_problems(ffmpeg, chain(*parts), first, runs, **settings)
 
 
-def refusal_check(name, title, shape, options, words, *, count):
+def refusal_check(name, title, shape, options, words, *, after=None, **settings):
     @check(name, title)
     def run(ffmpeg):
-        return refusal_problems(ffmpeg, chain(shape, "agapfill=" + options), words, count=count)
+        parts = [shape, "agapfill=" + options] + ([after] if after else [])
+        return refusal_problems(ffmpeg, chain(*parts), words, **settings)
 
 
 # --- Gaps ---------------------------------------------------------------------------------------
