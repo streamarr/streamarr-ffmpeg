@@ -715,7 +715,31 @@ timeline_check("step-wider-than-the-range", "passes a step at or under threshold
                [real(0, 409600), step(-10**19), real(409600, 409600)], count=819200,
                rate=2000000)
 
-timeline_check("packet-size","writes silence in frames of packet_size samples", EIGHT_SECOND_GAP,
+# max_gap=5,000,000,000,000 s is 10^19 samples at 2 MHz, and the gap from -6 x 10^18 to
+# +6 x 10^18 samples is 1.2 x 10^19. Unless the filter compares the whole silence with max_gap,
+# the silence stops at the largest timestamp, reads as shorter than max_gap, and the gap passes.
+# The trim ends the silence of a run that is not refused.
+refusal_check("max-gap-on-a-gap-wider-than-the-range", "fails on a gap longer than max_gap when the "
+              "gap does not fit a 64-bit timestamp",
+              chain(frames(4096), stamp("PTS-6e18+12e18*gte(N,409600)")), "max_gap=5000000000000",
+              "max_gap", after="atrim=end_sample=819200", count=819200, rate=2000000)
+
+# start=-4,000,000,000,000 s is -8 x 10^18 samples at 2 MHz, and the first frame is at
+# +6 x 10^18: a lead of 1.4 x 10^19 samples. Unless the filter keeps the whole lead, the output
+# begins where the lead, stopped at the largest timestamp, reaches back from the first frame, and
+# max_gap=6,000,000,000,000 s, which is 1.2 x 10^19 samples, lets the lead pass.
+LEAD_WIDER_THAN_THE_RANGE = chain(frames(4096), stamp("PTS+6e18"))
+
+timeline_check("lead-wider-than-the-range", "begins at start when the lead does not fit a 64-bit "
+               "timestamp", LEAD_WIDER_THAN_THE_RANGE, "start=-4000000000000", -8 * 10**18,
+               [silence(819200)], after="atrim=end_sample=819200", count=819200, rate=2000000)
+
+refusal_check("max-gap-on-a-lead-wider-than-the-range", "fails on a lead longer than max_gap when "
+              "the lead does not fit a 64-bit timestamp", LEAD_WIDER_THAN_THE_RANGE,
+              "start=-4000000000000:max_gap=6000000000000", "max_gap",
+              after="atrim=end_sample=819200", count=819200, rate=2000000)
+
+timeline_check("packet-size", "writes silence in frames of packet_size samples", EIGHT_SECOND_GAP,
                "packet_size=1000", 0, EIGHT_SECOND_TIMELINE, count=24 * SECOND, packet_size=1000)
 
 # A gap of 31,000 years. Unless the fill stops when the trim after it has what it needs, FFmpeg
@@ -1072,6 +1096,19 @@ refusal_check("max-gap-on-the-end-after-resume", "fails on silence up to the end
 timeline_check("resume-command-incomplete", "starts afresh when the resume command names no "
                "whole position", chain(LATE_BY_8_SECONDS, resume_command("96000/96000")), "start=0", 0,
                [silence(8 * SECOND), real(0, 10 * SECOND)], count=10 * SECOND)
+
+# The other filter stood at 8,192 samples of output at 4 MHz and had output no audio, which its
+# report gives as the smallest timestamp. At 2 MHz that end becomes about -4.6 x 10^18 samples, and
+# threshold=6,000,000,000,000 s, which is 1.2 x 10^19 samples, reaches past it. Unless the filter
+# knows that the other filter had output no audio, the first frame reads as a short step from
+# there and moves the output by 4.6 x 10^18 samples. It must take silence up to its own timestamp
+# instead, as the end of the lead that the other filter began.
+timeline_check("resume-command-lead-past-a-wide-threshold", "fills the lead the other filter began "
+               "up to the first frame when threshold reaches past the smallest timestamp",
+               chain(frames(4096), stamp("PTS+8192"),
+                     resume_command("8192/%d/16384/4000000" % -LARGEST_TIMESTAMP)),
+               "threshold=6000000000000", 4096, [silence(4096), real(0, 819200)], count=819200,
+               rate=2000000)
 
 FAR = 9 * 10 ** 18
 
