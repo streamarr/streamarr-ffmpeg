@@ -22,7 +22,9 @@ of silence. The expectations come from the rules the filter documents, not from 
        the gap, and a gap longer than `max_gap` is an error.
     6. When ffmpeg builds a new filter graph mid-stream, the new graph's filter continues the
        output of the old one, so rules 1 to 4 hold across the change. The old one first outputs
-       every frame it has.
+       every frame it has. When a filter behind it waits for another input of the graph, the
+       real audio the old one still holds becomes silence instead, and what the waiting filter
+       holds is lost.
 
 Exits 0 when every check passes, 1 when one fails, 2 when a fixture is unusable.
 """
@@ -1193,6 +1195,161 @@ def rebuild_during_gap_behind_finished_output(ffmpeg):
 def rebuild_during_lead(ffmpeg):
     return beside_video(ffmpeg, chain(frames(4800), stamp("PTS+%d" % (20 * SECOND))),
                         "=start=0", 0, [silence(20 * SECOND), real(0, 40 * SECOND)])
+
+
+# The real audio a fill may hold when ffmpeg frees a graph in which a filter behind the fill waits
+# for another input: the frame from after the gap and the frames queued behind it. Ten frames of
+# 4,800 samples.
+HELD_LIMIT = SECOND
+
+
+def held_problems(frame_list, data, counter, gap, end, lost=0, begin=0):
+    """Checks output in which ffmpeg rebuilt the filter graph during a gap while a filter behind the
+    fill waited for another input of the graph.
+
+    `gap` is (first, last, source): the gap runs from timestamp first to timestamp last, and the
+    sample stamped last is source sample `source`. The output begins at `begin`, and before the
+    gap each sample is the source sample its timestamp names. By rule 6 the real audio the fill
+    still held becomes silence, at most HELD_LIMIT samples, and the audio after it keeps its own
+    time up to `end`. The filter behind the fill loses what it held, so the timeline may step
+    forward once inside the silence, by at most `lost` samples.
+    """
+    first, last, source = gap
+    width = counter.width
+    if not frame_list:
+        return ["no frame came out of the filter"]
+    if any(pts is None for pts, _, _, _ in frame_list):
+        return ["a frame has no timestamp"]
+    problems = []
+    if frame_list[0][0] != begin:
+        problems.append("the first frame is stamped %d, expected %d" % (frame_list[0][0], begin))
+    steps = [(after, after - before - length) for (before, length, _, _), (after, _, _, _)
+             in zip(frame_list, frame_list[1:]) if after != before + length]
+    resumed, named, at = None, None, 0
+    for pts, length, _, _ in frame_list:
+        skip = min(max(first - pts, 0), length)
+        part = data[(at + skip) * width:(at + length) * width]
+        quiet = (len(part) - len(part.lstrip(b"\0"))) // width
+        if resumed is None and quiet < len(part) // width:
+            resumed, named = pts + skip + quiet, counter.name(part[quiet * width:(quiet + 1) * width])
+        at += length
+    if at * width != len(data):
+        return problems + ["the frames hold %d samples, the output %d" % (at, len(data) // width)]
+    if resumed is None:
+        return problems + ["the output holds no audio after the gap"]
+    if not last <= resumed <= last + HELD_LIMIT:
+        return problems + ["after the gap the first sample that is not silence is stamped %d "
+                           "(%.6f s) and is %s, expected a stamp from %d to %d"
+                           % (resumed, resumed / RATE, named, last, last + HELD_LIMIT)]
+    if len(steps) > 1 or any(not (0 < step <= lost and first <= pts <= resumed)
+                             for pts, step in steps):
+        pts, step = steps[0]
+        return problems + ["the output timeline breaks %d times: first by %d samples at a frame "
+                           "stamped %d" % (len(steps), step, pts)]
+    print("         the fill held %d samples (%.3f s) of real audio, now silence; the timeline "
+          "steps forward by %d samples" % (resumed - last, (resumed - last) / RATE,
+                                           sum(step for _, step in steps)))
+
+    def expected(pts, length):
+        """Source up to the gap, silence up to where the audio resumes, then the audio after it."""
+        parts, stop = [], pts + length
+        if pts < first:
+            parts.append(counter.samples(pts, min(stop, first) - pts))
+        if max(pts, first) < min(stop, resumed):
+            parts.append(bytes((min(stop, resumed) - max(pts, first)) * width))
+        if max(pts, resumed) < stop:
+            parts.append(counter.samples(max(pts, resumed) - last + source,
+                                         stop - max(pts, resumed)))
+        return b"".join(parts)
+
+    at = 0
+    for pts, length, _, _ in frame_list:
+        got, want = data[at * width:(at + length) * width], expected(pts, length)
+        if got != want:
+            index = next(i for i in range(length)
+                         if got[i * width:(i + 1) * width] != want[i * width:(i + 1) * width])
+            return problems + ["the sample stamped %d (%.6f s) is %s, expected %s"
+                               % (pts + index, (pts + index) / RATE,
+                                  counter.name(got[index * width:(index + 1) * width]),
+                                  counter.name(want[index * width:(index + 1) * width]))]
+        at += length
+    pts, length, _, _ = frame_list[-1]
+    if pts + length != end:
+        problems.append("the output ends at %d, expected %d" % (pts + length, end))
+    return problems
+
+
+def before_waiting_mixer(ffmpeg, mixer, *, shape, gap, end, ahead="", options="threshold=20",
+                         begin=0):
+    """Fills 40 s of the counter, cut by `shape` in its file and by `ahead` in the graph, ahead of
+    `mixer`, whose other input changes from 5.1 to stereo after 5 s. ffmpeg rebuilds the graph
+    there, while the mixer waits for that input. held_problems explains `gap`, `end` and `begin`.
+
+    threshold=20 joins any step shorter than 20 s. However many frames ffmpeg had queued behind the
+    held one, the frame after them follows the old output directly unless the old filter's
+    position leaves out the frames it held.
+    """
+    counter = COUNTERS["s16"]
+    with tempfile.TemporaryDirectory() as work:
+        # The other input lasts 45 s, so that a mixer which ends with its shorter input ends with
+        # the fill's 40 s.
+        other = ac3_parts(ffmpeg, work, [("5.1", RATE, 0)] + [("stereo", RATE, 0)] * 8)
+        audio = os.path.join(work, "audio.nut")
+        made = execute([ffmpeg, "-nostdin", "-hide_banner", "-v", "error", "-f", "lavfi", "-i",
+                        counter.lavfi(40 * SECOND, RATE), "-af", shape, "-c:a", counter.codec,
+                        "-f", "nut", "-y", audio])
+        if made.code:
+            raise Unusable("FFmpeg could not write the audio: %s" % last_lines(made.log))
+        graph = ("[1:a]aformat=channel_layouts=stereo[o];[0:a]%sagapfill=%s[g];"
+                 "[g][o]%s,ashowinfo[a]" % (ahead, options, mixer))
+        done = execute([ffmpeg, "-nostdin", "-hide_banner", "-nostats", "-v", "info", "-i", audio,
+                        "-i", other, "-filter_complex", graph, "-map", "[a]", "-c:a", counter.codec,
+                        "-f", counter.raw, "-"], lambda out: out.read())
+    if done.code:
+        return ["FFmpeg ended with status %d: %s" % (done.code, last_lines(done.log))]
+    rebuilds = done.log.count("Reconfiguring filter graph because audio parameters changed")
+    if rebuilds != 1:
+        raise Unusable("ffmpeg rebuilt the filter graph %d times, expected once" % rebuilds)
+    return held_problems(frames_of(done.log), done.result, counter, gap, end,
+                         lost=DEFAULT_PACKET, begin=begin)
+
+
+def gap_before_waiting_mixer(ffmpeg, mixer):
+    """The fill's gap from 2 s to 32 s meets `mixer` while it waits at the rebuild."""
+    return before_waiting_mixer(ffmpeg, mixer, shape=chain(frames(4800), drop((20, 319))),
+                                gap=(2 * SECOND, 32 * SECOND, 32 * SECOND), end=40 * SECOND)
+
+
+# The mix weighs its second input by zero, so its output is the fill's output.
+MIX = "amix=inputs=2:normalize=0:weights=1 0:duration=first"
+
+
+@check("rebuild-during-gap-before-mix", "writes the audio it holds as silence and keeps later audio "
+       "at its own time when ffmpeg rebuilds the filter graph while a mix behind it waits")
+def rebuild_during_gap_before_mix(ffmpeg):
+    return gap_before_waiting_mixer(ffmpeg, MIX)
+
+
+# 40 s of audio without a gap, stamped 25 s late. start=10 makes the filter write silence from
+# 10 s, so the rebuild comes at about 15 s, while the filter holds its first frame. The step from
+# start to the new filter's first frame, about 15 s, is shorter than threshold=20. Unless the
+# position says that no frame has left the filter, the new filter joins its first frame to the
+# old output, 10 s early.
+@check("rebuild-during-lead-before-mix", "writes the audio it holds as silence and keeps later "
+       "audio at its own time when ffmpeg rebuilds the filter graph during the lead while a mix "
+       "behind it waits")
+def rebuild_during_lead_before_mix(ffmpeg):
+    return before_waiting_mixer(ffmpeg, MIX, shape=frames(4800), ahead="asetpts=PTS+25/TB,",
+                                options="start=10:threshold=20", begin=10 * SECOND,
+                                gap=(10 * SECOND, 25 * SECOND, 0), end=65 * SECOND)
+
+
+# pan keeps the fill's two channels of the four that the merge puts together.
+@check("rebuild-during-gap-before-merge", "writes the audio it holds as silence and keeps later "
+       "audio at its own time when ffmpeg rebuilds the filter graph while a merge behind it waits")
+def rebuild_during_gap_before_merge(ffmpeg):
+    return gap_before_waiting_mixer(ffmpeg, "amerge=inputs=2,pan=stereo|c0=c0|c1=c1,"
+                                            "aformat=sample_fmts=s16")
 
 
 CHECKS_BY_NAME = {name: (title, function) for name, title, function in CHECKS}
