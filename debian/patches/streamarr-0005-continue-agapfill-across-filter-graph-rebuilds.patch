@@ -486,7 +486,7 @@ Index: FFmpeg/libavfilter/af_agapfill.c
  #include "libavutil/common.h"
  #include "libavutil/mathematics.h"
  #include "libavutil/opt.h"
-@@ -38,11 +42,14 @@ typedef struct AGapFillContext {
+@@ -38,11 +42,15 @@ typedef struct AGapFillContext {
      int64_t max_gap;        ///< longest silence to write, in microseconds; 0 for no limit
      int packet_size;        ///< samples in each frame of silence
  
@@ -497,29 +497,57 @@ Index: FFmpeg/libavfilter/af_agapfill.c
 -    int64_t silence_left;   ///< samples of silence still to write before the held frame
 +    int64_t sent_end;       ///< end of the last input frame sent on, by its own timestamp; the smallest timestamp before one
 +    int64_t taken_end;      ///< end of the last input frame taken, by its own timestamp; until a frame comes, that of the filter this one continues
++    int lead_resumed;       ///< continues a filter that had output no frame: silence leads the first frame whatever threshold says
 +    int64_t silence_left;   ///< samples of silence still to write before the held frame, or before the end
      AVFrame *held;          ///< input frame that waits for the silence before it
 +    int eof;                ///< status that ended the input, passed on once the silence owed before it is written
  
      int64_t nb_gaps;        ///< runs of silence written, the leading one included
      int64_t nb_silence;     ///< samples of silence in those runs
-@@ -196,6 +203,7 @@ static int place_frame(AVFilterContext *
+@@ -118,7 +126,9 @@ static uint64_t silence_after_step(AVFil
+ {
+     AGapFillContext *s = ctx->priv;
+ 
+-    if (pts <= s->in_end ||
++    if (pts <= s->in_end)
++        return 0;
++    if (!s->lead_resumed &&
+         !is_longer(ctx->inputs[0], distance(s->in_end, pts), s->threshold))
+         return 0;
+     return pts > s->out_pos ? distance(s->out_pos, pts) : 0;
+@@ -134,7 +144,7 @@ static void pass_short_step(AVFilterCont
+     AGapFillContext *s = ctx->priv;
+     const uint64_t length = distance(s->in_end, pts);
+ 
+-    if (!length)
++    if (!length || s->lead_resumed)
+         return;
+     if (is_longer(ctx->inputs[0], length, s->threshold)) {
+         if (pts < s->in_end)
+@@ -199,12 +209,14 @@ static int place_frame(AVFilterContext *
          if (pts > start)
-             silence = av_sat_sub64(pts, start);
-         s->out_pos = pts - silence;
+             silence = distance(start, pts);
+         s->out_pos = FFMIN(pts, start);
 +        s->sent_end = INT64_MIN + 1;
          s->started = 1;
      } else {
          if (pts == AV_NOPTS_VALUE)
-@@ -211,6 +219,7 @@ static int place_frame(AVFilterContext *
+             pts = s->in_end;
+         silence = silence_after_step(ctx, pts);
+         pass_short_step(ctx, pts);
++        s->lead_resumed = 0;
+     }
+ 
+     ret = owe_silence(ctx, pts, silence);
+@@ -214,6 +226,7 @@ static int place_frame(AVFilterContext *
      s->max_offset = FFMAX(s->max_offset,
-                           FFABS(av_sat_sub64(av_sat_add64(s->out_pos, silence), pts)));
+                           FFABS(av_sat_sub64(moved(s->out_pos, silence, 1), pts)));
      s->in_end     = av_sat_add64(pts, frame->nb_samples);
 +    s->taken_end  = s->in_end;
      s->held       = frame;
  
      return 0;
-@@ -247,6 +256,7 @@ static int send_held(AVFilterContext *ct
+@@ -250,6 +263,7 @@ static int send_held(AVFilterContext *ct
      frame->duration = frame->nb_samples;
  
      s->out_pos = av_sat_add64(s->out_pos, frame->nb_samples);
@@ -527,7 +555,7 @@ Index: FFmpeg/libavfilter/af_agapfill.c
  
      return ff_filter_frame(ctx->outputs[0], frame);
  }
-@@ -259,9 +269,16 @@ static int activate(AVFilterContext *ctx
+@@ -262,9 +276,16 @@ static int activate(AVFilterContext *ctx
      int64_t pts;
      int ret, status;
  
@@ -546,7 +574,7 @@ Index: FFmpeg/libavfilter/af_agapfill.c
          AVFrame *frame;
  
          ret = ff_inlink_consume_frame(inlink, &frame);
-@@ -276,25 +293,38 @@ static int activate(AVFilterContext *ctx
+@@ -279,25 +300,38 @@ static int activate(AVFilterContext *ctx
          }
      }
  
@@ -597,7 +625,7 @@ Index: FFmpeg/libavfilter/af_agapfill.c
          return 0;
      }
  
-@@ -328,6 +358,104 @@ static int config_output(AVFilterLink *o
+@@ -331,6 +365,107 @@ static int config_output(AVFilterLink *o
      return 0;
  }
  
@@ -625,6 +653,9 @@ Index: FFmpeg/libavfilter/af_agapfill.c
 +    if (s->started)
 +        return 0;
 +
++    /* The other filter reports the smallest timestamp until it has output a
++     * frame. Rescaled to this filter's rate, it may no longer be. */
++    s->lead_resumed = in_end == INT64_MIN + 1;
 +    s->out_pos = rescale_saturated(out_pos, (AVRational){ 1, sample_rate }, sample,
 +                                   AV_ROUND_NEAR_INF);
 +    s->in_end  = rescale_saturated(in_end, (AVRational){ 1, sample_rate }, sample,
@@ -702,7 +733,7 @@ Index: FFmpeg/libavfilter/af_agapfill.c
  static av_cold void uninit(AVFilterContext *ctx)
  {
      AGapFillContext *s = ctx->priv;
-@@ -349,12 +477,13 @@ static const AVFilterPad agapfill_output
+@@ -352,12 +487,13 @@ static const AVFilterPad agapfill_output
  };
  
  const FFFilter ff_af_agapfill = {

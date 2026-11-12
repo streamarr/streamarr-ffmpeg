@@ -196,7 +196,7 @@ Index: FFmpeg/libavfilter/af_agapfill.c
 ===================================================================
 --- /dev/null
 +++ FFmpeg/libavfilter/af_agapfill.c
-@@ -0,0 +1,360 @@
+@@ -0,0 +1,363 @@
 +/*
 + * This file is part of FFmpeg.
 + *
@@ -313,14 +313,14 @@ Index: FFmpeg/libavfilter/af_agapfill.c
 +/* The silence that the step from the end of the previous input frame to
 + * input that begins at pts puts before that input. The step alone decides.
 + * Steps at or below the threshold never add up to a gap. */
-+static int64_t silence_after_step(AVFilterContext *ctx, int64_t pts)
++static uint64_t silence_after_step(AVFilterContext *ctx, int64_t pts)
 +{
 +    AGapFillContext *s = ctx->priv;
 +
-+    if (pts > s->in_end &&
-+        is_longer(ctx->inputs[0], distance(s->in_end, pts), s->threshold))
-+        return FFMAX(av_sat_sub64(pts, s->out_pos), 0);
-+    return 0;
++    if (pts <= s->in_end ||
++        !is_longer(ctx->inputs[0], distance(s->in_end, pts), s->threshold))
++        return 0;
++    return pts > s->out_pos ? distance(s->out_pos, pts) : 0;
 +}
 +
 +/* A step at or below the threshold, forward or backward, passes through:
@@ -346,25 +346,27 @@ Index: FFmpeg/libavfilter/af_agapfill.c
 +
 +/* Owe silence before the input that begins at pts, unless the silence is
 + * longer than max_gap. */
-+static int owe_silence(AVFilterContext *ctx, int64_t pts, int64_t silence)
++static int owe_silence(AVFilterContext *ctx, int64_t pts, uint64_t silence)
 +{
 +    AVFilterLink *inlink = ctx->inputs[0];
 +    AGapFillContext *s = ctx->priv;
 +
 +    if (silence && s->max_gap > 0 && is_longer(inlink, silence, s->max_gap)) {
 +        av_log(ctx, AV_LOG_ERROR,
-+               "The frame at sample %"PRId64" needs %"PRId64" samples of silence "
++               "The frame at sample %"PRId64" needs %"PRIu64" samples of silence "
 +               "before it, which is longer than max_gap.\n", pts, silence);
 +        return AVERROR(EINVAL);
 +    }
++    /* The output stops at the largest timestamp long before longer silence
++     * ends. */
++    s->silence_left = FFMIN(silence, INT64_MAX);
 +    if (silence) {
 +        s->nb_gaps++;
-+        s->nb_silence += silence;
++        s->nb_silence = av_sat_add64(s->nb_silence, s->silence_left);
 +        av_log(ctx, AV_LOG_VERBOSE,
-+               "Writing %"PRId64" samples of silence from sample %"PRId64".\n",
++               "Writing %"PRIu64" samples of silence from sample %"PRId64".\n",
 +               silence, s->out_pos);
 +    }
-+    s->silence_left = silence;
 +
 +    return 0;
 +}
@@ -378,7 +380,8 @@ Index: FFmpeg/libavfilter/af_agapfill.c
 +    AVFilterLink *inlink = ctx->inputs[0];
 +    AGapFillContext *s = ctx->priv;
 +    const AVRational sample = { 1, inlink->sample_rate };
-+    int64_t pts = AV_NOPTS_VALUE, silence = 0;
++    int64_t pts = AV_NOPTS_VALUE;
++    uint64_t silence = 0;
 +    int ret;
 +
 +    if (frame->pts != AV_NOPTS_VALUE)
@@ -393,8 +396,8 @@ Index: FFmpeg/libavfilter/af_agapfill.c
 +            pts = start != INT64_MAX ? start : 0;
 +        /* No threshold applies here: the timeline begins exactly at start. */
 +        if (pts > start)
-+            silence = av_sat_sub64(pts, start);
-+        s->out_pos = pts - silence;
++            silence = distance(start, pts);
++        s->out_pos = FFMIN(pts, start);
 +        s->started = 1;
 +    } else {
 +        if (pts == AV_NOPTS_VALUE)
@@ -408,7 +411,7 @@ Index: FFmpeg/libavfilter/af_agapfill.c
 +        return ret;
 +
 +    s->max_offset = FFMAX(s->max_offset,
-+                          FFABS(av_sat_sub64(av_sat_add64(s->out_pos, silence), pts)));
++                          FFABS(av_sat_sub64(moved(s->out_pos, silence, 1), pts)));
 +    s->in_end     = av_sat_add64(pts, frame->nb_samples);
 +    s->held       = frame;
 +
