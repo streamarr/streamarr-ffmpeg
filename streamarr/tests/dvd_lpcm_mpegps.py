@@ -18,6 +18,16 @@ the LPCM packets of the written file and decodes it from the start and after eac
     the decode from the start holds every source sample, in order
     each decode after a seek holds only source samples, each one following the one before
 
+DVD-Video gives each LPCM packet the number of audio frames that start in its payload and a pointer
+to the first of them, where 4 is the payload's first byte. The packet's timestamp names that frame.
+The check also requires:
+
+    every packet with a timestamp starts a frame at its pointer, and the timestamp is that byte's
+    time, to within one tick of the 90 kHz clock
+    a packet in which no frame starts carries no timestamp
+    every decoded frame, from the start and after each seek, is stamped with the time of the source
+    sample that it starts with, to within one sample
+
 It also writes 24-bit 5.1, whose block is 72 bytes, alone into packets too small for a block. A
 VOB packet of 96 bytes has room for 60 after the pack header that every MPEG-2 packet carries, a
 PES header with a PTS and the LPCM header. An MPEG-1 system stream packet of 88 bytes has room for
@@ -47,9 +57,14 @@ import tempfile
 
 SECONDS = 6
 SEEKS = (1.3, 2.6, 3.9, 5.2)
-# bits, rate and channels of every shape FFmpeg's encoder writes under DVD-Video's 9.8 Mb/s
-SHAPES = [(16, 48000, 1), (16, 48000, 2), (16, 48000, 6), (16, 96000, 6),
-          (24, 48000, 1), (24, 48000, 2), (24, 48000, 6), (24, 96000, 1), (24, 96000, 2)]
+# bits, rate, channels and encoder frame size of every shape FFmpeg's encoder writes under
+# DVD-Video's 9.8 Mb/s, with the encoder's own frames (0) beside video. The last shape's frames of 120
+# samples, 2,160 bytes, are longer than a packet's payload, so some packets hold no frame's start. It
+# has no video: with video, the order in which FFmpeg hands the muxer its packets varies from run to
+# run, and with it which packets hold no frame's start.
+SHAPES = [(16, 48000, 1, 0), (16, 48000, 2, 0), (16, 48000, 6, 0), (16, 96000, 6, 0),
+          (24, 48000, 1, 0), (24, 48000, 2, 0), (24, 48000, 6, 0), (24, 96000, 1, 0),
+          (24, 96000, 2, 0), (24, 48000, 6, 120)]
 LAYOUTS = {1: "mono", 2: "stereo", 6: "5.1"}
 SMALL_PACKETS = {"vob": range(96, 129), "mpeg": range(88, 129)}
 FORMAT_NAMES = {"vob": "a VOB", "mpeg": "an MPEG-1 system stream"}
@@ -116,16 +131,20 @@ def exit_status_within_limits(command):
 
 
 def write_source(ffmpeg, directory, shape):
-    bits, rate, channels = shape
-    raw = os.path.join(directory, "b%d-r%d-c%d.s32le" % shape)
-    vob = os.path.join(directory, "b%d-r%d-c%d.vob" % shape)
+    bits, rate, channels, frame_size = shape
+    raw = os.path.join(directory, "b%d-r%d-c%d-f%d.s32le" % shape)
+    vob = os.path.join(directory, "b%d-r%d-c%d-f%d.vob" % shape)
     with open(raw, "wb") as out:
         out.write(counted(bits, channels, rate * SECONDS))
-    run([ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
-         "-f", "lavfi", "-i", "testsrc=size=64x48:rate=24:duration=%d" % SECONDS,
-         "-f", "s32le", "-ar", str(rate), "-ch_layout", LAYOUTS[channels], "-i", raw,
-         "-c:v", "mpeg2video", "-g", "12", "-bf", "0",
-         "-c:a", "pcm_dvd", "-sample_fmt", "s16" if bits == 16 else "s32", "-f", "vob", vob])
+    video = ["-f", "lavfi", "-i", "testsrc=size=64x48:rate=24:duration=%d" % SECONDS]
+    video_codec = ["-c:v", "mpeg2video", "-g", "12", "-bf", "0"]
+    audio_codec = ["-c:a", "pcm_dvd", "-sample_fmt", "s16" if bits == 16 else "s32"]
+    if frame_size:
+        video = video_codec = []
+        audio_codec += ["-frame_size", str(frame_size)]
+    run([ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-y"] + video
+        + ["-f", "s32le", "-ar", str(rate), "-ch_layout", LAYOUTS[channels], "-i", raw]
+        + video_codec + audio_codec + ["-f", "vob", vob])
     return vob
 
 
@@ -208,11 +227,52 @@ def misaligned_payloads(vob, bits, channels):
     return misaligned, len(packets)
 
 
-def decoded_rows(ffmpeg, vob, bits, channels, seek):
-    """Each decoded row as (source sample index, or None for a row that names none)."""
+def misplaced_timestamps(vob, bits, rate, channels):
+    """Packets whose timestamp is not the time of the byte at their pointer, of all stamped ones.
+
+    The first packet's first byte is the stream's first byte, so its time sets the zero."""
+    ticks_per_byte = 90000 * 8 / (rate * channels * bits)
+    origin = None
+    offset = misplaced = stamped = 0
+    for packet in lpcm_packets(vob):
+        if packet.pts is not None:
+            stamped += 1
+            if packet.frames == 0 or not 4 <= packet.pointer < len(packet.payload) + 4:
+                misplaced += 1
+            else:
+                first_byte = offset + packet.pointer - 4
+                if origin is None:
+                    origin = packet.pts - first_byte * ticks_per_byte
+                misplaced += abs(origin + first_byte * ticks_per_byte - packet.pts) > 1
+        offset += len(packet.payload)
+    return misplaced, stamped
+
+
+def decode(ffmpeg, vob, shape, seek):
+    """Each decoded row as its source sample index, or None for a row that names none, and each
+    decoded frame as (stamp in samples on the source's clock, first row, rows)."""
+    bits, rate, channels, _ = shape
     seek_arguments = ["-ss", str(seek)] if seek is not None else []
-    pcm = run([ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error"] + seek_arguments
-              + ["-i", vob, "-map", "0:a:0", "-c:a", "pcm_s32le", "-f", "s32le", "-"])
+    raw = vob + ".s32le"
+    frames = run([ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-copyts"] + seek_arguments
+                 + ["-i", vob, "-map", "0:a:0", "-c:a", "pcm_s32le", "-f", "s32le", "-y", raw,
+                    "-map", "0:a:0", "-c:a", "pcm_s32le", "-f", "framecrc", "-"])
+    with open(raw, "rb") as decoded:
+        pcm = decoded.read()
+    stamps = []
+    row = 0
+    for line in frames.decode().splitlines():
+        if line.startswith("#tb 0:"):
+            numerator, denominator = (int(part) for part in line.split()[-1].split("/"))
+        elif line and not line.startswith("#"):
+            fields = [field.strip() for field in line.split(",")]
+            count = int(fields[4]) // (4 * channels)
+            stamps.append((int(fields[2]) * numerator * rate // denominator, row, count))
+            row += count
+    return decoded_rows(pcm, bits, channels), stamps
+
+
+def decoded_rows(pcm, bits, channels):
     words = array.array("I", pcm[:len(pcm) - len(pcm) % (4 * channels)])
     if sys.byteorder == "big":
         words.byteswap()
@@ -226,7 +286,7 @@ def decoded_rows(ffmpeg, vob, bits, channels, seek):
             rows.append(None)
             continue
         rows.append((counts.pop() - 1) % period)
-    return rows, period
+    return rows
 
 
 def rows_out_of_sequence(rows, period):
@@ -240,9 +300,30 @@ def rows_out_of_sequence(rows, period):
     return wrong
 
 
+def stamp_errors(stamps, rows, origin, period):
+    """Each frame's stamp less the time of the source sample it starts with, in samples, for the
+    frames whose first row names a source sample."""
+    errors = []
+    for stamp, first, _ in stamps:
+        if first < len(rows) and rows[first] is not None:
+            errors.append((stamp - origin - rows[first] + period // 2) % period - period // 2)
+    return errors
+
+
+def report_stamps(name, errors):
+    right = bool(errors) and max(abs(error) for error in errors) <= 1
+    print("%s: %d decoded frames stamped %s samples from their first source sample: %s"
+          % (name, len(errors), "%+d to %+d" % (min(errors), max(errors)) if errors else "-",
+             "ok" if right else "WRONG"))
+    return not right
+
+
 def check_shape(ffmpeg, directory, shape):
-    bits, rate, channels = shape
+    bits, rate, channels, frame_size = shape
     name = "%d-bit %d Hz %s" % (bits, rate, LAYOUTS[channels])
+    if frame_size:
+        name += " in frames of %d samples" % frame_size
+    period = 1 << (bits - 3)
     vob = write_source(ffmpeg, directory, shape)
     failures = 0
 
@@ -251,28 +332,39 @@ def check_shape(ffmpeg, directory, shape):
     print("%s: %d of %d LPCM payloads start inside a %d-byte block: %s"
           % (name, misaligned, total, block_size(bits, channels), "ok" if not misaligned else "WRONG"))
 
-    rows, period = decoded_rows(ffmpeg, vob, bits, channels, None)
+    misplaced, stamped = misplaced_timestamps(vob, bits, rate, channels)
+    failures += misplaced != 0
+    print("%s: %d of %d LPCM timestamps do not name the frame at the packet's pointer: %s"
+          % (name, misplaced, stamped, "ok" if not misplaced else "WRONG"))
+
+    rows, stamps = decode(ffmpeg, vob, shape, None)
     expected = rate * SECONDS
     whole = rows == [n % period for n in range(expected)]
     failures += not whole
     print("%s from the start: %d rows for %d source samples, %d out of sequence: %s"
           % (name, len(rows), expected, rows_out_of_sequence(rows, period), "ok" if whole else "WRONG"))
+    origin = stamps[0][0]
+    failures += report_stamps(name + " from the start", stamp_errors(stamps, rows, origin, period))
 
     for seek in SEEKS:
-        rows, period = decoded_rows(ffmpeg, vob, bits, channels, seek)
+        rows, stamps = decode(ffmpeg, vob, shape, seek)
         wrong = rows_out_of_sequence(rows, period)
         right = rows and wrong == 0
         failures += not right
         print("%s after a seek to %.1f s: %d of %d rows hold no source sample or do not follow"
               " the one before: %s" % (name, seek, wrong, len(rows), "ok" if right else "WRONG"))
+        failures += report_stamps("%s after a seek to %.1f s" % (name, seek),
+                                  stamp_errors(stamps, rows, origin, period))
     return failures
 
 
-def written_in_whole_blocks(ffmpeg, vob, bits, channels):
+def written_in_whole_blocks(ffmpeg, vob, shape):
     """Whether every payload starts on a block and the decode from the start holds every source
     sample in order, and a description of what the file holds."""
+    bits, _, channels, _ = shape
+    period = 1 << (bits - 3)
     misaligned, total = misaligned_payloads(vob, bits, channels)
-    rows, period = decoded_rows(ffmpeg, vob, bits, channels, None)
+    rows, _ = decode(ffmpeg, vob, shape, None)
     whole = rows == [n % period for n in range(SMALL_PACKET_SAMPLES)]
     return misaligned == 0 and whole, (
         "written, %d of %d LPCM payloads start inside a block, %d of %d rows from the start out of"
@@ -308,7 +400,7 @@ def check_small_packets(ffmpeg, directory):
             if status is None:
                 outcome = "FFmpeg did not stop"
             elif not refused:
-                whole, outcome = written_in_whole_blocks(ffmpeg, path, bits, channels)
+                whole, outcome = written_in_whole_blocks(ffmpeg, path, (bits, rate, channels, 0))
             if os.path.exists(path):
                 os.remove(path)
 
@@ -352,19 +444,31 @@ def write_dvd_pcm(path, bits, channels):
         out.write(b"\x00\x00\x01\xB9")
 
 
+def first_sample_due(packets, bits, rate, channels):
+    """When the first sample is due, in 90 kHz ticks: the first stamped packet's PTS, less the
+    samples in front of the frame at its pointer. A first packet too small for a block holds no
+    sample, so no frame starts in it and it carries no PTS."""
+    offset = 0
+    for packet in packets:
+        if packet.pts is not None:
+            return packet.pts - (offset + packet.pointer - 4) * 8 // (bits * channels) * 90000 / rate
+        offset += len(packet.payload)
+    raise ValueError("no LPCM packet carries a PTS")
+
+
 def late_packets(vob, bits, rate, channels):
     """The LPCM packets whose pack starts to arrive after the first block that the packet
     completes is due, and the smallest margin in ms by which a pack starts before that, negative for
-    a late one. The first packet's PTS is when the first sample is due, and each sample after it is
-    due one sample period later."""
+    a late one. Each sample is due one sample period after the one before."""
     block = block_size(bits, channels)
     packets = lpcm_packets(vob)
+    start = first_sample_due(packets, bits, rate, channels)
     offset = late = 0
     margin = float("inf")
     for packet in packets:
         first_end = (offset // block + 1) * block
         if first_end <= offset + len(packet.payload):
-            due = packets[0].pts + (first_end - block) * 8 // (bits * channels) * 90000 / rate
+            due = start + (first_end - block) * 8 // (bits * channels) * 90000 / rate
             late += packet.scr > due
             margin = min(margin, due - packet.scr)
         offset += len(packet.payload)
