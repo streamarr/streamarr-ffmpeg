@@ -122,7 +122,7 @@ Index: FFmpeg/doc/filters.texi
 ===================================================================
 --- FFmpeg.orig/doc/filters.texi
 +++ FFmpeg/doc/filters.texi
-@@ -2165,6 +2165,67 @@ agapfill=start=0:max_gap=600
+@@ -2172,6 +2172,68 @@ agapfill=start=0:max_gap=600
  @end example
  @end itemize
  
@@ -153,10 +153,11 @@ Index: FFmpeg/doc/filters.texi
 +Continue the output of another agapfill filter. The argument is what the
 +@code{position} command of that filter reported. The filter then ignores
 +@option{start}, and its first frame is one more step after the last frame the
-+other filter output: a gap between the two is filled, and any other step is
-+joined. When the input ends before a frame comes, the end of the last frame the
-+other filter took is that step, so the time of the frames it took and did not
-+output becomes silence there too.
++other filter output: a gap between the two is filled, a step at or below
++@option{threshold} passes through, and a longer overlap is joined. When the
++input ends before a frame comes, the end of the last frame the other filter
++took is that step, so the time of the frames it took and did not output
++becomes silence there too.
 +A position that no timestamp at the filter's own sample rate reaches stops at
 +the largest or the smallest timestamp, as the output position does. The
 +command has no effect once the filter has taken a frame.
@@ -502,7 +503,7 @@ Index: FFmpeg/libavfilter/af_agapfill.c
  
      int64_t nb_gaps;        ///< runs of silence written, the leading one included
      int64_t nb_silence;     ///< samples of silence in those runs
-@@ -157,6 +164,7 @@ static int place_frame(AVFilterContext *
+@@ -177,6 +184,7 @@ static int place_frame(AVFilterContext *
          if (pts > start)
              silence = av_sat_sub64(pts, start);
          s->out_pos = pts - silence;
@@ -510,7 +511,7 @@ Index: FFmpeg/libavfilter/af_agapfill.c
          s->started = 1;
      } else {
          if (pts == AV_NOPTS_VALUE)
-@@ -171,6 +179,7 @@ static int place_frame(AVFilterContext *
+@@ -192,6 +200,7 @@ static int place_frame(AVFilterContext *
      s->max_offset = FFMAX(s->max_offset,
                            FFABS(av_sat_sub64(av_sat_add64(s->out_pos, silence), pts)));
      s->in_end     = av_sat_add64(pts, frame->nb_samples);
@@ -518,7 +519,7 @@ Index: FFmpeg/libavfilter/af_agapfill.c
      s->held       = frame;
  
      return 0;
-@@ -207,6 +216,7 @@ static int send_held(AVFilterContext *ct
+@@ -228,6 +237,7 @@ static int send_held(AVFilterContext *ct
      frame->duration = frame->nb_samples;
  
      s->out_pos = av_sat_add64(s->out_pos, frame->nb_samples);
@@ -526,7 +527,7 @@ Index: FFmpeg/libavfilter/af_agapfill.c
  
      return ff_filter_frame(ctx->outputs[0], frame);
  }
-@@ -219,9 +229,16 @@ static int activate(AVFilterContext *ctx
+@@ -240,9 +250,16 @@ static int activate(AVFilterContext *ctx
      int64_t pts;
      int ret, status;
  
@@ -545,7 +546,7 @@ Index: FFmpeg/libavfilter/af_agapfill.c
          AVFrame *frame;
  
          ret = ff_inlink_consume_frame(inlink, &frame);
-@@ -236,25 +253,38 @@ static int activate(AVFilterContext *ctx
+@@ -257,25 +274,38 @@ static int activate(AVFilterContext *ctx
          }
      }
  
@@ -596,7 +597,7 @@ Index: FFmpeg/libavfilter/af_agapfill.c
          return 0;
      }
  
-@@ -288,6 +318,104 @@ static int config_output(AVFilterLink *o
+@@ -309,6 +339,104 @@ static int config_output(AVFilterLink *o
      return 0;
  }
  
@@ -677,10 +678,10 @@ Index: FFmpeg/libavfilter/af_agapfill.c
 +
 +    /* Nothing to continue before the first frame. A filter that continues
 +     * this one takes the step to its first frame from the last frame sent on,
-+     * so the time of frames lost with the old graph becomes a gap. Before a
-+     * frame was sent on, that step is always a gap, as the lead before a
-+     * first frame is. When no frame follows, the end of the frames taken is
-+     * that step. */
++     * so the time of frames lost with the old graph becomes a gap, or a step
++     * that passes through when it is that short. Before a frame was sent on,
++     * that step is always a gap, as the lead before a first frame is. When no
++     * frame follows, the end of the frames taken is that step. */
 +    res[0] = 0;
 +    if (!s->started)
 +        return 0;
@@ -701,7 +702,7 @@ Index: FFmpeg/libavfilter/af_agapfill.c
  static av_cold void uninit(AVFilterContext *ctx)
  {
      AGapFillContext *s = ctx->priv;
-@@ -309,12 +437,13 @@ static const AVFilterPad agapfill_output
+@@ -330,12 +458,13 @@ static const AVFilterPad agapfill_output
  };
  
  const FFFilter ff_af_agapfill = {

@@ -9,14 +9,22 @@ Description: avfilter: add agapfill, which fills gaps between audio frames with 
  filter writes the gap as silence without also trimming audio whose
  timestamps overlap and holding the whole gap in memory.
  .
- agapfill makes the timeline continuous ahead of such consumers and
- never drops a sample. It compares the timestamp of each frame with the
- end of the previous frame. A forward step above the threshold, 2 ms by
- default, is a gap, and the filter writes silence up to the frame's own
- timestamp. Any other step, an overlap or a backward step included,
- writes no silence, and the frame follows the previous one. Each step is
- decided alone, so drift never adds up to a gap. The start option puts
- silence from a given time up to the first frame.
+ agapfill fills every gap ahead of such consumers and never drops a
+ sample. It compares the timestamp of each frame with the end of the
+ previous frame. A forward step above the threshold, 2 ms by default, is
+ a gap, and the filter writes silence up to the frame's own timestamp. A
+ step at or below the threshold, forward or backward, passes through:
+ the frame keeps its own timestamp, as it does without the filter. A
+ longer overlap or backward step writes no silence, and the frame
+ follows the previous one. Each step is decided alone, so drift never
+ adds up to a gap. The start option puts silence from a given time up
+ to the first frame.
+ .
+ A short step passes through instead of joining the frame to the one
+ before it. Joined, each step moved the audio after it, so audio whose
+ timestamps run 0.02 % fast played 120 ms from its timestamps after
+ 600 s, and a seek within the encode kept that error. An encode without
+ the filter keeps each step, and so does the filter.
  .
  The filter writes silence one frame at a time, when the next filter
  asks for a frame, so memory does not grow with the gap. max_gap makes a
@@ -47,14 +55,14 @@ Index: FFmpeg/doc/filters.texi
 ===================================================================
 --- FFmpeg.orig/doc/filters.texi
 +++ FFmpeg/doc/filters.texi
-@@ -2073,6 +2073,98 @@ Set softness applied inside thresholding
+@@ -2073,6 +2073,105 @@ Set softness applied inside thresholding
  
  This filter supports the all above options as @ref{commands}.
  
 +@section agapfill
 +
-+Fill gaps between audio frames with silence, so that the output is one
-+continuous run of samples.
++Fill gaps between audio frames with silence, so that the output has no gap
++left.
 +
 +Some encoders and filters count samples and ignore timestamps. When two audio
 +frames with a gap between them reach one of those, the samples after the gap
@@ -73,28 +81,34 @@ Index: FFmpeg/doc/filters.texi
 +timestamp, the filter writes no silence.
 +
 +@item
-+Any other step writes no silence, and the later frame follows the previous
-+frame directly. That covers rounded timestamps, timestamps that drift against
-+the sample count, frames that overlap and timestamps that go backward. After
-+such steps the output times differ from the input timestamps by the sum of
-+the steps, until the next gap puts a frame at its own time again.
++A step at or below @option{threshold}, forward or backward, passes through.
++The output takes the same step, so the later frame keeps its own timestamp, as
++it does without this filter. That covers rounded timestamps and timestamps
++that drift against the sample count.
++
++@item
++A longer overlap or backward step writes no silence, and the later frame
++follows the previous frame directly. After such a step the output times are
++later than the input timestamps by the length of the step, until a gap puts a
++frame at its own time again.
 +@end itemize
 +
 +Each step is decided alone. Steps at or below the threshold never add up to a
 +gap.
 +
-+The silence of a gap covers the step and whatever the joined steps before it
-+have left between the output and the timestamps. For example, at 48 kHz, 299
-+forward steps of 96 samples are joined and leave the output 28,704 samples
-+behind the timestamps. A step of 97 samples after them is a gap, and the
-+filter writes 28,801 samples of silence, which is 0.6 seconds.
++The silence of a gap reaches the later frame's own timestamp, so it is shorter
++by what earlier overlaps have left between the output and the timestamps. For
++example, at 48 kHz, an overlap of 2,400 samples leaves the output 2,400 samples
++after the timestamps. A gap of 384,000 samples after it gets 381,600 samples
++of silence.
 +
-+The output time base is one sample, and each output frame begins where the
-+previous one ends. A frame without a timestamp follows the previous frame
-+directly. A timestamp or a @option{start} that lies beyond the 64-bit range
-+once counted in samples stops at the largest or the smallest timestamp, so a
-+gap up to such a frame is filled, or fails on @option{max_gap}, like any other.
-+The filter writes no silence after the last frame. Use @code{apad} for that.
++The output time base is one sample. Each output frame begins where the
++previous one ends, moved by any step that passes through. A frame without a
++timestamp follows the previous frame directly. A timestamp or a
++@option{start} that lies beyond the 64-bit range once counted in samples
++stops at the largest or the smallest timestamp, so a gap up to such a frame
++is filled, or fails on @option{max_gap}, like any other. The filter writes no
++silence after the last frame. Use @code{apad} for that.
 +
 +The filter writes silence one frame at a time, when the next filter asks for
 +a frame. It holds at most one input frame and one frame of silence, however
@@ -104,8 +118,9 @@ Index: FFmpeg/doc/filters.texi
 +
 +@table @option
 +@item threshold
-+Set the longest forward step between two frames that is not a gap. Default is
-+2 milliseconds. When the input time base is not one sample, the value must be
++Set the longest step between two frames that passes through. A longer forward
++step is a gap, and a longer backward step is joined. Default is 2
++milliseconds. When the input time base is not one sample, the value must be
 +at least one tick of that time base plus one sample. Timestamps rounded to
 +that time base differ by that much where the audio has no gap.
 +
@@ -179,7 +194,7 @@ Index: FFmpeg/libavfilter/af_agapfill.c
 ===================================================================
 --- /dev/null
 +++ FFmpeg/libavfilter/af_agapfill.c
-@@ -0,0 +1,320 @@
+@@ -0,0 +1,341 @@
 +/*
 + * This file is part of FFmpeg.
 + *
@@ -215,7 +230,7 @@ Index: FFmpeg/libavfilter/af_agapfill.c
 +typedef struct AGapFillContext {
 +    const AVClass *class;
 +
-+    int64_t threshold;      ///< longest forward step that is not a gap, in microseconds
++    int64_t threshold;      ///< longest step between frames that passes through, in microseconds
 +    int64_t start;          ///< time from which silence leads the first frame, in microseconds; INT64_MAX when unset
 +    int64_t max_gap;        ///< longest silence to write, in microseconds; 0 for no limit
 +    int packet_size;        ///< samples in each frame of silence
@@ -228,7 +243,8 @@ Index: FFmpeg/libavfilter/af_agapfill.c
 +
 +    int64_t nb_gaps;        ///< runs of silence written, the leading one included
 +    int64_t nb_silence;     ///< samples of silence in those runs
-+    int64_t nb_joined;      ///< steps other than zero that wrote no silence
++    int64_t nb_joined;      ///< backward steps above the threshold, joined without silence
++    int64_t nb_passed;      ///< steps at or below the threshold, which the output took too
 +    int64_t max_offset;     ///< largest distance of a frame from its own timestamp, in samples
 +} AGapFillContext;
 +
@@ -236,7 +252,7 @@ Index: FFmpeg/libavfilter/af_agapfill.c
 +#define A AV_OPT_FLAG_AUDIO_PARAM | AV_OPT_FLAG_FILTERING_PARAM
 +
 +static const AVOption agapfill_options[] = {
-+    { "threshold",   "set the longest forward step between frames that is not a gap", OFFSET(threshold),   AV_OPT_TYPE_DURATION, { .i64 = 2000 },      0,         INT64_MAX, A },
++    { "threshold",   "set the longest step between frames that passes through", OFFSET(threshold),   AV_OPT_TYPE_DURATION, { .i64 = 2000 },      0,         INT64_MAX, A },
 +    { "start",       "set the time from which silence leads the first frame",         OFFSET(start),       AV_OPT_TYPE_DURATION, { .i64 = INT64_MAX }, INT64_MIN, INT64_MAX, A },
 +    { "max_gap",     "set the longest silence to write, 0 for no limit",              OFFSET(max_gap),     AV_OPT_TYPE_DURATION, { .i64 = 0 },         0,         INT64_MAX, A },
 +    { "packet_size", "set the number of samples in each frame of silence",            OFFSET(packet_size), AV_OPT_TYPE_INT,      { .i64 = 4096 },      1,         65536,     A },
@@ -274,8 +290,7 @@ Index: FFmpeg/libavfilter/af_agapfill.c
 +
 +/* The silence that the step from the end of the previous input frame to
 + * input that begins at pts puts before that input. The step alone decides.
-+ * Steps below the threshold never add up to a gap, and an overlap or a
-+ * backward step trims nothing. */
++ * Steps at or below the threshold never add up to a gap. */
 +static int64_t silence_after_step(AVFilterContext *ctx, int64_t pts)
 +{
 +    AGapFillContext *s = ctx->priv;
@@ -283,9 +298,29 @@ Index: FFmpeg/libavfilter/af_agapfill.c
 +
 +    if (step > 0 && is_longer(ctx->inputs[0], step, s->threshold))
 +        return FFMAX(av_sat_sub64(pts, s->out_pos), 0);
-+    if (step)
-+        s->nb_joined++;
 +    return 0;
++}
++
++/* A step at or below the threshold, forward or backward, passes through:
++ * the output takes the same step, so the frame keeps its own timestamp, as
++ * it does without the filter. A longer overlap or backward step trims
++ * nothing, and the frame follows the previous one. */
++static void pass_short_step(AVFilterContext *ctx, int64_t pts)
++{
++    AGapFillContext *s = ctx->priv;
++    const int64_t step = av_sat_sub64(pts, s->in_end);
++    /* -INT64_MIN does not fit, and no threshold reaches that far. */
++    const int64_t length = step == INT64_MIN ? INT64_MAX : FFABS(step);
++
++    if (!step)
++        return;
++    if (is_longer(ctx->inputs[0], length, s->threshold)) {
++        if (step < 0)
++            s->nb_joined++;
++        return;
++    }
++    s->out_pos = av_sat_add64(s->out_pos, step);
++    s->nb_passed++;
 +}
 +
 +/* Owe silence before the input that begins at pts, unless the silence is
@@ -344,6 +379,7 @@ Index: FFmpeg/libavfilter/af_agapfill.c
 +        if (pts == AV_NOPTS_VALUE)
 +            pts = s->in_end;
 +        silence = silence_after_step(ctx, pts);
++        pass_short_step(ctx, pts);
 +    }
 +
 +    ret = owe_silence(ctx, pts, silence);
@@ -478,8 +514,8 @@ Index: FFmpeg/libavfilter/af_agapfill.c
 +    if (s->started)
 +        av_log(ctx, AV_LOG_VERBOSE,
 +               "gaps:%"PRId64" silence_samples:%"PRId64" joined_steps:%"PRId64" "
-+               "max_offset_samples:%"PRId64"\n",
-+               s->nb_gaps, s->nb_silence, s->nb_joined, s->max_offset);
++               "passed_steps:%"PRId64" max_offset_samples:%"PRId64"\n",
++               s->nb_gaps, s->nb_silence, s->nb_joined, s->nb_passed, s->max_offset);
 +}
 +
 +static const AVFilterPad agapfill_outputs[] = {
