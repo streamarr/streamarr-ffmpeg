@@ -20,6 +20,17 @@ Description: avformat/mpegenc: write whole DVD PCM blocks into each MPEG-PS pack
  muxer writes empty packets forever, so refuse such packet sizes. 24-bit
  5.1 then needs packets of at least 113 bytes in an MPEG-2 program stream;
  the default is 2048.
+ .
+ Whole blocks can leave most of a block of a packet unused, more than the
+ 5 % that the automatic mux rate adds to the streams' bit rates for
+ headers allows for. 24-bit 5.1 in 2050-byte packets carried 1944 bytes
+ where whole sample frames carried 1998, and the SCR, which advances by
+ one packet at the mux rate, ran ahead of the samples by 2.4 ms a second.
+ 7 channels did the same in 2048-byte packets. So raise the bit rate of
+ each DVD PCM stream, for the mux rate, by the largest ratio of whole
+ sample frames to whole blocks over the rooms that a packet's headers can
+ leave. Where a block is one sample frame, as at 16 bits, the rate does
+ not change.
 Author: Streamarr
 Forwarded: no
 Last-Update: 2026-11-12
@@ -28,7 +39,7 @@ Index: FFmpeg/libavformat/mpegenc.c
 ===================================================================
 --- FFmpeg.orig/libavformat/mpegenc.c
 +++ FFmpeg/libavformat/mpegenc.c
-@@ -300,6 +300,39 @@ static int get_system_header_size(AVFormatContext *ctx)
+@@ -300,6 +300,74 @@ static int get_system_header_size(AVFormatContext *ctx)
      return buf_index;
  }
  
@@ -65,10 +76,45 @@ Index: FFmpeg/libavformat/mpegenc.c
 +    return pack_header + pes_header + 1 + 6;
 +}
 +
++/* The bytes that flush_packet() writes before the samples of an LPCM packet without time stamps:
++ * the pack header, which every packet of an MPEG-2 program stream has, the PES header, the
++ * substream ID and the LPCM header. */
++static int lpcm_packet_least_overhead(const MpegMuxContext *s)
++{
++    int pack_header = s->is_mpeg2 ? 14 : 0;
++    int pes_header  = 6 + (s->is_mpeg2 ? 3 + 1 : 1);
++
++    return pack_header + pes_header + 1 + 6;
++}
++
++/* The bit rate that a DVD PCM stream of the given rate needs in the mux rate. Whole blocks can
++ * leave most of a block of a packet unused, more than whole sample frames do, and the 5 % that
++ * mpeg_mux_init() adds for headers does not allow for that. The rate grows by the largest ratio
++ * of whole frames to whole blocks over the rooms that the headers of a packet can leave. Where a
++ * block is one frame, as for 16 bits, four channels or eight, the rate does not change. */
++static int lpcm_whole_block_rate(const MpegMuxContext *s, const AVCodecParameters *par, int rate)
++{
++    int block  = pcm_dvd_block_size(par);
++    int frame  = par->ch_layout.nb_channels * par->bits_per_coded_sample / 8;
++    int frames = 1, blocks = 1;
++
++    for (int room = s->packet_size - lpcm_packet_overhead(s);
++         room <= s->packet_size - lpcm_packet_least_overhead(s); room++) {
++        int room_frames = room - room % frame;
++        int room_blocks = room - room % block;
++
++        if ((int64_t)room_frames * blocks > (int64_t)frames * room_blocks) {
++            frames = room_frames;
++            blocks = room_blocks;
++        }
++    }
++    return av_rescale(rate, frames, blocks);
++}
++
  static av_cold int mpeg_mux_init(AVFormatContext *ctx)
  {
      MpegMuxContext *s = ctx->priv_data;
-@@ -410,7 +443,16 @@ static av_cold int mpeg_mux_init(AVFormatContext *ctx)
+@@ -410,7 +478,16 @@ static av_cold int mpeg_mux_init(AVFormatContext *ctx)
                                           st->codecpar->ch_layout.nb_channels - 1;
                  stream->lpcm_header[2] = 0x80;
                  stream->id = lpcm_id++;
@@ -86,13 +132,23 @@ Index: FFmpeg/libavformat/mpegenc.c
              } else if (st->codecpar->codec_id == AV_CODEC_ID_MLP ||
                         st->codecpar->codec_id == AV_CODEC_ID_TRUEHD) {
                         av_log(ctx, AV_LOG_ERROR, "Support for muxing audio codec %s not implemented.\n",
+@@ -503,6 +580,9 @@ static av_cold int mpeg_mux_init(AVFormatContext *ctx)
+         else
+             codec_rate = st->codecpar->bit_rate;
+ 
++        if (st->codecpar->codec_id == AV_CODEC_ID_PCM_DVD)
++            codec_rate = lpcm_whole_block_rate(s, st->codecpar, codec_rate);
++
+         if (!codec_rate)
+             codec_rate = (1 << 21) * 8 * 50 / ctx->nb_streams;
+ 
 Index: FFmpeg/tests/ref/fate/pcm_dvd-24-1-48000
 ===================================================================
 --- FFmpeg.orig/tests/ref/fate/pcm_dvd-24-1-48000
 +++ FFmpeg/tests/ref/fate/pcm_dvd-24-1-48000
 @@ -1,4 +1,4 @@
 -95a5e963bb6b654603089f3e17718b16 *tests/data/fate/pcm_dvd-24-1-48000.vob
-+26b583b29c554cdeb55eef180ee330da *tests/data/fate/pcm_dvd-24-1-48000.vob
++2e644b3d363f6b37cb803224ee6b1a17 *tests/data/fate/pcm_dvd-24-1-48000.vob
  106496 tests/data/fate/pcm_dvd-24-1-48000.vob
  #tb 0: 1/48000
  #media_type 0: audio
@@ -207,7 +263,7 @@ Index: FFmpeg/tests/ref/fate/pcm_dvd-24-2-48000
 @@ -1,5 +1,5 @@
 -6fcd235f0c165f2c5f4431f9e0d60d28 *tests/data/fate/pcm_dvd-24-2-48000.vob
 -8218624 tests/data/fate/pcm_dvd-24-2-48000.vob
-+e01ce1d955c90ea49bd716cfe89ef1bd *tests/data/fate/pcm_dvd-24-2-48000.vob
++467fc09691fa14367dda11756cf5f8ca *tests/data/fate/pcm_dvd-24-2-48000.vob
 +8243200 tests/data/fate/pcm_dvd-24-2-48000.vob
  #tb 0: 1/48000
  #media_type 0: audio
@@ -277,7 +333,7 @@ Index: FFmpeg/tests/ref/fate/pcm_dvd-24-5.1-48000
 @@ -1,94 +1,96 @@
 -131d92cc9349ab808cf60dd0c9ed8df6 *tests/data/fate/pcm_dvd-24-5.1-48000.vob
 -2519040 tests/data/fate/pcm_dvd-24-5.1-48000.vob
-+48dcb4c91785757d1189b47ae3026bb2 *tests/data/fate/pcm_dvd-24-5.1-48000.vob
++e5eb904a4e4130ebaa183680fb167b9b *tests/data/fate/pcm_dvd-24-5.1-48000.vob
 +2586624 tests/data/fate/pcm_dvd-24-5.1-48000.vob
  #tb 0: 1/48000
  #media_type 0: audio

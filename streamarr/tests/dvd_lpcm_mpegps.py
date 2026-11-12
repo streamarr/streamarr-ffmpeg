@@ -26,6 +26,13 @@ packet has room for one block even with a pack header, a PTS and a DTS, so FFmpe
 Every size between is refused or written in whole blocks, and FFmpeg must stop: a muxer that
 cannot write a block writes empty packets forever.
 
+Last, it writes 24-bit DVD PCM alone into VOBs: 5.1 that FFmpeg encodes and 7 channels that
+FFmpeg copies, in packets of the default 2048 bytes and of 1000 to 3000 bytes. Whole blocks leave
+up to a block of a packet unused, so FFmpeg must raise the mux rate, which it computes from the
+stream's bit rate, to carry them. The pack that completes a block must start to arrive, by its
+SCR, before the block's first sample is due. A block that arrives later leaves a player that keeps
+to that clock without the samples it must play.
+
 Exits 0 when every check passes, 1 when one fails, 2 when FFmpeg fails.
 """
 import argparse
@@ -49,6 +56,12 @@ SMALL_PACKET_SAMPLES = 24000
 # Half a second of 24-bit 5.1 fills about 0.7 MB of these packets. A muxer that never drains its
 # queue writes past this limit within a second, and the limit stops it.
 OUTPUT_LIMIT = 16 << 20
+# The default, then a step prime to the 72-byte block of 24-bit 5.1 and the 84-byte block of 7
+# channels, so the bytes that whole blocks leave unused take every value below a block. With or
+# without whole blocks, below about 1000 bytes the headers alone outgrow the 5 % that FFmpeg adds
+# to the mux rate for them, and above about 3500 the 4 KB audio buffer that the muxer models holds
+# each packet back until its first block is all but due.
+ARRIVAL_PACKET_SIZES = [2048] + list(range(1000, 3001, 11))
 
 
 def block_size(bits, channels):
@@ -115,10 +128,29 @@ def write_source(ffmpeg, directory, shape):
     return vob
 
 
+def timestamp(data, position):
+    """The 33-bit PTS or MPEG-1 SCR in the five bytes at position, in 90 kHz ticks."""
+    b = data[position:position + 5]
+    return ((b[0] >> 1) & 7) << 30 | b[1] << 22 | (b[2] >> 1) << 15 | b[3] << 7 | b[4] >> 1
+
+
+def pack_scr(data, position):
+    """The size of the MPEG-2 or MPEG-1 pack header at position, and its SCR in 90 kHz ticks."""
+    if data[position + 4] & 0xC0 == 0x40:
+        b = data[position + 4:position + 10]
+        base = (((b[0] >> 3) & 7) << 30 | (b[0] & 3) << 28 | b[1] << 20 | (b[2] >> 3) << 15
+                | (b[2] & 3) << 13 | b[3] << 5 | b[4] >> 3)
+        extension = (b[4] & 3) << 7 | b[5] >> 1
+        return 14 + (data[position + 13] & 7), base + extension / 300
+    return 12, timestamp(data, position + 4)
+
+
 def pes_body(data, position):
-    """Where the data of the PES packet at position starts, after an MPEG-2 or MPEG-1 header."""
+    """Where the data of the PES packet at position starts, after an MPEG-2 or MPEG-1 header, and
+    the packet's PTS, or None."""
     if data[position + 6] & 0xC0 == 0x80:
-        return position + 9 + data[position + 8]
+        pts = timestamp(data, position + 9) if data[position + 7] & 0x80 else None
+        return position + 9 + data[position + 8], pts
     body = position + 6
     while data[body] == 0xFF:
         body += 1
@@ -126,13 +158,15 @@ def pes_body(data, position):
         body += 2
     timestamps = data[body] & 0xF0
     if timestamps == 0x20:
-        return body + 5
+        return body + 5, timestamp(data, body)
     if timestamps == 0x30:
-        return body + 10
-    return body + 1
+        return body + 10, timestamp(data, body)
+    return body + 1, None
 
 
-LpcmPacket = collections.namedtuple("LpcmPacket", "frames pointer payload")
+# scr: the SCR of the packet's pack, when the pack starts to reach the decoder (ISO/IEC 13818-1,
+# 2.5.2). No byte of the packet arrives earlier.
+LpcmPacket = collections.namedtuple("LpcmPacket", "frames pointer payload pts scr")
 
 
 def lpcm_packets(vob):
@@ -141,6 +175,7 @@ def lpcm_packets(vob):
         data = source.read()
     packets = []
     position = 0
+    scr = None
     while position + 4 <= len(data):
         if data[position:position + 3] != b"\x00\x00\x01":
             raise ValueError("no start code at byte %d" % position)
@@ -148,18 +183,16 @@ def lpcm_packets(vob):
         if stream_id == 0xB9:
             break
         if stream_id == 0xBA:
-            pack_header = 12
-            if data[position + 4] & 0xC0 == 0x40:
-                pack_header = 14 + (data[position + 13] & 7)
+            pack_header, scr = pack_scr(data, position)
             position += pack_header
             continue
         end = position + 6 + int.from_bytes(data[position + 4:position + 6], "big")
         if stream_id == 0xBD:
-            body = pes_body(data, position)
+            body, pts = pes_body(data, position)
             if 0xA0 <= data[body] <= 0xAF:
                 packets.append(LpcmPacket(
                     frames=data[body + 1], pointer=int.from_bytes(data[body + 2:body + 4], "big"),
-                    payload=data[body + 7:end]))
+                    payload=data[body + 7:end], pts=pts, scr=scr))
         position = end
     return packets
 
@@ -286,6 +319,85 @@ def check_small_packets(ffmpeg, directory):
     return failures
 
 
+def pes_timestamp(value):
+    """The five bytes of a PES header's PTS, in 90 kHz ticks."""
+    return bytes([0x21 | ((value >> 30) & 7) << 1, (value >> 22) & 0xFF, ((value >> 14) & 0xFE) | 1,
+                  (value >> 7) & 0xFF, ((value << 1) & 0xFE) | 1])
+
+
+def pack_header(scr):
+    """An MPEG-2 pack header with the given SCR and a mux rate of 10.08 Mb/s."""
+    return bytes([0, 0, 1, 0xBA, 0x44 | ((scr >> 30) & 7) << 3 | ((scr >> 28) & 3),
+                  (scr >> 20) & 0xFF, ((scr >> 15) & 0x1F) << 3 | 4 | ((scr >> 13) & 3),
+                  (scr >> 5) & 0xFF, (scr & 0x1F) << 3 | 4, 1, 0x01, 0x89, 0xC3, 0xF8])
+
+
+def write_dvd_pcm(path, bits, channels):
+    """Writes to path a VOB of silent 48 kHz DVD PCM alone, as FFmpeg's encoder writes only 1, 2, 6
+    and 8 channels. Each pack holds one packet of whole blocks with the PTS of its first sample, and
+    each SCR is 0.2 s before that PTS."""
+    block = block_size(bits, channels)
+    size = 2000 - 2000 % block
+    total = 48000 * SECONDS * channels * bits // 8
+    total -= total % block
+    with open(path, "wb") as out:
+        for offset in range(0, total, size):
+            pts = 45000 + offset * 8 * 90000 // (channels * bits * 48000)
+            data = (b"\x81\x80\x05" + pes_timestamp(pts)
+                    + bytes([0xA0, 1, 0, 4, 0, (bits - 16) // 4 << 6 | (channels - 1), 0x80])
+                    + bytes(min(size, total - offset)))
+            out.write(pack_header(pts - 18000) + b"\x00\x00\x01\xBD"
+                      + len(data).to_bytes(2, "big") + data)
+        out.write(b"\x00\x00\x01\xB9")
+
+
+def late_packets(vob, bits, rate, channels):
+    """The LPCM packets whose pack starts to arrive after the first block that the packet
+    completes is due, and the smallest margin in ms by which a pack starts before that, negative for
+    a late one. The first packet's PTS is when the first sample is due, and each sample after it is
+    due one sample period later."""
+    block = block_size(bits, channels)
+    packets = lpcm_packets(vob)
+    offset = late = 0
+    margin = float("inf")
+    for packet in packets:
+        first_end = (offset // block + 1) * block
+        if first_end <= offset + len(packet.payload):
+            due = packets[0].pts + (first_end - block) * 8 // (bits * channels) * 90000 / rate
+            late += packet.scr > due
+            margin = min(margin, due - packet.scr)
+        offset += len(packet.payload)
+    return late, len(packets), margin / 90
+
+
+def check_arrivals(ffmpeg, directory):
+    """Every block of DVD PCM that FFmpeg writes alone into a VOB starts to arrive, by the SCR of
+    its pack, before its first sample is due: 24-bit 5.1 that FFmpeg encodes, and 24-bit 7-channel
+    DVD PCM that FFmpeg copies, in each of ARRIVAL_PACKET_SIZES. Each copied packet holds 1932
+    bytes, so many of the packets that FFmpeg writes start none of them and carry no PTS, which
+    leaves room for more samples."""
+    raw = os.path.join(directory, "arrivals.s32le")
+    with open(raw, "wb") as out:
+        out.write(counted(24, 6, 48000 * SECONDS))
+    copied = os.path.join(directory, "arrivals-7-channels.vob")
+    write_dvd_pcm(copied, 24, 7)
+    vob = os.path.join(directory, "arrivals.vob")
+    sources = [("5.1", 6, ["-f", "s32le", "-ar", "48000", "-ch_layout", "5.1", "-i", raw,
+                           "-c:a", "pcm_dvd", "-sample_fmt", "s32"]),
+               ("7 channels, copied,", 7, ["-i", copied, "-c:a", "copy"])]
+    failures = 0
+    for packet_size in ARRIVAL_PACKET_SIZES:
+        for name, channels, arguments in sources:
+            run([ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-y"] + arguments
+                + ["-packetsize", str(packet_size), "-f", "vob", vob])
+            late, total, margin = late_packets(vob, 24, 48000, channels)
+            failures += late != 0
+            print("24-bit 48000 Hz %s alone in a VOB of %d-byte packets: %d of %d LPCM packets"
+                  " start after a block they complete is due, smallest margin %+.2f ms: %s"
+                  % (name, packet_size, late, total, margin, "ok" if not late else "WRONG"))
+    return failures
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--ffmpeg", required=True)
@@ -295,6 +407,7 @@ def main():
         for shape in SHAPES:
             failures += check_shape(arguments.ffmpeg, directory, shape)
         failures += check_small_packets(arguments.ffmpeg, directory)
+        failures += check_arrivals(arguments.ffmpeg, directory)
     print("%d checks failed" % failures)
     sys.exit(1 if failures else 0)
 

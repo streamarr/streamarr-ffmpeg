@@ -191,7 +191,8 @@ jobs:
       # block of the decoder, and a decode that starts after a seek reads noise to its end. The
       # check writes counted PCM with the build's own FFmpeg, reads every LPCM payload, and
       # compares every sample decoded from the start and after four seeks with the source. It
-      # also checks that FFmpeg refuses packets too small for a block instead of never stopping.
+      # also checks that FFmpeg refuses packets too small for a block instead of never stopping,
+      # and that the SCR in the pack headers never runs ahead of the samples.
       # linuxarm64 binaries cannot run on these runners.
       - name: Check that DVD PCM in MPEG-PS decodes after a seek
         if: matrix.target != 'linuxarm64'
