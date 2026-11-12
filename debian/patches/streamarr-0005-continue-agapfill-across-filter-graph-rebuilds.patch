@@ -16,6 +16,13 @@ Description: fftools/ffmpeg_filter: continue the output of agapfill when a filte
  silence. That is the case after a seek whose discarded frames hold the
  change.
  .
+ resume counts the position in the new graph's sample rate. When the rate
+ rises, a position near the end of the 64-bit range can pass it, and
+ av_rescale_q_rnd() then answers INT64_MIN, which means no timestamp. A
+ position of 9 x 10^18 samples at 44.1 kHz became a gap that never ended
+ at 48 kHz. Such a position now stops at the largest or the smallest
+ timestamp, as the output position does.
+ .
  The filter writes a gap one frame of silence for each frame its output
  asks for, and holds the frame after the gap, and the frames behind it,
  until then. ffmpeg freed a graph with those frames in it when another
@@ -28,13 +35,13 @@ Description: fftools/ffmpeg_filter: continue the output of agapfill when a filte
  would only discard the rest of the gap.
 Author: Streamarr
 Forwarded: no
-Last-Update: 2026-11-11
+Last-Update: 2026-11-12
 ---
 Index: FFmpeg/doc/filters.texi
 ===================================================================
 --- FFmpeg.orig/doc/filters.texi
 +++ FFmpeg/doc/filters.texi
-@@ -2163,6 +2163,42 @@ agapfill=start=0:max_gap=600
+@@ -2163,6 +2163,44 @@ agapfill=start=0:max_gap=600
  @end example
  @end itemize
  
@@ -58,7 +65,9 @@ Index: FFmpeg/doc/filters.texi
 +@code{position} command of that filter reported. The filter then ignores
 +@option{start}, and its first frame is one more step after the other filter's
 +last frame: a gap between the two is filled, and any other step is joined.
-+The command has no effect once the filter has taken a frame.
++A position that no timestamp at the filter's own sample rate reaches stops at
++the largest or the smallest timestamp, as the output position does. The
++command has no effect once the filter has taken a frame.
 +@end table
 +
 +@command{ffmpeg} builds a new filter graph when the parameters of an input
@@ -319,10 +328,24 @@ Index: FFmpeg/libavfilter/af_agapfill.c
          }
          return send_held(ctx);
      }
-@@ -251,6 +259,63 @@ static int config_output(AVFilterLink *o
+@@ -251,6 +259,74 @@ static int config_output(AVFilterLink *o
      return 0;
  }
  
++/* A position in samples at the rate from, counted in samples at the rate to.
++ * Where no timestamp at the rate to reaches it, the position stops at the end
++ * of the range, as the output position does. av_rescale_q_rnd() answers
++ * INT64_MIN there, the value that means no timestamp. */
++static int64_t rescale_position(int64_t position, int from, int to)
++{
++    const int64_t rescaled = av_rescale_q_rnd(position, (AVRational){ 1, from },
++                                              (AVRational){ 1, to }, AV_ROUND_NEAR_INF);
++
++    if (rescaled != INT64_MIN)
++        return rescaled;
++    return position < 0 ? INT64_MIN + 1 : INT64_MAX;
++}
++
 +/**
 + * Continue the output of another agapfill filter, from what its position
 + * command reported. The first frame is then one more step for place_frame.
@@ -331,7 +354,6 @@ Index: FFmpeg/libavfilter/af_agapfill.c
 +{
 +    AVFilterLink *inlink = ctx->inputs[0];
 +    AGapFillContext *s = ctx->priv;
-+    const AVRational sample = { 1, inlink->sample_rate };
 +    int64_t out_pos, in_end;
 +    int sample_rate;
 +
@@ -345,10 +367,8 @@ Index: FFmpeg/libavfilter/af_agapfill.c
 +    if (s->started)
 +        return 0;
 +
-+    s->out_pos = av_rescale_q_rnd(out_pos, (AVRational){ 1, sample_rate }, sample,
-+                                  AV_ROUND_NEAR_INF);
-+    s->in_end  = av_rescale_q_rnd(in_end, (AVRational){ 1, sample_rate }, sample,
-+                                  AV_ROUND_NEAR_INF);
++    s->out_pos = rescale_position(out_pos, sample_rate, inlink->sample_rate);
++    s->in_end  = rescale_position(in_end, sample_rate, inlink->sample_rate);
 +    s->started = 1;
 +
 +    return 0;
@@ -383,7 +403,7 @@ Index: FFmpeg/libavfilter/af_agapfill.c
  static av_cold void uninit(AVFilterContext *ctx)
  {
      AGapFillContext *s = ctx->priv;
-@@ -272,12 +337,13 @@ static const AVFilterPad agapfill_output
+@@ -272,12 +348,13 @@ static const AVFilterPad agapfill_output
  };
  
  const FFFilter ff_af_agapfill = {

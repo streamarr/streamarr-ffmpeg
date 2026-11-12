@@ -837,6 +837,45 @@ timeline_check("resume-command-incomplete", "starts afresh when the resume comma
                "whole position", chain(LATE_BY_8_SECONDS, resume_command("96000/96000")), "start=0", 0,
                [silence(8 * SECOND), real(0, 10 * SECOND)], count=10 * SECOND)
 
+FAR = 9 * 10 ** 18
+
+
+# The other filter stood at 9 x 10^18 samples at 44.1 kHz, 6.5 million years. At 48 kHz that time is
+# past the largest timestamp, and the position stops there, as the output position does. The audio
+# at 8 s is then a backward step and follows without silence. Unless the position stops, it wraps to
+# the smallest timestamp, and the first frame looks like a gap that never ends.
+@check("resume-command-past-the-range", "stops a position that its own sample rate cannot reach at "
+       "the largest timestamp")
+def resume_command_past_the_range(ffmpeg):
+    counter = COUNTERS["s16"]
+    # ffmpeg adds a frame's length to its timestamp. The last filter stamps the frames from zero, so
+    # that this sum stays in range.
+    shape = chain(LATE_BY_8_SECONDS, resume_command("%d/%d/44100" % (FAR, FAR)), "agapfill",
+                  "ashowinfo", stamp("N"))
+    command = filter_command(ffmpeg, counter.lavfi(10 * SECOND, RATE), "anull", counter)
+    command[command.index("-af") + 1] = shape
+    done = execute(command, lambda out: compare_samples(out, LARGEST_TIMESTAMP,
+                                                        [real(0, 10 * SECOND)], counter, RATE))
+    if done.code:
+        return ["FFmpeg ended with status %d: %s" % (done.code, last_lines(done.log))]
+    stamps = [pts for pts, _, _, _ in frames_of(done.log)]
+    wrong = [pts for pts in stamps if pts != LARGEST_TIMESTAMP]
+    if wrong:
+        return ["%d of %d frames are not stamped %d: the first is stamped %s"
+                % (len(wrong), len(stamps), LARGEST_TIMESTAMP, wrong[0])] + done.result
+    return done.result
+
+
+# The other filter stood at -9 x 10^18 samples at 44.1 kHz. At 48 kHz that time is before the
+# smallest timestamp, and the position stops there. The audio at 8 s is then a gap of 6.5 million
+# years, which the trim cuts short. Unless the position stops, it becomes the value that means no
+# timestamp, and the first frame of silence comes out without one.
+timeline_check("resume-command-before-the-range", "stops a position that its own sample rate cannot "
+               "reach at the smallest timestamp",
+               chain(LATE_BY_8_SECONDS, resume_command("%d/%d/44100" % (-FAR, -FAR))), "",
+               -LARGEST_TIMESTAMP, [silence(2 * DEFAULT_PACKET)],
+               after="atrim=end_sample=%d" % (2 * DEFAULT_PACKET), count=10 * SECOND)
+
 
 # --- When ffmpeg rebuilds the filter graph ------------------------------------------------------
 
@@ -958,6 +997,44 @@ def seek_past_graph_rebuild(ffmpeg):
     # sees a frame. The audio begins 2.024 s after the seek point, and the new graph's filter owes
     # the silence from start, 1 s after the seek point.
     return rebuild_problems(ffmpeg, hole=3, start=1, seek=6)
+
+
+@check("rate-rise-at-graph-rebuild-past-the-range", "keeps every sample and writes no silence when "
+       "the sample rate rises at a rebuild where the new rate cannot reach the old position")
+def rate_rise_past_the_range(ffmpeg):
+    # The audio changes from 44.1 kHz to 48 kHz after 5 s. The first part is stamped 9 x 10^18
+    # samples late, 6.5 million years, and the second part is not. At 48 kHz the old graph's
+    # position is past the largest timestamp. Unless the new graph's filter stops the position
+    # there, it wraps to the smallest timestamp, and the first 48 kHz frame looks like a gap that
+    # never ends. The second part is a backward step, so the output is the audio without the fill.
+    # asetpts rounds the late timestamps to 1,024 samples, and threshold=0.03 joins those steps.
+    late = stamp("PTS+%d*eq(SR,44100)" % FAR)
+    with tempfile.TemporaryDirectory() as work:
+        source = ac3_parts(ffmpeg, work, [("stereo", 44100, 0), ("stereo", RATE, 0)])
+
+        def decode(filters, consume):
+            # The last filter stamps the frames from zero, as in resume-command-past-the-range.
+            return execute([ffmpeg, "-nostdin", "-hide_banner", "-nostats", "-v", "info", "-i", source,
+                            "-af", chain(late, filters, "ashowinfo", stamp("N")),
+                            "-c:a", "pcm_s16le", "-f", "s16le", "-"], consume)
+
+        plain = decode("anull", lambda out: out.read())
+        if plain.code or "Reconfiguring filter graph" not in plain.log:
+            raise Unusable("ffmpeg did not rebuild the filter graph at the change of rate")
+        if frames_of(plain.log)[0][0] <= LARGEST_TIMESTAMP * 44100 // RATE:
+            raise Unusable("the 44.1 kHz part is not stamped past the range of 48 kHz")
+        filled = decode("agapfill=threshold=0.03",
+                        lambda out: (read_fully(out, len(plain.result)), byte_count(out)))
+    if filled.code:
+        return ["FFmpeg ended with status %d: %s" % (filled.code, last_lines(filled.log))]
+    head, extra = filled.result
+    if len(head) + extra != len(plain.result):
+        return ["the output holds %d samples, expected %d"
+                % ((len(head) + extra) // 4, len(plain.result) // 4)]
+    if head != plain.result:
+        at = next(at for at in range(0, len(head), 4) if head[at:at + 4] != plain.result[at:at + 4])
+        return ["output sample %d is not the one the audio has there" % (at // 4)]
+    return []
 
 
 CHANGING_SIZE = (("64x36", 10), ("128x72", 30))
