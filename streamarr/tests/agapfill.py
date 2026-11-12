@@ -126,6 +126,26 @@ def silence(count):
     return ("silence", 0, count)
 
 
+def step(count):
+    """The output's timestamps move by `count` samples, forward or backward, between two samples."""
+    return ("step", 0, count)
+
+
+def sample_count(runs):
+    return sum(count for kind, _, count in runs if kind != "step")
+
+
+def steps_of(runs):
+    """Where the timeline steps: (samples before the step, the step), in order."""
+    steps, offset = [], 0
+    for kind, _, count in runs:
+        if kind == "step":
+            steps.append((offset, count))
+        else:
+            offset += count
+    return steps
+
+
 # A small interpreter that runs FFmpeg and reports the peak memory of its child. The figure is an
 # upper bound: it also counts the interpreter's own memory up to the moment FFmpeg replaces the
 # child, and a lean FFmpeg build stays below that. Run from this script itself, the figure would
@@ -230,9 +250,12 @@ def read_fully(stream, size):
 
 def compare_samples(stream, first, runs, counter, rate):
     """Reads raw PCM and returns what differs from the expected runs."""
-    problems, position, width = [], 0, counter.width
-    expected_total = sum(count for _, _, count in runs)
+    problems, position, shift, width = [], 0, 0, counter.width
+    expected_total = sample_count(runs)
     for kind, source_first, count in runs:
+        if kind == "step":
+            shift += count
+            continue
         done = 0
         while done < count:
             want = min(count - done, CHUNK)
@@ -245,7 +268,7 @@ def compare_samples(stream, first, runs, counter, rate):
             if got[:have * width] != expected and not problems:
                 index = next(i for i in range(have)
                              if got[i * width:(i + 1) * width] != expected[i * width:(i + 1) * width])
-                at = first + position + index
+                at = first + shift + position + index
                 problems.append("the sample at %d (%.6f s) is %s, expected %s"
                                 % (at, at / rate, counter.name(got[index * width:(index + 1) * width]),
                                    counter.name(expected[index * width:(index + 1) * width])))
@@ -270,7 +293,7 @@ def compare_samples(stream, first, runs, counter, rate):
 def check_frames(frames, first, runs, packet_size, rate):
     """Checks the timestamps of the frames against the expected timeline."""
     problems = []
-    total = sum(count for _, _, count in runs)
+    total = sample_count(runs)
     if not frames:
         return [] if not total else ["no frame came out of the filter"]
     if frames[0][0] != first:
@@ -280,13 +303,32 @@ def check_frames(frames, first, runs, packet_size, rate):
     if pts is not None and abs(seconds - pts / rate) > 1e-5 * max(1, abs(pts / rate)):
         problems.append("the frame stamped %d is at %s s, expected %.6f s: the output time base is "
                         "not one sample" % (pts, seconds, pts / rate))
-    breaks = [(frames[i - 1][0], frames[i - 1][1], frames[i][0]) for i in range(1, len(frames))
-              if frames[i - 1][0] is None or frames[i][0] != frames[i - 1][0] + frames[i - 1][1]]
+    # A frame begins where the frame before it ends, moved by the timeline's steps there.
+    steps = {}
+    for offset, size in steps_of(runs):
+        steps[offset] = steps.get(offset, 0) + size
+    breaks, starts, offset = [], set(), 0
+    for index, (pts, length, _, _) in enumerate(frames):
+        if index:
+            before, before_length = frames[index - 1][:2]
+            expected = None if before is None else before + before_length + steps.get(offset, 0)
+            if before is None or pts != expected:
+                breaks.append((before, before_length, pts, expected))
+        starts.add(offset)
+        offset += length
     if breaks:
-        pts, length, following = breaks[0]
+        pts, length, following, expected = breaks[0]
         end = "nowhere" if pts is None else "%d (%.6f s)" % (pts + length, (pts + length) / rate)
+        where = "" if expected is None else ", where the timeline puts it at %d" % expected
         problems.append("the output timeline breaks %d times: first at a frame stamped %s, "
-                        "which follows a frame that ends at %s" % (len(breaks), following, end))
+                        "which follows a frame that ends at %s%s"
+                        % (len(breaks), following, end, where))
+        return problems
+    missing = [(offset, size) for offset, size in sorted(steps.items()) if offset not in starts]
+    if missing:
+        offset, size = missing[0]
+        problems.append("no frame begins where the timeline steps by %d samples, after %d samples "
+                        "of output" % (size, offset))
         return problems
     position, silences = first, []
     for kind, _, count in runs:
@@ -1019,7 +1061,8 @@ def rebuild_problems(ffmpeg, *, hole, ahead="anull", after="anull", start=None, 
                                         None if start is None else start * RATE)
     problems = check_frames(frames_of(filled.log), first, runs, DEFAULT_PACKET, RATE)
     expected = b"".join(bytes(4 * count) if kind == "silence"
-                        else plain.result[4 * at:4 * (at + count)] for kind, at, count in runs)
+                        else plain.result[4 * at:4 * (at + count)] for kind, at, count in runs
+                        if kind != "step")
     quiet = sum(count for kind, _, count in runs if kind == "silence")
     if len(filled.result) != len(expected):
         problems.append("the output holds %d samples, expected %d of silence and %d of source"
