@@ -28,7 +28,10 @@ Description: avfilter/tonemapx: linearize Dolby Vision L'M'S' before the LMS to 
  it to 1 before the matrix gives a different colour from the GPU
  filters, which do not clamp there. Linear RGB below zero comes out as
  zero on every path. The vector paths used to carry negative R'G'B'
- on, where the C path already clipped it.
+ on, where the C path already clipped it. Linear RGB above one comes
+ out as one. tonemap_cuda does not clip there, so on colours brighter
+ than 10,000 nits the two filters still differ. No standard gives
+ these values.
 Author: Streamarr
 Forwarded: no
 Last-Update: 2026-11-11
@@ -327,8 +330,8 @@ Index: FFmpeg/libavfilter/vf_tonemapx.h
 + * are 2^17 apart, and one more for the same reason. Both are read with linear interpolation.
 + */
 +#define PQ_EOTF_LUT_UNIT 16384
-+#define PQ_EOTF_LUT_MAX 1.375f
-+#define PQ_EOTF_LUT_STEPS 22528 // PQ_EOTF_LUT_UNIT * PQ_EOTF_LUT_MAX
++#define PQ_EOTF_LUT_STEPS (PQ_EOTF_LUT_UNIT * 11 / 8)
++#define PQ_EOTF_LUT_MAX ((float)PQ_EOTF_LUT_STEPS / PQ_EOTF_LUT_UNIT) // 1.375, exact in float
 +#define PQ_EOTF_LUT_SIZE (PQ_EOTF_LUT_STEPS + 2)
 +#define PQ_OETF_LUT_OCTAVES 40
 +#define PQ_OETF_LUT_SHIFT 17
@@ -365,8 +368,8 @@ Index: FFmpeg/libavfilter/vf_tonemapx.h
 +
 +/*
 + * Dolby Vision L'M'S' to BT.2020 R'G'B', both PQ coded: PQ EOTF, the LMS to RGB matrix on
-+ * linear light, PQ OETF. The matrix is only correct on linear values. Linear RGB outside 0..1
-+ * comes out as 0 or 1.
++ * linear light, PQ OETF. The matrix is only correct on linear values. L'M'S' is clamped to
++ * 0..PQ_EOTF_LUT_MAX first, and linear RGB outside 0..1 comes out as 0 or 1.
 + */
 +static av_always_inline void tonemapx_lms2rgb(float *r, float *g, float *b,
 +                                              float l, float m, float s,
