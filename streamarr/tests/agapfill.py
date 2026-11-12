@@ -1058,7 +1058,7 @@ STEADY_SIZE = (("64x36", 40),)
 
 
 def beside_video(ffmpeg, shape, option, first, runs, after="anull", audio_frames=None,
-                 sizes=CHANGING_SIZE, discarded=()):
+                 sizes=CHANGING_SIZE, discarded=(), chains=None):
     """Fills the counter in one filter graph with a video made of `sizes`, (frame size, seconds).
 
     The audio file carries the timestamps `shape` gives. By default the frame size changes at
@@ -1066,7 +1066,8 @@ def beside_video(ffmpeg, shape, option, first, runs, after="anull", audio_frames
     is still short of 10 s, so the filter is writing silence when the change of size makes ffmpeg
     free the graph and build a new one. `after` is the filter behind the fill. It may branch, and
     its last chain leads on to the audio output. `discarded` names the outputs of other branches,
-    which ffmpeg discards. The audio output takes at most `audio_frames` frames.
+    which ffmpeg discards. The audio output takes at most `audio_frames` frames. `chains` replace
+    the fill and `after`: they read [1:a] and end in ashowinfo[a].
     """
     limit = [] if audio_frames is None else ["-frames:a", str(audio_frames)]
     other_outputs = [part for label in discarded for part in ("-map", label, "-f", "null", "-")]
@@ -1088,7 +1089,9 @@ def beside_video(ffmpeg, shape, option, first, runs, after="anull", audio_frames
                                            audio])
         if made.code:
             raise Unusable("FFmpeg could not write the audio: %s" % last_lines(made.log))
-        graph = "[0:v]scale=64:36[v];[1:a]agapfill%s,%s,ashowinfo[a]" % (option, after)
+        if chains is None:
+            chains = "[1:a]agapfill%s,%s,ashowinfo[a]" % (option, after)
+        graph = "[0:v]scale=64:36[v];" + chains
         done = execute([ffmpeg, "-nostdin", "-hide_banner", "-nostats", "-v", "info", "-copyts",
                         "-f", "mjpeg", "-framerate", "24", "-i", video, "-i", audio,
                         "-filter_complex", graph, "-map", "[v]", "-f", "null", "-"] + other_outputs
