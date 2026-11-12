@@ -195,9 +195,9 @@ def pes_body(data, position):
 LpcmPacket = collections.namedtuple("LpcmPacket", "frames pointer payload pts scr")
 
 
-def lpcm_packet_bounds(data):
-    """The (PES packet start, LPCM sub-stream start, PES packet end, PTS or None, SCR of its pack)
-    of every LPCM packet of the bytes of an MPEG-2 program stream or an MPEG-1 system stream."""
+def pes_packets(data):
+    """The (PES packet start, stream id, PES packet end, SCR of its pack) of every PES packet of the
+    bytes of an MPEG-2 program stream or an MPEG-1 system stream."""
     position = 0
     scr = None
     while position + 4 <= len(data):
@@ -211,11 +211,18 @@ def lpcm_packet_bounds(data):
             position += pack_header
             continue
         end = position + 6 + int.from_bytes(data[position + 4:position + 6], "big")
+        yield position, stream_id, end, scr
+        position = end
+
+
+def lpcm_packet_bounds(data):
+    """The (PES packet start, LPCM sub-stream start, PES packet end, PTS or None, SCR of its pack)
+    of every LPCM packet of the bytes of an MPEG-2 program stream or an MPEG-1 system stream."""
+    for position, stream_id, end, scr in pes_packets(data):
         if stream_id == 0xBD:
             body, pts = pes_body(data, position)
             if 0xA0 <= data[body] <= 0xAF:
                 yield position, body, end, pts, scr
-        position = end
 
 
 def lpcm_packets(vob):
