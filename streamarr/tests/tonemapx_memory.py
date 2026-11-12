@@ -5,8 +5,8 @@
     python3 streamarr/tests/tonemapx_memory.py --ffmpeg PATH --leak-sanitizer [--cpuflags FLAGS]
 
 Everything is synthetic. FFmpeg's libx265 encodes one small black frame, and the stream is that
-access unit again and again, each copy followed by the profile 5 RPU of the colour check
-(dolby_vision_profile5_colour.py). It runs through the two tonemapx chains of the Streamarr
+access unit again and again, each copy followed by the polynomial profile 5 RPU of the colour
+check (dolby_vision_profile5_colour.py). It runs through the two tonemapx chains of the Streamarr
 transcode worker: the reshape of Dolby Vision profile 5 to BT.2020 PQ, and the tone map to SDR.
 Nothing is encoded after the filter.
 
@@ -35,7 +35,7 @@ import subprocess
 import sys
 import tempfile
 
-from dolby_vision_profile5_colour import rpu_nal, run
+from dolby_vision_profile5_colour import POLYNOMIAL, rpu_nal, run
 
 CHAINS = {
     "reshape to BT.2020 PQ": "format=yuv420p10le,"
@@ -175,7 +175,7 @@ def main():
         with open(base, "rb") as file:
             access_unit = file.read()
         frames = SANITIZED_FRAMES if arguments.leak_sanitizer else LONG_FRAMES
-        write_stream(profile5, access_unit + rpu_nal(), frames)
+        write_stream(profile5, access_unit + rpu_nal(POLYNOMIAL), frames)
         require_reshaped_frames(arguments, profile5)
         if arguments.leak_sanitizer:
             write_stream(plain, access_unit, frames)
