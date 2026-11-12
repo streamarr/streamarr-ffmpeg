@@ -5,8 +5,8 @@
                                                             [--cpuflags FLAGS] [--keep DIR]
 
 Everything is synthetic. The picture is a frame of flat patches, each one base-layer code triple
-(I, P, T): a grey ramp, three rings of colours around neutral, and bright colours whose L'M'S' goes
-above the PQ range. FFmpeg's libx265 encodes it
+(I, P, T): a grey ramp, rings of colours 16 to 260 codes around neutral, and bright colours whose
+L'M'S' goes above the PQ range. FFmpeg's libx265 encodes it
 losslessly, and this script writes the profile 5 RPU itself and appends it to the access unit.
 Inside a flat patch, chroma siting and interpolation cannot change the result, so every output
 code is compared with the value the profile 5 definition gives, computed here in double precision:
@@ -38,10 +38,10 @@ import sys
 import tempfile
 
 PATCH = 16
-COLUMNS, ROWS = 24, 17
+COLUMNS, ROWS = 24, 39
 WIDTH, HEIGHT = COLUMNS * PATCH, ROWS * PATCH
 GREY_TOLERANCE = 1
-COLOUR_TOLERANCE = 2
+COLOUR_TOLERANCE = 1
 
 # The RPU's reshaping curves: one second-order piece for I, one first-order piece for P and T.
 COEFFICIENT_BITS = 23
@@ -129,6 +129,8 @@ def patch_triples():
     for luma in (64, 128, 192, 256, 320, 384, 448, 512, 640, 768, 896):
         for radius in (16, 48, 90):
             triples += ring(luma, radius, 8)
+        for radius in (140, 200, 260):
+            triples += ring(luma, radius, 16)
     triples += [triple for luma in (960, 992, 1023) for radius in (90, 140) for triple in ring(luma, radius, 16)
                 if exact_codes(triple)[1] == ABOVE_RANGE]
     triples += [(512, 512, 512)] * (-len(triples) % COLUMNS)

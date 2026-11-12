@@ -1,0 +1,101 @@
+Description: avfilter/tonemap: apply the RPU's linear matrix to LMS before LMS to RGB
+ For Dolby Vision reshaping, the tone-map filters convert linear LMS to
+ RGB with the product of two matrices: the RPU's rgb_to_lms matrix
+ (dovi->linear; for profile 5 the inverse of the 2 % crosstalk matrix)
+ and the constant LMS to BT.2020 RGB matrix. The definition, and
+ libplacebo, apply the RPU's matrix to LMS first. The filters built the
+ product as ff_matrix_mul_3x3(dst, dovi_lms2rgb_matrix, linear), which
+ is linear x dovi_lms2rgb_matrix, so LMS to RGB acted first and the
+ crosstalk inverse was applied to RGB. BT.2100 table 7 fixes the order
+ too: the inverse of its ICtCp RGB to LMS matrix equals the LMS to RGB
+ matrix times the inverse of its 4 % crosstalk matrix.
+ .
+ The rows of both matrices sum to one, so greys came out right and the
+ error grew with saturation. On flat profile 5 patches converted to
+ BT.2020 PQ, colours 140 to 260 base-layer codes from neutral came out
+ 0.7 to 2.2 luma codes off on average, up to 13 luma and 22 chroma
+ codes. tonemapx and tonemap_cuda carried the same error, so they
+ agreed with each other but not with the definition.
+ .
+ Multiply in the right order in tonemapx, tonemap_cuda, tonemap_opencl,
+ tonemap_videotoolbox and tonemap_d3d11. Input without Dolby Vision
+ reshaping does not reach this product.
+Author: Streamarr
+Forwarded: no
+Last-Update: 2026-11-11
+---
+Index: FFmpeg/libavfilter/vf_tonemap_cuda.c
+===================================================================
+--- FFmpeg.orig/libavfilter/vf_tonemap_cuda.c
++++ FFmpeg/libavfilter/vf_tonemap_cuda.c
+@@ -651,7 +651,9 @@ static av_cold int compile(AVFilterLink *inlink)
+             for (j = 0; j < 3; j++)
+                 ycc2rgb_offset[i] -= s->dovi->nonlinear[i][j] * s->dovi->nonlinear_offset[j];
+         }
+-        ff_matrix_mul_3x3(lms2rgb_matrix, dovi_lms2rgb_matrix, s->dovi->linear);
++        // ff_matrix_mul_3x3(dst, a, b) gives b x a, so a acts first: the RPU's linear matrix on LMS,
++        // then LMS to RGB.
++        ff_matrix_mul_3x3(lms2rgb_matrix, s->dovi->linear, dovi_lms2rgb_matrix);
+     } else {
+         ff_fill_rgb2yuv_table(in_coeffs, yuv_matrix);
+         ff_matrix_invert_3x3(yuv_matrix, rgb_matrix);
+Index: FFmpeg/libavfilter/vf_tonemap_d3d11.c
+===================================================================
+--- FFmpeg.orig/libavfilter/vf_tonemap_d3d11.c
++++ FFmpeg/libavfilter/vf_tonemap_d3d11.c
+@@ -488,7 +488,9 @@ static void fill_dovi_params(TonemapD3D11Params *params,
+         params->dovi_ycc2rgb_offset[i] = ycc2rgb_offset[i];
+     }
+ 
+-    ff_matrix_mul_3x3(lms2rgb, dovi_lms2rgb_matrix, dovi->linear);
++    // ff_matrix_mul_3x3(dst, a, b) gives b x a, so a acts first: the RPU's linear matrix on LMS,
++    // then LMS to RGB.
++    ff_matrix_mul_3x3(lms2rgb, dovi->linear, dovi_lms2rgb_matrix);
+     copy_matrix(dovi->nonlinear, params->dovi_rgb_matrix);
+     copy_matrix(lms2rgb, params->dovi_lms2rgb_matrix);
+ 
+Index: FFmpeg/libavfilter/vf_tonemap_opencl.c
+===================================================================
+--- FFmpeg.orig/libavfilter/vf_tonemap_opencl.c
++++ FFmpeg/libavfilter/vf_tonemap_opencl.c
+@@ -735,7 +735,9 @@ static int tonemap_opencl_init(AVFilterContext *avctx)
+         }
+         av_bprintf(&header, "__constant float3 ycc2rgb_offset = {%.13ff, %.13ff, %.13ff};\n",
+                    ycc2rgb_offset[0], ycc2rgb_offset[1], ycc2rgb_offset[2]);
+-        ff_matrix_mul_3x3(lms2rgb, dovi_lms2rgb_matrix, ctx->dovi->linear);
++        // ff_matrix_mul_3x3(dst, a, b) gives b x a, so a acts first: the RPU's linear matrix on LMS,
++        // then LMS to RGB.
++        ff_matrix_mul_3x3(lms2rgb, ctx->dovi->linear, dovi_lms2rgb_matrix);
+         ff_opencl_print_const_matrix_3x3(&header, "rgb_matrix", ctx->dovi->nonlinear); //ycc2rgb
+         ff_opencl_print_const_matrix_3x3(&header, "lms2rgb_matrix", lms2rgb); //lms2rgb
+ 
+Index: FFmpeg/libavfilter/vf_tonemap_videotoolbox.m
+===================================================================
+--- FFmpeg.orig/libavfilter/vf_tonemap_videotoolbox.m
++++ FFmpeg/libavfilter/vf_tonemap_videotoolbox.m
+@@ -581,7 +581,9 @@ static int tonemap_videotoolbox_init(AVFilterContext *avctx)
+                 ycc2rgb_offset[i] -= (float)(ctx->dovi->nonlinear[i][j] * ctx->dovi->nonlinear_offset[j]);
+         }
+         [constant_values setConstantValue:&ycc2rgb_offset type:MTLDataTypeFloat3 withName:@"ycc2rgb_offset"];
+-        ff_matrix_mul_3x3(lms2rgb, dovi_lms2rgb_matrix, ctx->dovi->linear);
++        // ff_matrix_mul_3x3(dst, a, b) gives b x a, so a acts first: the RPU's linear matrix on LMS,
++        // then LMS to RGB.
++        ff_matrix_mul_3x3(lms2rgb, ctx->dovi->linear, dovi_lms2rgb_matrix);
+         // ycc2rgb
+         rgb_matrix_1[0] = (float)ctx->dovi->nonlinear[0][0];
+         rgb_matrix_1[1] = (float)ctx->dovi->nonlinear[0][1];
+Index: FFmpeg/libavfilter/vf_tonemapx.c
+===================================================================
+--- FFmpeg.orig/libavfilter/vf_tonemapx.c
++++ FFmpeg/libavfilter/vf_tonemapx.c
+@@ -1600,7 +1600,9 @@ static int filter_frame(AVFilterLink *link, AVFrame *in)
+             av_assert0(0);
+         }
+         update_dovi_buf(ctx);
+-        ff_matrix_mul_3x3(s->lms2rgb_matrix, dovi_lms2rgb_matrix, s->dovi->linear);
++        // ff_matrix_mul_3x3(dst, a, b) gives b x a, so a acts first: the RPU's linear matrix on LMS,
++        // then LMS to RGB.
++        ff_matrix_mul_3x3(s->lms2rgb_matrix, s->dovi->linear, dovi_lms2rgb_matrix);
+         s->ycc_offset[0] = s->dovi->nonlinear_offset[0] * (float)s->dovi->nonlinear[0][0] + s->dovi->nonlinear_offset[1] * (float)s->dovi->nonlinear[0][1] + s->dovi->nonlinear_offset[2] * (float)s->dovi->nonlinear[0][2];
+         s->ycc_offset[1] = s->dovi->nonlinear_offset[0] * (float)s->dovi->nonlinear[1][0] + s->dovi->nonlinear_offset[1] * (float)s->dovi->nonlinear[1][1] + s->dovi->nonlinear_offset[2] * (float)s->dovi->nonlinear[1][2];
+         s->ycc_offset[2] = s->dovi->nonlinear_offset[0] * (float)s->dovi->nonlinear[2][0] + s->dovi->nonlinear_offset[1] * (float)s->dovi->nonlinear[2][1] + s->dovi->nonlinear_offset[2] * (float)s->dovi->nonlinear[2][2];
