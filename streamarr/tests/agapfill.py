@@ -535,6 +535,17 @@ refusal_check("max-gap-exceeded-by-lead", "fails on leading silence longer than 
 refusal_check("max-gap-on-2-hours", "fails on a gap of 2 h with max_gap=3600", TWO_HOUR_GAP,
               "max_gap=3600", "max_gap", count=4 * SECOND)
 
+# 10^18 samples, 660,000 years at 48 kHz, are 2.1 x 10^19 microseconds, more than a 64-bit
+# timestamp holds. Unless the filter compares a length in samples with one in microseconds in a way
+# that cannot overflow, such a gap or lead passes max_gap, or the step does not count as a gap.
+refusal_check("max-gap-on-a-lead-of-10-to-the-18", "fails on a lead of 10^18 samples with "
+              "max_gap=10", chain(frames(4800), stamp("PTS+1e18")), "start=0:max_gap=10",
+              "max_gap", count=4 * SECOND)
+
+refusal_check("max-gap-on-a-gap-of-10-to-the-18", "fails on a gap of 10^18 samples with "
+              "max_gap=3600", chain(frames(4800), stamp("PTS+1e18*gte(N,96000)")), "max_gap=3600",
+              "max_gap", count=4 * SECOND)
+
 timeline_check("packet-size", "writes silence in frames of packet_size samples", EIGHT_SECOND_GAP,
                "packet_size=1000", 0, EIGHT_SECOND_TIMELINE, count=24 * SECOND, packet_size=1000)
 

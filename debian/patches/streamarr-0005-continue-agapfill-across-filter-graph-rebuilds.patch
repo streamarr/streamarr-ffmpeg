@@ -300,7 +300,7 @@ Index: FFmpeg/libavfilter/af_agapfill.c
      int64_t out_pos;        ///< timestamp of the next output sample, in samples
      int64_t in_end;         ///< end of the previous input frame by its own timestamp, in samples
      int64_t silence_left;   ///< samples of silence still to write before the held frame
-@@ -199,8 +203,12 @@ static int activate(AVFilterContext *ctx
+@@ -206,8 +210,12 @@ static int activate(AVFilterContext *ctx
              if (!ff_outlink_frame_wanted(outlink))
                  return FFERROR_NOT_READY;
              ret = send_silence(ctx);
@@ -315,7 +315,7 @@ Index: FFmpeg/libavfilter/af_agapfill.c
          }
          return send_held(ctx);
      }
-@@ -244,6 +252,63 @@ static int config_output(AVFilterLink *o
+@@ -251,6 +259,63 @@ static int config_output(AVFilterLink *o
      return 0;
  }
  
@@ -379,7 +379,7 @@ Index: FFmpeg/libavfilter/af_agapfill.c
  static av_cold void uninit(AVFilterContext *ctx)
  {
      AGapFillContext *s = ctx->priv;
-@@ -265,12 +330,13 @@ static const AVFilterPad agapfill_output
+@@ -272,12 +337,13 @@ static const AVFilterPad agapfill_output
  };
  
  const FFFilter ff_af_agapfill = {

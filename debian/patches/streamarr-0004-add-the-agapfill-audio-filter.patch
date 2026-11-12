@@ -144,7 +144,7 @@ Index: FFmpeg/libavfilter/af_agapfill.c
 ===================================================================
 --- /dev/null
 +++ FFmpeg/libavfilter/af_agapfill.c
-@@ -0,0 +1,276 @@
+@@ -0,0 +1,283 @@
 +/*
 + * This file is part of FFmpeg.
 + *
@@ -210,10 +210,17 @@ Index: FFmpeg/libavfilter/af_agapfill.c
 +
 +AVFILTER_DEFINE_CLASS(agapfill);
 +
++/* Whether samples last longer than microseconds, neither below zero. Whole
++ * seconds first, then the rest: av_compare_ts() is undefined where one value
++ * does not fit the other's time base, as 10^18 samples at 48 kHz do not. */
 +static int is_longer(const AVFilterLink *link, int64_t samples, int64_t microseconds)
 +{
-+    return av_compare_ts(samples, (AVRational){ 1, link->sample_rate },
-+                         microseconds, AV_TIME_BASE_Q) > 0;
++    const int64_t rate    = link->sample_rate;
++    const int64_t seconds = samples / rate, limit = microseconds / AV_TIME_BASE;
++
++    if (seconds != limit)
++        return seconds > limit;
++    return (samples % rate) * AV_TIME_BASE > (microseconds % AV_TIME_BASE) * rate;
 +}
 +
 +/**
