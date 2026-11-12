@@ -1483,6 +1483,17 @@ def rebuild_during_gap_before_split_mix(ffmpeg):
     return split_mix_memory_problems(ffmpeg)
 
 
+# As above, but the mix's output takes 20 frames and is then finished. ffmpeg discards whatever
+# reaches a finished output. The mix still waits for its other input and keeps what the split hands
+# it. Unless ffmpeg also asks the finished output whether a filter on its way waits, the audio output
+# keeps asking for the rest of the gap, and the mix keeps every frame of it.
+@check("rebuild-during-gap-before-finished-split-mix", "fills a gap in the memory the same gap "
+       "takes without a rebuild when a split behind the filter feeds a waiting mix whose output "
+       "has finished")
+def rebuild_during_gap_before_finished_split_mix(ffmpeg):
+    return split_mix_memory_problems(ffmpeg, mix_frames=20)
+
+
 def shortest_problems(ffmpeg, sizes, *, at_most):
     """Puts the counter, 2 s and then 8 s after a gap to 32 s, beside a video made of `sizes` in one
     output with -shortest. The audio must last as long as the video less one frame of silence and
