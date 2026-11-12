@@ -190,7 +190,8 @@ jobs:
       # Without streamarr-0008 the MPEG-PS muxer starts most 24-bit DVD PCM payloads inside a
       # block of the decoder, and a decode that starts after a seek reads noise to its end. The
       # check writes counted PCM with the build's own FFmpeg, reads every LPCM payload, and
-      # compares every sample decoded from the start and after four seeks with the source.
+      # compares every sample decoded from the start and after four seeks with the source. It
+      # also checks that FFmpeg refuses packets too small for a block instead of never stopping.
       # linuxarm64 binaries cannot run on these runners.
       - name: Check that DVD PCM in MPEG-PS decodes after a seek
         if: matrix.target != 'linuxarm64'

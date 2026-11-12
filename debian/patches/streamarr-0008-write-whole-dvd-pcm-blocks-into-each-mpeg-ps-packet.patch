@@ -14,15 +14,21 @@ Description: avformat/mpegenc: write whole DVD PCM blocks into each MPEG-PS pack
  is one sample frame, so 16-bit output does not change. 24-bit files grow
  by the padding of the shorter payloads, 0.3 % for stereo and 2.7 % for
  5.1 in FATE.
+ .
+ A packet with no room for a block after its headers holds no samples. If
+ every packet of a stream is that small, the stream never drains and the
+ muxer writes empty packets forever, so refuse such packet sizes. 24-bit
+ 5.1 then needs packets of at least 113 bytes in an MPEG-2 program stream;
+ the default is 2048.
 Author: Streamarr
 Forwarded: no
-Last-Update: 2026-11-11
+Last-Update: 2026-11-12
 ---
 Index: FFmpeg/libavformat/mpegenc.c
 ===================================================================
 --- FFmpeg.orig/libavformat/mpegenc.c
 +++ FFmpeg/libavformat/mpegenc.c
-@@ -300,6 +300,28 @@ static int get_system_header_size(AVFormatContext *ctx)
+@@ -300,6 +300,39 @@ static int get_system_header_size(AVFormatContext *ctx)
      return buf_index;
  }
  
@@ -48,15 +54,35 @@ Index: FFmpeg/libavformat/mpegenc.c
 +    }
 +}
 +
++/* The bytes that flush_packet() writes before the samples of an LPCM packet with a pack header,
++ * a PTS and a DTS: the pack header, the PES header, the substream ID and the LPCM header. Only
++ * the first packet of a stream and a packet with a system header have more. */
++static int lpcm_packet_overhead(const MpegMuxContext *s)
++{
++    int pack_header = s->is_mpeg2 ? 14 : 12;
++    int pes_header  = 6 + (s->is_mpeg2 ? 3 + 1 : 0) + 5 + 5;
++
++    return pack_header + pes_header + 1 + 6;
++}
++
  static av_cold int mpeg_mux_init(AVFormatContext *ctx)
  {
      MpegMuxContext *s = ctx->priv_data;
-@@ -410,7 +432,7 @@ static av_cold int mpeg_mux_init(AVFormatContext *ctx)
+@@ -410,7 +443,16 @@ static av_cold int mpeg_mux_init(AVFormatContext *ctx)
                                           st->codecpar->ch_layout.nb_channels - 1;
                  stream->lpcm_header[2] = 0x80;
                  stream->id = lpcm_id++;
 -                stream->lpcm_align = st->codecpar->ch_layout.nb_channels * st->codecpar->bits_per_coded_sample / 8;
 +                stream->lpcm_align = pcm_dvd_block_size(st->codecpar);
++                /* flush_packet() writes only whole blocks. Where the headers of
++                 * lpcm_packet_overhead() leave no room for one, the stream can stall, and the
++                 * muxer then writes empty packets forever. */
++                if (s->packet_size - lpcm_packet_overhead(s) < stream->lpcm_align) {
++                    av_log(ctx, AV_LOG_ERROR,
++                           "Packet size %d leaves no room for a %d-byte block of DVD PCM.\n",
++                           s->packet_size, stream->lpcm_align);
++                    return AVERROR(EINVAL);
++                }
              } else if (st->codecpar->codec_id == AV_CODEC_ID_MLP ||
                         st->codecpar->codec_id == AV_CODEC_ID_TRUEHD) {
                         av_log(ctx, AV_LOG_ERROR, "Support for muxing audio codec %s not implemented.\n",
