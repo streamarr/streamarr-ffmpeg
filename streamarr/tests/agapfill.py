@@ -1042,16 +1042,18 @@ STEADY_SIZE = (("64x36", 40),)
 
 
 def beside_video(ffmpeg, shape, option, first, runs, after="anull", audio_frames=None,
-                 sizes=CHANGING_SIZE):
+                 sizes=CHANGING_SIZE, discarded=()):
     """Fills the counter in one filter graph with a video made of `sizes`, (frame size, seconds).
 
     The audio file carries the timestamps `shape` gives. By default the frame size changes at
     10 s. ffmpeg reads the first frame after the hole, or the late first frame, while the video
     is still short of 10 s, so the filter is writing silence when the change of size makes ffmpeg
-    free the graph and build a new one. `after` is the filter behind the fill. The audio output
-    takes at most `audio_frames` frames.
+    free the graph and build a new one. `after` is the filter behind the fill. It may branch, and
+    its last chain leads on to the audio output. `discarded` names the outputs of other branches,
+    which ffmpeg discards. The audio output takes at most `audio_frames` frames.
     """
     limit = [] if audio_frames is None else ["-frames:a", str(audio_frames)]
+    other_outputs = [part for label in discarded for part in ("-map", label, "-f", "null", "-")]
     counter = COUNTERS["s16"]
     quiet = ["-nostdin", "-hide_banner", "-v", "error"]
     with tempfile.TemporaryDirectory() as work:
@@ -1073,8 +1075,8 @@ def beside_video(ffmpeg, shape, option, first, runs, after="anull", audio_frames
         graph = "[0:v]scale=64:36[v];[1:a]agapfill%s,%s,ashowinfo[a]" % (option, after)
         done = execute([ffmpeg, "-nostdin", "-hide_banner", "-nostats", "-v", "info", "-copyts",
                         "-f", "mjpeg", "-framerate", "24", "-i", video, "-i", audio,
-                        "-filter_complex", graph, "-map", "[v]", "-f", "null", "-",
-                        "-map", "[a]"] + limit + ["-c:a", counter.codec, "-f", counter.raw, "-"],
+                        "-filter_complex", graph, "-map", "[v]", "-f", "null", "-"] + other_outputs
+                       + ["-map", "[a]"] + limit + ["-c:a", counter.codec, "-f", counter.raw, "-"],
                        lambda out: compare_samples(out, first, runs, counter, RATE))
     if done.code:
         return ["FFmpeg ended with status %d: %s" % (done.code, last_lines(done.log))]
