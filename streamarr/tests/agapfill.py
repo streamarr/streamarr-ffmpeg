@@ -1075,6 +1075,34 @@ def case_distinct_names_at_graph_rebuild(ffmpeg):
                             names=("agapfill@a", "agapfill@A"))
 
 
+def apart_problems(ffmpeg, names):
+    """rebuild_problems for two fills named `names`, the second 10 s later than the first and its
+    output moved back by as much.
+
+    At the change of layout the first fill's output stands at about 6 s and the second's at about
+    16 s. Unless each fill of the new graph resumes from the fill in its place, both resume at the
+    same position. When both resume at 16 s, the first joins its next frame there, and the second
+    then finds a gap of 10 s and fills it: the audio after the change comes 10 s late.
+    """
+    return rebuild_problems(ffmpeg, hole=0, names=names, between=stamp("PTS+%d" % (10 * SECOND)),
+                            after=stamp("PTS-%d" % (10 * SECOND)))
+
+
+# ffmpeg accepts the same instance name twice.
+@check("same-names-at-graph-rebuild", "continues each of two filters with the same name when ffmpeg "
+       "rebuilds the filter graph")
+def same_names_at_graph_rebuild(ffmpeg):
+    return apart_problems(ffmpeg, ("agapfill@same", "agapfill@same"))
+
+
+# ffmpeg cuts a filter's name to 63 characters, so two instance names that differ only after their
+# 54th character give two filters the same name.
+@check("names-cut-the-same-at-graph-rebuild", "continues each of two filters whose names ffmpeg "
+       "cuts to the same 63 characters when it rebuilds the filter graph")
+def names_cut_the_same_at_graph_rebuild(ffmpeg):
+    return apart_problems(ffmpeg, ("agapfill@" + "x" * 54 + "1", "agapfill@" + "x" * 54 + "2"))
+
+
 @check("rate-rise-at-graph-rebuild-past-the-range", "keeps every sample and writes no silence when "
        "the sample rate rises at a rebuild where the new rate cannot reach the old position")
 def rate_rise_past_the_range(ffmpeg):

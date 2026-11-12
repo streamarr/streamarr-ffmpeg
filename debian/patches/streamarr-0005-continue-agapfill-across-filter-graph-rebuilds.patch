@@ -10,17 +10,23 @@ Description: fftools/ffmpeg_filter: continue the output of agapfill when a filte
  The filter gains two commands. position reports where its output
  stands, and resume makes a filter continue from such a report. Before
  send_frame() replaces a graph, it notes the position of every agapfill
- filter. configure_filtergraph() makes the filter of the same name in
- the new graph resume from it. A filter that took no frame reports
+ filter. configure_filtergraph() makes the agapfill filter in its place
+ in the new graph resume from it. A filter that took no frame reports
  nothing, so its successor starts afresh and still writes the leading
  silence. That is the case after a seek whose discarded frames hold the
  change.
  .
- Filter names differ when their case does, but the positions were noted
- in a dictionary whose keys matched regardless of case. The position of
- agapfill@A replaced that of agapfill@a, so agapfill@a of the new graph
- started from nothing, and the source above came out as 19.07 s again.
- The positions now match by case.
+ The positions were noted by filter name, but a name does not tell two
+ filters apart. The keys matched regardless of case, so the position of
+ agapfill@A replaced that of agapfill@a. agapfill@a of the new graph
+ found none and started from nothing, and the source above came out as
+ 19.07 s again. ffmpeg also accepts an instance name twice, and cuts
+ a name to 63 characters. Two filters of one name, the second 10 s later
+ than the first, both resumed from the second one's position: the first
+ joined its next frame there, the second filled the 10 s up to it, and
+ the audio after the rebuild came 10 s late. The positions now go by the
+ order of the agapfill filters in the graph, which the same description
+ gives them again.
  .
  resume counts the position in the new graph's sample rate. When the rate
  rises, a position near the end of the 64-bit range can pass it, and
@@ -188,18 +194,19 @@ Index: FFmpeg/fftools/ffmpeg_filter.c
 ===================================================================
 --- FFmpeg.orig/fftools/ffmpeg_filter.c
 +++ FFmpeg/fftools/ffmpeg_filter.c
-@@ -96,6 +96,10 @@ typedef struct FilterGraphThread {
+@@ -96,6 +96,11 @@ typedef struct FilterGraphThread {
      // EOF status of each input/output, as received by the thread
      uint8_t         *eof_in;
      uint8_t         *eof_out;
 +
-+    // Where each agapfill filter of a graph that is being replaced stood,
-+    // by filter name. The filters of the new graph resume from there.
++    // Where each agapfill filter of a graph that is being replaced stood, by
++    // its place among the agapfill filters of the graph, counted from 0. The
++    // filters of the new graph resume from there.
 +    AVDictionary    *gap_fill_positions;
  } FilterGraphThread;
  
  typedef struct InputFilterPriv {
-@@ -2077,6 +2081,59 @@ static int graph_is_meta(AVFilterGraph *
+@@ -2077,6 +2082,68 @@ static int graph_is_meta(AVFilterGraph *
      return 1;
  }
  
@@ -212,20 +219,23 @@ Index: FFmpeg/fftools/ffmpeg_filter.c
 + * in its place then starts afresh. */
 +static int note_gap_fill_positions(AVFilterGraph *graph, AVDictionary **positions)
 +{
++    unsigned place = 0;
++
 +    for (unsigned i = 0; i < graph->nb_filters; i++) {
 +        AVFilterContext *f = graph->filters[i];
 +        /* The longest report: three timestamps of 20 characters, each with a
 +         * slash after it, and a sample rate of 10 digits. */
 +        char position[3 * 21 + 10 + 1] = "";
++        char key[11];
 +        int ret;
 +
 +        if (!is_gap_fill(f))
 +            continue;
 +
++        snprintf(key, sizeof(key), "%u", place++);
 +        ret = avfilter_process_command(f, "position", NULL, position, sizeof(position), 0);
-+        /* Two filters may have names that differ only in case. */
 +        if (ret >= 0 && position[0])
-+            ret = av_dict_set(positions, f->name, position, AV_DICT_MATCH_CASE);
++            ret = av_dict_set(positions, key, position, 0);
 +        if (ret < 0)
 +            return ret;
 +    }
@@ -233,18 +243,24 @@ Index: FFmpeg/fftools/ffmpeg_filter.c
 +    return 0;
 +}
 +
-+/* The same graph description gives each filter the same name again. */
++/* A name does not tell two filters apart: ffmpeg accepts an instance name
++ * twice, and cuts a name to 63 characters. The same graph description gives
++ * the agapfill filters the same order again. */
 +static int resume_gap_fills(AVFilterGraph *graph, const AVDictionary *positions)
 +{
++    unsigned place = 0;
++
 +    for (unsigned i = 0; i < graph->nb_filters; i++) {
 +        AVFilterContext *f = graph->filters[i];
 +        const AVDictionaryEntry *position;
++        char key[11];
 +        int ret;
 +
 +        if (!is_gap_fill(f))
 +            continue;
 +
-+        position = av_dict_get(positions, f->name, NULL, AV_DICT_MATCH_CASE);
++        snprintf(key, sizeof(key), "%u", place++);
++        position = av_dict_get(positions, key, NULL, 0);
 +        if (!position)
 +            continue;
 +
@@ -259,7 +275,7 @@ Index: FFmpeg/fftools/ffmpeg_filter.c
  static int sub2video_frame(InputFilter *ifilter, AVFrame *frame, int buffer);
  
  static int configure_filtergraph(FilterGraph *fg, FilterGraphThread *fgt)
-@@ -2160,6 +2217,11 @@ static int configure_filtergraph(FilterG
+@@ -2160,6 +2227,11 @@ static int configure_filtergraph(FilterG
      if ((ret = avfilter_graph_config(fgt->graph, NULL)) < 0)
          goto fail;
  
@@ -271,7 +287,7 @@ Index: FFmpeg/fftools/ffmpeg_filter.c
      fgp->is_meta = graph_is_meta(fgt->graph);
  
      /* limit the lists of allowed formats to the ones selected, to
-@@ -3106,6 +3168,154 @@ static const char *unknown_if_null(const
+@@ -3106,6 +3178,154 @@ static const char *unknown_if_null(const
      return str ? str : "unknown";
  }
  
@@ -426,7 +442,7 @@ Index: FFmpeg/fftools/ffmpeg_filter.c
  static int send_frame(FilterGraph *fg, FilterGraphThread *fgt,
                        InputFilter *ifilter, AVFrame *frame)
  {
-@@ -3194,6 +3404,8 @@ static int send_frame(FilterGraph *fg, F
+@@ -3194,6 +3414,8 @@ static int send_frame(FilterGraph *fg, F
          }
  
          ret = fgt->graph ? read_frames(fg, fgt, tmp) : 0;
@@ -435,7 +451,7 @@ Index: FFmpeg/fftools/ffmpeg_filter.c
          av_frame_free(&tmp);
          if (ret < 0)
              return ret;
-@@ -3226,6 +3438,10 @@ static int send_frame(FilterGraph *fg, F
+@@ -3226,6 +3448,10 @@ static int send_frame(FilterGraph *fg, F
              if (reason.len > 1)
                  reason.str[reason.len - 2] = '\0'; // remove last comma
              av_log(fg, AV_LOG_INFO, "Reconfiguring filter graph%s%s\n", reason.len ? " because " : "", reason.str);
@@ -446,7 +462,7 @@ Index: FFmpeg/fftools/ffmpeg_filter.c
          } else {
              /* Choke all input to avoid buffering excessive frames while the
               * initial filter graph is being configured, and before we have a
-@@ -3291,6 +3507,7 @@ static void fg_thread_uninit(FilterGraph
+@@ -3291,6 +3517,7 @@ static void fg_thread_uninit(FilterGraph
      av_frame_free(&fgt->frame);
      av_freep(&fgt->eof_in);
      av_freep(&fgt->eof_out);
