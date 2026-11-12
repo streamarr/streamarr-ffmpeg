@@ -189,6 +189,8 @@ jobs:
 
       # Without streamarr-0003 tonemapx applies the LMS to RGB matrix to PQ-coded values, and the
       # saturated colours of a Dolby Vision profile 5 picture come out up to tens of codes wrong.
+      # Without streamarr-0010 it applies the RPU's linear matrix after LMS to RGB instead of
+      # before it, and colours more than 90 codes from neutral come out up to 13 luma codes wrong.
       # The check writes its own profile 5 stream. It runs the path the runner's CPU selects
       # (AVX2 on Linux, NEON on macOS), then plain C, then SSE4.2 where the CPU has it.
       # linuxarm64 binaries cannot run on these runners.
