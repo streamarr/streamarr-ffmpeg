@@ -16,12 +16,13 @@ Description: avformat/mpeg, avformat/mpegenc: stamp DVD PCM packets by their fir
  .
  The demuxer now moves the timestamp of every DVD PCM packet back by the
  bytes in front of its pointer, whatever its dynamic range byte, which a
- disc can change from packet to packet. The muxer writes the number of frames
- that start in the payload and the true pointer, or 0 and no timestamp
- when none starts.
+ disc can change from packet to packet. A timestamp moved before zero
+ stays negative, so that libavformat's wrap correction places it. The
+ muxer writes the number of frames that start in the payload and the
+ true pointer, or 0 and no timestamp when none starts.
 Author: Streamarr
 Forwarded: no
-Last-Update: 2026-11-11
+Last-Update: 2026-11-12
 ---
 Index: FFmpeg/libavformat/mpeg.c
 ===================================================================
@@ -70,7 +71,7 @@ Index: FFmpeg/libavformat/mpeg.c
                  avio_skip(s->pb, -3);
              }
          }
-@@ -656,6 +665,22 @@ found:
+@@ -656,6 +665,23 @@ found:
              len -=6;
        }
      }
@@ -78,7 +79,8 @@ Index: FFmpeg/libavformat/mpeg.c
 +        lpcm_pointer > 4 && lpcm_pointer - 4 < len - 3) {
 +        /* The timestamp names the first frame that starts in the payload, lpcm_pointer - 4
 +         * bytes after the payload's first byte. Move it back to that byte, the packet's first
-+         * sample after the 3 header bytes. */
++         * sample after the 3 header bytes. A stamp moved before zero stays negative: the wrap
++         * correction of libavformat, not a 33-bit mask, places it beside the other streams. */
 +        static const int rates[4] = { 48000, 96000, 44100, 32000 };
 +        int bits     = 16 + (lpcm_header >> 14 & 3) * 4;
 +        int channels = 1 + (lpcm_header >> 8 & 7);
@@ -86,9 +88,9 @@ Index: FFmpeg/libavformat/mpeg.c
 +                                  (int64_t)rates[lpcm_header >> 12 & 3] * channels * bits);
 +
 +        if (pts != AV_NOPTS_VALUE)
-+            pts = (pts - lead) & ((1LL << 33) - 1);
++            pts -= lead;
 +        if (dts != AV_NOPTS_VALUE)
-+            dts = (dts - lead) & ((1LL << 33) - 1);
++            dts -= lead;
 +    }
      ret = av_get_packet(s->pb, pkt, len);
  

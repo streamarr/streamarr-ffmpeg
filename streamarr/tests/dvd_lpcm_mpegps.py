@@ -32,6 +32,10 @@ The third byte of the LPCM header sets dynamic range control, 0x80 for none. FFm
 0x80 into every packet, and a disc can change it from packet to packet. The decode checks also run
 on copies of two sources in which every second LPCM packet after the first carries 0x55.
 
+The first byte of the first LPCM packet can be before zero while the video, read first, starts after
+it. The check also decodes copies of two sources whose LPCM is moved there, and requires every frame
+to be stamped with the time of the source sample it starts with, before zero too.
+
 It also writes 24-bit 5.1, whose block is 72 bytes, alone into packets too small for a block. A
 VOB packet of 96 bytes has room for 60 after the pack header that every MPEG-2 packet carries, a
 PES header with a PTS and the LPCM header. An MPEG-1 system stream packet of 88 bytes has room for
@@ -71,6 +75,8 @@ SHAPES = [(16, 48000, 1, 0), (16, 48000, 2, 0), (16, 48000, 6, 0), (16, 96000, 6
           (24, 96000, 2, 0), (24, 48000, 6, 120)]
 # The shapes whose packets also get a dynamic range byte that changes from packet to packet.
 VARYING_DYNAMIC_RANGE_SHAPES = [(16, 48000, 2, 0), (24, 48000, 2, 0)]
+# The shapes also read with their LPCM moved to start before zero, beside video that starts after it.
+START_BEFORE_ZERO_SHAPES = [(16, 48000, 2, 0), (24, 48000, 2, 0)]
 LAYOUTS = {1: "mono", 2: "stereo", 6: "5.1"}
 SMALL_PACKETS = {"vob": range(96, 129), "mpeg": range(88, 129)}
 FORMAT_NAMES = {"vob": "a VOB", "mpeg": "an MPEG-1 system stream"}
@@ -158,6 +164,12 @@ def timestamp(data, position):
     """The 33-bit PTS or MPEG-1 SCR in the five bytes at position, in 90 kHz ticks."""
     b = data[position:position + 5]
     return ((b[0] >> 1) & 7) << 30 | b[1] << 22 | (b[2] >> 1) << 15 | b[3] << 7 | b[4] >> 1
+
+
+def set_timestamp(data, offset, value):
+    """Writes a 33-bit PES timestamp into the five bytes at offset, keeping their first four bits."""
+    field = pes_timestamp(value)
+    data[offset:offset + 5] = bytes([data[offset] & 0xF0 | field[0] & 0x0F]) + field[1:]
 
 
 def pack_scr(data, position):
@@ -249,6 +261,39 @@ def vary_dynamic_range(vob):
     with open(varied, "wb") as out:
         out.write(data)
     return varied
+
+
+def start_before_zero(vob):
+    """A copy of the file whose LPCM starts before zero, and the bytes in front of the first frame
+    of its first LPCM packet.
+
+    The copy keeps the LPCM from the first packet after the first stamped video packet in which a
+    frame starts past the payload's first byte, turns the LPCM packets before it into padding, and
+    moves every LPCM timestamp back so that this frame is stamped 0. The video keeps its
+    timestamps: FFmpeg's demuxer reads it first and takes its timestamp wrap reference from it."""
+    with open(vob, "rb") as source:
+        data = bytearray(source.read())
+    first_video = next(position for position, stream_id, _, _ in pes_packets(data)
+                       if 0xE0 <= stream_id <= 0xEF and data[position + 7] & 0x80)
+    shift = lead = None
+    for position, body, end, _, _ in lpcm_packet_bounds(data):
+        # FFmpeg's muxer writes no DTS into an LPCM packet, so moving the PTS moves the packet.
+        stamped = data[position + 7] & 0x80
+        pointer = int.from_bytes(data[body + 2:body + 4], "big")
+        if shift is None and position > first_video and stamped and pointer > 4:
+            shift, lead = timestamp(data, position + 9), pointer - 4
+        if shift is None:
+            data[position + 3] = 0xBE
+            data[position + 6:end] = b"\xff" * (end - position - 6)
+        elif stamped:
+            set_timestamp(data, position + 9, timestamp(data, position + 9) - shift)
+    if lead is None:
+        raise ValueError("no LPCM packet after the first video packet starts a frame past its"
+                         " payload's first byte")
+    moved = vob[:-len(".vob")] + "-before-zero.vob"
+    with open(moved, "wb") as out:
+        out.write(data)
+    return moved, lead
 
 
 def misaligned_payloads(vob, bits, channels):
@@ -381,6 +426,22 @@ def check_shape(ffmpeg, directory, shape):
 def check_varying_dynamic_range(ffmpeg, directory, shape):
     vob = vary_dynamic_range(write_source(ffmpeg, directory, shape))
     return check_decodes(ffmpeg, vob, shape, shape_name(shape) + " with a varying dynamic range byte")
+
+
+def check_start_before_zero(ffmpeg, directory, shape):
+    """Decodes LPCM whose first byte is before zero, beside video that starts after it."""
+    bits, _, channels, _ = shape
+    name = shape_name(shape) + ", starting before zero beside video,"
+    vob, lead = start_before_zero(write_source(ffmpeg, directory, shape))
+    rows, stamps = decode(ffmpeg, vob, shape, None)
+    wrong = rows_out_of_sequence(rows, 1 << (bits - 3))
+    right = rows and wrong == 0
+    print("%s from the start: %d of %d rows hold no source sample or do not follow the one before: %s"
+          % (name, wrong, len(rows), "ok" if right else "WRONG"))
+    # The first decoded row is the first byte of the first LPCM packet, lead bytes before zero.
+    start = -lead * 8 // (channels * bits)
+    errors = [stamp - start - first for stamp, first, _ in stamps]
+    return (not right) + report_stamps(name + " from the start", errors)
 
 
 def check_decodes(ffmpeg, vob, shape, name):
@@ -564,6 +625,8 @@ def main():
             failures += check_shape(arguments.ffmpeg, directory, shape)
         for shape in VARYING_DYNAMIC_RANGE_SHAPES:
             failures += check_varying_dynamic_range(arguments.ffmpeg, directory, shape)
+        for shape in START_BEFORE_ZERO_SHAPES:
+            failures += check_start_before_zero(arguments.ffmpeg, directory, shape)
         failures += check_small_packets(arguments.ffmpeg, directory)
         failures += check_arrivals(arguments.ffmpeg, directory)
     print("%d checks failed" % failures)
