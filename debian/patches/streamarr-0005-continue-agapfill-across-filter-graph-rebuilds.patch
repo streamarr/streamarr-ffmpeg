@@ -36,6 +36,13 @@ Description: fftools/ffmpeg_filter: continue the output of agapfill when a filte
  example through the feedback filter, and the search for the outputs
  behind a filter followed it until the stack overflowed. The search now
  enters each filter once.
+ .
+ A filter behind agapfill can end its output inside a gap, for example
+ atrim, while a filter behind that one goes on writing frames of its own,
+ for example apad. agapfill kept the frame from after the gap, which could
+ no longer leave, and pending reported it. send_frame() then asked for
+ frames without end and never built the new graph. agapfill now drops the
+ frame it holds once its output has ended, and pending reports none.
 Author: Streamarr
 Forwarded: no
 Last-Update: 2026-11-12
@@ -44,7 +51,7 @@ Index: FFmpeg/doc/filters.texi
 ===================================================================
 --- FFmpeg.orig/doc/filters.texi
 +++ FFmpeg/doc/filters.texi
-@@ -2163,6 +2163,44 @@ agapfill=start=0:max_gap=600
+@@ -2163,6 +2163,46 @@ agapfill=start=0:max_gap=600
  @end example
  @end itemize
  
@@ -61,7 +68,9 @@ Index: FFmpeg/doc/filters.texi
 +@item pending
 +Report how many input frames the filter has not output yet: the frame it
 +holds while it writes the silence before it, and the frames that wait behind
-+that one.
++that one. Once a filter behind it has ended its output, for example
++@code{atrim}, no frame can leave, and the filter drops the frame it holds
++and reports none.
 +
 +@item resume
 +Continue the output of another agapfill filter. The argument is what the
@@ -343,7 +352,23 @@ Index: FFmpeg/libavfilter/af_agapfill.c
      int64_t out_pos;        ///< timestamp of the next output sample, in samples
      int64_t in_end;         ///< end of the previous input frame by its own timestamp, in samples
      int64_t silence_left;   ///< samples of silence still to write before the held frame
-@@ -206,8 +210,12 @@ static int activate(AVFilterContext *ctx
+@@ -182,7 +186,14 @@ static int activate(AVFilterContext *ctx
+     int64_t pts;
+     int ret, status;
+ 
+-    FF_FILTER_FORWARD_STATUS_BACK(outlink, inlink);
++    /* No frame leaves once the output has ended, so the filter lets go of the
++     * frame it holds, and pending reports none. */
++    status = ff_outlink_get_status(outlink);
++    if (status) {
++        av_frame_free(&s->held);
++        ff_inlink_set_status(inlink, status);
++        return 0;
++    }
+ 
+     if (!s->held) {
+         AVFrame *frame;
+@@ -206,8 +217,12 @@ static int activate(AVFilterContext *ctx
              if (!ff_outlink_frame_wanted(outlink))
                  return FFERROR_NOT_READY;
              ret = send_silence(ctx);
@@ -358,7 +383,7 @@ Index: FFmpeg/libavfilter/af_agapfill.c
          }
          return send_held(ctx);
      }
-@@ -251,6 +259,74 @@ static int config_output(AVFilterLink *o
+@@ -251,6 +266,74 @@ static int config_output(AVFilterLink *o
      return 0;
  }
  
@@ -433,7 +458,7 @@ Index: FFmpeg/libavfilter/af_agapfill.c
  static av_cold void uninit(AVFilterContext *ctx)
  {
      AGapFillContext *s = ctx->priv;
-@@ -272,12 +348,13 @@ static const AVFilterPad agapfill_output
+@@ -272,12 +355,13 @@ static const AVFilterPad agapfill_output
  };
  
  const FFFilter ff_af_agapfill = {

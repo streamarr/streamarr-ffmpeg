@@ -1102,6 +1102,41 @@ def rebuild_during_gap_behind_end(ffmpeg):
                         [real(0, 2 * SECOND), silence(10 * SECOND)], after="atrim=end=12")
 
 
+# The text of a command's status differs between C libraries. The filter's reply follows it.
+COMMAND_REPLY = re.compile(r"Command reply for command #\d+: ret:.*? res:(.*)$", re.MULTILINE)
+
+
+# The trim ends the output at 3 s, inside a gap from 2 s to 32 s, while the filter holds the frame
+# from after the gap. That frame can never leave. A second chain of the same graph asks the filter
+# what is pending at 2.5 s and at 5 s. At a rebuild ffmpeg asks the outputs behind the filter for
+# frames until none is pending. Unless the filter lets go of the frame when its output ends, a filter
+# behind the trim that writes frames of its own, such as apad, keeps ffmpeg asking without end.
+@check("pending-after-end", "reports no frame pending once the filter behind it has ended its output")
+def pending_after_end(ffmpeg):
+    counter = COUNTERS["s16"]
+    asks = ",".join("asendcmd=c='%s agapfill pending'" % at for at in (2.5, 5))
+    graph = ("%s,%s,agapfill,atrim=end=3[a];anullsrc=r=%d:cl=stereo,atrim=end=6,%s[b]"
+             % (counter.lavfi(40 * SECOND, RATE), chain(frames(4800), drop((20, 319))), RATE, asks))
+    done = execute([ffmpeg, "-nostdin", "-hide_banner", "-nostats", "-v", "verbose",
+                    "-filter_complex", graph, "-map", "[b]", "-f", "null", "-", "-map", "[a]",
+                    "-c:a", counter.codec, "-f", counter.raw, "-"],
+                   lambda out: compare_samples(out, 0, [real(0, 2 * SECOND), silence(SECOND)],
+                                               counter, RATE))
+    if done.code:
+        return ["FFmpeg ended with status %d: %s" % (done.code, last_lines(done.log))]
+    replies = COMMAND_REPLY.findall(done.log)
+    if len(replies) != 2:
+        raise Unusable("the second chain sent %d of the 2 pending commands" % len(replies))
+    problems = []
+    if replies[0] != "1":
+        problems.append("at 2.5 s, while the filter writes the gap, it reports '%s' pending, "
+                        "expected the 1 frame it holds" % replies[0])
+    if replies[1] != "0":
+        problems.append("at 5 s, after its output ended at 3 s, it reports '%s' pending, expected 0"
+                        % replies[1])
+    return problems + done.result
+
+
 # A split behind the fill also draws the audio as a waveform, and the feedback filter sends that
 # video round a loop of filters, which a filter graph may hold. At the rebuild ffmpeg looks for the
 # outputs behind the fill, and the scaled video's output is not one of them. Unless that search
