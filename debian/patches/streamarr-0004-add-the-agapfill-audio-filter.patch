@@ -22,6 +22,13 @@ Description: avfilter: add agapfill, which fills gaps between audio frames with 
  asks for a frame, so memory does not grow with the gap. max_gap makes a
  longer gap an error.
  .
+ The filter counts timestamps in samples. A timestamp that lies beyond
+ the 64-bit range once counted so, for example 10^18 ms at 48 kHz,
+ stops at the largest or the smallest timestamp, and so does start.
+ av_rescale_q_rnd() answers INT64_MIN there, the value that means no
+ timestamp. Read so, the frame would follow the previous one, and max_gap
+ would let the gap or the lead before it pass.
+ .
  Like apad, the filter outputs frames without new input while it writes
  a gap. ffmpeg's read_frames() returns to the scheduler after each step
  only for a graph that it counts as having a source, and only the
@@ -34,13 +41,13 @@ Description: avfilter: add agapfill, which fills gaps between audio frames with 
  streamarr/tests/agapfill.py checks the filter.
 Author: Streamarr
 Forwarded: no
-Last-Update: 2026-11-11
+Last-Update: 2026-11-12
 ---
 Index: FFmpeg/doc/filters.texi
 ===================================================================
 --- FFmpeg.orig/doc/filters.texi
 +++ FFmpeg/doc/filters.texi
-@@ -2073,6 +2073,96 @@ Set softness applied inside thresholding
+@@ -2073,6 +2073,98 @@ Set softness applied inside thresholding
  
  This filter supports the all above options as @ref{commands}.
  
@@ -84,8 +91,10 @@ Index: FFmpeg/doc/filters.texi
 +
 +The output time base is one sample, and each output frame begins where the
 +previous one ends. A frame without a timestamp follows the previous frame
-+directly. The filter writes no silence after the last frame. Use @code{apad}
-+for that.
++directly. A timestamp or a @option{start} that lies beyond the 64-bit range
++once counted in samples stops at the largest or the smallest timestamp, so a
++gap up to such a frame is filled, or fails on @option{max_gap}, like any other.
++The filter writes no silence after the last frame. Use @code{apad} for that.
 +
 +The filter writes silence one frame at a time, when the next filter asks for
 +a frame. It holds at most one input frame and one frame of silence, however
@@ -275,13 +284,13 @@ Index: FFmpeg/libavfilter/af_agapfill.c
 +    int64_t pts = AV_NOPTS_VALUE, silence = 0;
 +
 +    if (frame->pts != AV_NOPTS_VALUE)
-+        pts = av_rescale_q_rnd(frame->pts, inlink->time_base, sample, AV_ROUND_NEAR_INF);
++        pts = rescale_saturated(frame->pts, inlink->time_base, sample, AV_ROUND_NEAR_INF);
 +
 +    if (!s->started) {
 +        int64_t start = INT64_MAX;
 +
 +        if (s->start != INT64_MAX)
-+            start = av_rescale_q_rnd(s->start, AV_TIME_BASE_Q, sample, AV_ROUND_UP);
++            start = rescale_saturated(s->start, AV_TIME_BASE_Q, sample, AV_ROUND_UP);
 +        if (pts == AV_NOPTS_VALUE)
 +            pts = start != INT64_MAX ? start : 0;
 +        /* No threshold applies here: the timeline begins exactly at start. */

@@ -550,6 +550,43 @@ refusal_check("max-gap-on-a-gap-of-10-to-the-18", "fails on a gap of 10^18 sampl
               "max_gap=3600", chain(frames(4800), stamp("PTS+1e18*gte(N,96000)")), "max_gap=3600",
               "max_gap", count=4 * SECOND)
 
+
+def in_milliseconds(expression):
+    """Frames of 100 ms in a time base of 1 ms, their timestamps rewritten by `expression`."""
+    return chain(frames(4800), "asettb=1/1000", stamp(expression))
+
+
+# 10^18 ms are 4.8 x 10^19 samples at 48 kHz, more than a 64-bit timestamp holds. Counted in
+# samples, such a timestamp must stop at the largest or the smallest timestamp, as the output
+# position does. Unless it does, it reads as no timestamp: the frame follows the previous one, and
+# the gap or lead before it passes max_gap.
+refusal_check("max-gap-on-a-lead-past-the-range", "fails on a lead with max_gap=10 when the first "
+              "timestamp is past the largest timestamp in samples",
+              in_milliseconds("PTS+1e18"), "start=0:max_gap=10", "max_gap", count=4 * SECOND)
+
+refusal_check("max-gap-on-a-gap-past-the-range", "fails on a gap with max_gap=3600 when the "
+              "timestamp after it is past the largest timestamp in samples",
+              in_milliseconds("PTS+1e18*gte(N,96000)"), "max_gap=3600", "max_gap",
+              count=4 * SECOND)
+
+timeline_check("gap-past-the-range", "fills a gap up to a timestamp past the largest timestamp in "
+               "samples", in_milliseconds("PTS+1e18*gte(N,96000)"), "", 0,
+               [real(0, 96000), silence(1344000)], after="atrim=end_sample=1440000",
+               count=4 * SECOND)
+
+# Unless such a timestamp stops at the smallest timestamp, the step back reads as a gap that never
+# ends. The trims here and below end such a run.
+timeline_check("backward-step-past-the-range", "keeps every sample when timestamps go back past "
+               "the smallest timestamp in samples", in_milliseconds("PTS-1e18*gte(N,96000)"), "", 0,
+               [real(0, 4 * SECOND)], after="atrim=end_sample=192000", count=4 * SECOND)
+
+# At 2 MHz, start=9,000,000,000,000 s is 1.8 x 10^19 samples, past the largest timestamp, and the
+# first frame, at zero, is before it. Unless start stops at the largest timestamp, it reads as the
+# smallest, and silence before the first frame never ends.
+timeline_check("start-past-the-range", "writes no leading silence when start is past the largest "
+               "timestamp in samples", frames(4800), "start=9000000000000", 0, [real(0, 480000)],
+               after="atrim=end_sample=480000", count=480000, rate=2000000)
+
 timeline_check("packet-size", "writes silence in frames of packet_size samples", EIGHT_SECOND_GAP,
                "packet_size=1000", 0, EIGHT_SECOND_TIMELINE, count=24 * SECOND, packet_size=1000)
 
