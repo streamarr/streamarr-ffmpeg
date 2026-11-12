@@ -31,6 +31,7 @@ import array
 import os
 import re
 import resource
+import signal
 import subprocess
 import sys
 import tempfile
@@ -44,6 +45,9 @@ RSS_UNIT = 1 if sys.platform == "darwin" else 1024
 ADDRESS_SPACE = 4 << 30
 # No check needs more than a few seconds. The limit only ends a run that would never end.
 TIME_LIMIT = 120
+# A run that never ends logs a frame of silence at a time, about 30 MB a second, into a temporary
+# file that may sit in memory. No check logs more than 16 MB, and FFmpeg is stopped past this size.
+FILE_SIZE = 256 << 20
 SHOWINFO = re.compile(r"Parsed_ashowinfo\S* @ \S+ n:\d+ pts:(-?\d+|NOPTS) pts_time:(\S+) fmt:(\S+) "
                       r"channels:\d+ chlayout:\S+ rate:\d+ nb_samples:(\d+)")
 
@@ -132,9 +136,12 @@ MEASURED = re.compile(r"^measured: own (\d+) peak (\d+)$", re.MULTILINE)
 
 
 def limit_memory():
-    """Keeps a filter that queues a whole gap from taking the machine's memory. Linux only."""
+    """Keeps a filter that queues a whole gap, or a run that never ends, from taking the machine's
+    memory. The limit of the address space is Linux only."""
     if sys.platform.startswith("linux"):
         resource.setrlimit(resource.RLIMIT_AS, (ADDRESS_SPACE, ADDRESS_SPACE))
+    resource.setrlimit(resource.RLIMIT_FSIZE, (FILE_SIZE, FILE_SIZE))
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 
 
 class Finished:
@@ -176,7 +183,17 @@ def execute(command, consume=None, timeout=TIME_LIMIT, measure=False):
         text = log.read().decode("utf-8", "replace")
     if expired:
         text += "\nThe command did not end within %d s and was stopped.\n" % timeout
+    if process.returncode == -signal.SIGXFSZ:
+        text += "\nThe command wrote %d MB to a file and was stopped.\n" % (FILE_SIZE >> 20)
     return Finished(process.returncode, text, result)
+
+
+def byte_count(stream):
+    """Reads a stream to its end, one chunk at a time, and returns its length."""
+    count = 0
+    for part in iter(lambda: stream.read(CHUNK), b""):
+        count += len(part)
+    return count
 
 
 def last_lines(log, count=3):
@@ -302,8 +319,7 @@ REFUSED = 234
 def refusal_problems(ffmpeg, chain, words, *, count):
     """Expects FFmpeg to refuse `chain` with an error line that holds `words`."""
     counter = COUNTERS["s16"]
-    done = execute(filter_command(ffmpeg, counter.lavfi(count, RATE), chain, counter),
-                   lambda out: len(out.read()))
+    done = execute(filter_command(ffmpeg, counter.lavfi(count, RATE), chain, counter), byte_count)
     if done.code != REFUSED:
         return ["FFmpeg ended with status %d after %d bytes, expected status %d: %s"
                 % (done.code, done.result, REFUSED, last_lines(done.log))]
