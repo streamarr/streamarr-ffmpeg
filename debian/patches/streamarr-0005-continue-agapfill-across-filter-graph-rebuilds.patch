@@ -70,6 +70,10 @@ Description: fftools/ffmpeg_filter: continue the output of agapfill when a filte
  14 MB. send_frame() now stops asking as soon as one output behind
  agapfill gives no frame, and the frames agapfill holds become silence as
  above.
+ .
+ The asking still keeps the other inputs of the graph waiting. With
+ -shortest, the audio of an output can then run past its video, to about
+ the end of the gap less -shortest_buf_duration. max_gap bounds that.
 Author: Streamarr
 Forwarded: no
 Last-Update: 2026-11-12
@@ -78,7 +82,7 @@ Index: FFmpeg/doc/filters.texi
 ===================================================================
 --- FFmpeg.orig/doc/filters.texi
 +++ FFmpeg/doc/filters.texi
-@@ -2163,6 +2163,55 @@ agapfill=start=0:max_gap=600
+@@ -2163,6 +2163,60 @@ agapfill=start=0:max_gap=600
  @end example
  @end itemize
  
@@ -130,6 +134,11 @@ Index: FFmpeg/doc/filters.texi
 +them keeps its own time. Samples that other filters of the old graph hold are
 +lost, as they are without this filter. An output that takes no more frames,
 +for example after @option{-frames}, is not asked.
++
++While @command{ffmpeg} asks for the rest of a gap, the other inputs of the
++graph wait. With @option{-shortest}, the audio of an output can then run past
++its video, to about the end of the gap less @option{-shortest_buf_duration}.
++@option{max_gap} bounds that.
 +
  @section agate
  

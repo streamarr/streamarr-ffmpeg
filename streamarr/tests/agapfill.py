@@ -30,6 +30,7 @@ Exits 0 when every check passes, 1 when one fails, 2 when a fixture is unusable.
 """
 import argparse
 import array
+import io
 import os
 import re
 import resource
@@ -1413,6 +1414,67 @@ def rebuild_during_gap_before_split_mix(ffmpeg):
     if rebuilt.peak() > steady.peak() + allowance:
         return ["peak memory is %s: more than %d MB apart" % (megabytes, allowance >> 20)]
     return []
+
+
+def shortest_problems(ffmpeg, sizes, *, at_most):
+    """Puts the counter, 2 s and then 8 s after a gap to 32 s, beside a video made of `sizes` in one
+    output with -shortest. The audio must last as long as the video less one frame of silence and
+    at most `at_most` samples, and hold the 2 s of source and silence after them."""
+    counter = COUNTERS["s16"]
+    quiet = ["-nostdin", "-hide_banner", "-v", "error"]
+    seconds = sum(length for _, length in sizes)
+    with tempfile.TemporaryDirectory() as work:
+        video, audio = os.path.join(work, "video.mjpeg"), os.path.join(work, "audio.nut")
+        output = os.path.join(work, "output.nut")
+        with open(video, "wb") as out:
+            for size, length in sizes:
+                part = execute([ffmpeg] + quiet + ["-f", "lavfi", "-i",
+                                                   "testsrc2=s=%s:r=24:d=%d" % (size, length),
+                                                   "-c:v", "mjpeg", "-q:v", "20", "-f", "mjpeg", "-"],
+                               lambda stream: stream.read())
+                if part.code:
+                    raise Unusable("FFmpeg could not encode the video: %s" % last_lines(part.log))
+                out.write(part.result)
+        made = execute([ffmpeg] + quiet + ["-f", "lavfi", "-i", counter.lavfi(40 * SECOND, RATE),
+                                           "-af", chain(frames(4800), drop((20, 319))),
+                                           "-c:a", counter.codec, "-f", "nut", "-y", audio])
+        if made.code:
+            raise Unusable("FFmpeg could not write the audio: %s" % last_lines(made.log))
+        done = execute([ffmpeg, "-nostdin", "-hide_banner", "-nostats", "-v", "info", "-copyts",
+                        "-f", "mjpeg", "-framerate", "24", "-i", video, "-i", audio,
+                        "-filter_complex", "[0:v]scale=64:36[v];[1:a]agapfill[a]",
+                        "-map", "[v]", "-map", "[a]", "-shortest", "-c:v", "rawvideo",
+                        "-c:a", counter.codec, "-f", "nut", "-y", output])
+        if done.code:
+            return ["FFmpeg ended with status %d: %s" % (done.code, last_lines(done.log))]
+        rebuilt = "Reconfiguring filter graph because video parameters changed" in done.log
+        if rebuilt != (len(sizes) > 1):
+            raise Unusable("ffmpeg rebuilt the filter graph %s" % ("once" if rebuilt else "never"))
+        written = execute([ffmpeg] + quiet + ["-i", output, "-map", "0:a", "-c:a", counter.codec,
+                                              "-f", counter.raw, "-"], lambda out: out.read())
+    count = len(written.result) // counter.width
+    print("         the audio output lasts %.3f s beside %d s of video" % (count / RATE, seconds))
+    if not seconds * RATE - DEFAULT_PACKET <= count <= at_most:
+        return ["the audio output holds %d samples, expected %d to %d"
+                % (count, seconds * RATE - DEFAULT_PACKET, at_most)]
+    return compare_samples(io.BytesIO(written.result), 0,
+                           [real(0, 2 * SECOND), silence(count - 2 * SECOND)], counter, RATE)
+
+
+@check("gap-beside-shortest-video", "ends the audio of a -shortest output with its video while "
+       "the filter writes a gap")
+def gap_beside_shortest_video(ffmpeg):
+    return shortest_problems(ffmpeg, (("64x36", 12),), at_most=12 * SECOND)
+
+
+# The video changes size at 10 s and ends at 12 s, inside the gap. ffmpeg asks for the rest of the
+# gap before the video can go on, and the sync queue of -shortest lets the audio run ahead of the
+# waiting video by -shortest_buf_duration, 10 s. The audio then ends at about 32 s less 10 s, past
+# its video, as filters.texi states. It never reaches the audio after the gap.
+@check("rebuild-during-gap-beside-shortest-video", "ends the audio of a -shortest output inside the "
+       "gap, past its video, when ffmpeg rebuilds the filter graph while the filter writes the gap")
+def rebuild_during_gap_beside_shortest_video(ffmpeg):
+    return shortest_problems(ffmpeg, (("64x36", 10), ("128x72", 2)), at_most=32 * SECOND)
 
 
 CHECKS_BY_NAME = {name: (title, function) for name, title, function in CHECKS}
