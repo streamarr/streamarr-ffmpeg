@@ -189,11 +189,9 @@ def pes_body(data, position):
 LpcmPacket = collections.namedtuple("LpcmPacket", "frames pointer payload pts scr")
 
 
-def lpcm_packets(vob):
-    """Every LPCM packet, in order, of an MPEG-2 program stream or an MPEG-1 system stream."""
-    with open(vob, "rb") as source:
-        data = source.read()
-    packets = []
+def lpcm_packet_bounds(data):
+    """The (PES packet start, LPCM sub-stream start, PES packet end, PTS or None, SCR of its pack)
+    of every LPCM packet of the bytes of an MPEG-2 program stream or an MPEG-1 system stream."""
     position = 0
     scr = None
     while position + 4 <= len(data):
@@ -210,10 +208,19 @@ def lpcm_packets(vob):
         if stream_id == 0xBD:
             body, pts = pes_body(data, position)
             if 0xA0 <= data[body] <= 0xAF:
-                packets.append(LpcmPacket(
-                    frames=data[body + 1], pointer=int.from_bytes(data[body + 2:body + 4], "big"),
-                    payload=data[body + 7:end], pts=pts, scr=scr))
+                yield position, body, end, pts, scr
         position = end
+
+
+def lpcm_packets(vob):
+    """Every LPCM packet, in order, of an MPEG-2 program stream or an MPEG-1 system stream."""
+    with open(vob, "rb") as source:
+        data = source.read()
+    packets = []
+    for _, body, end, pts, scr in lpcm_packet_bounds(data):
+        packets.append(LpcmPacket(
+            frames=data[body + 1], pointer=int.from_bytes(data[body + 2:body + 4], "big"),
+            payload=data[body + 7:end], pts=pts, scr=scr))
     return packets
 
 
@@ -318,12 +325,17 @@ def report_stamps(name, errors):
     return not right
 
 
-def check_shape(ffmpeg, directory, shape):
+def shape_name(shape):
     bits, rate, channels, frame_size = shape
     name = "%d-bit %d Hz %s" % (bits, rate, LAYOUTS[channels])
     if frame_size:
         name += " in frames of %d samples" % frame_size
-    period = 1 << (bits - 3)
+    return name
+
+
+def check_shape(ffmpeg, directory, shape):
+    bits, rate, channels, _ = shape
+    name = shape_name(shape)
     vob = write_source(ffmpeg, directory, shape)
     failures = 0
 
@@ -336,7 +348,14 @@ def check_shape(ffmpeg, directory, shape):
     failures += misplaced != 0
     print("%s: %d of %d LPCM timestamps do not name the frame at the packet's pointer: %s"
           % (name, misplaced, stamped, "ok" if not misplaced else "WRONG"))
+    return failures + check_decodes(ffmpeg, vob, shape, name)
 
+
+def check_decodes(ffmpeg, vob, shape, name):
+    """Decodes the file from the start and after each seek, and checks every row and frame stamp."""
+    bits, rate, _, _ = shape
+    period = 1 << (bits - 3)
+    failures = 0
     rows, stamps = decode(ffmpeg, vob, shape, None)
     expected = rate * SECONDS
     whole = rows == [n % period for n in range(expected)]
