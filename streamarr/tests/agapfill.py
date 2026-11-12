@@ -688,7 +688,33 @@ timeline_check("start-past-the-range", "writes no leading silence when start is 
                "timestamp in samples", frames(4800), "start=9000000000000", 0, [real(0, 480000)],
                after="atrim=end_sample=480000", count=480000, rate=2000000)
 
-timeline_check("packet-size", "writes silence in frames of packet_size samples", EIGHT_SECOND_GAP,
+# At 2 MHz, threshold=5,000,000,000,000 s is 10^19 samples, more than a 64-bit timestamp holds. A
+# step between frames at +6 x 10^18 and -6 x 10^18 samples is 1.2 x 10^19 samples, longer than
+# threshold. Unless the filter compares the whole step with threshold, the step stops at the
+# largest timestamp, reads as a step at or under threshold, and moves the output by that much.
+# The frames are 4,096 samples long, so each timestamp near 6 x 10^18 is exact in asetpts.
+timeline_check("overlap-wider-than-the-range", "joins an overlap longer than threshold when the "
+               "step does not fit a 64-bit timestamp",
+               chain(frames(4096), stamp("PTS+6e18-12e18*gte(N,409600)")),
+               "threshold=5000000000000", 6 * 10**18, [real(0, 819200)], count=819200,
+               rate=2000000)
+
+timeline_check("gap-wider-than-the-range", "fills a gap longer than threshold when the step does "
+               "not fit a 64-bit timestamp",
+               chain(frames(4096), stamp("PTS-6e18+12e18*gte(N,409600)")),
+               "threshold=5000000000000", -6 * 10**18, [real(0, 409600), silence(409600)],
+               after="atrim=end_sample=819200", count=819200, rate=2000000)
+
+# threshold=6,000,000,000,000 s is 1.2 x 10^19 samples at 2 MHz, so a step of 10^19 samples, from
+# +5 x 10^18 to -5 x 10^18, passes through whole and the frame keeps its own timestamp.
+timeline_check("step-wider-than-the-range", "passes a step at or under threshold whole when it "
+               "does not fit a 64-bit timestamp",
+               chain(frames(4096), stamp("PTS+5e18-10e18*gte(N,409600)")),
+               "threshold=6000000000000", 5 * 10**18,
+               [real(0, 409600), step(-10**19), real(409600, 409600)], count=819200,
+               rate=2000000)
+
+timeline_check("packet-size","writes silence in frames of packet_size samples", EIGHT_SECOND_GAP,
                "packet_size=1000", 0, EIGHT_SECOND_TIMELINE, count=24 * SECOND, packet_size=1000)
 
 # A gap of 31,000 years. Unless the fill stops when the trim after it has what it needs, FFmpeg
