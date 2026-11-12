@@ -1102,6 +1102,22 @@ def rebuild_during_gap_behind_end(ffmpeg):
                         [real(0, 2 * SECOND), silence(10 * SECOND)], after="atrim=end=12")
 
 
+# A split behind the fill also draws the audio as a waveform, and the feedback filter sends that
+# video round a loop of filters, which a filter graph may hold. At the rebuild ffmpeg looks for the
+# outputs behind the fill, and the scaled video's output is not one of them. Unless that search
+# enters each filter once, it goes round the loop until the stack overflows. The waveform goes to an
+# output of its own: a nullsink would pull the audio ahead, and the fill would finish the gap
+# before the rebuild.
+@check("rebuild-during-gap-before-loop", "keeps every sample and the whole gap when ffmpeg rebuilds "
+       "the filter graph and a loop of filters lies behind the filter")
+def rebuild_during_gap_before_loop(ffmpeg):
+    loop = ("asplit[fill][wave];[wave]showwaves=s=64x36[waves];"
+            "[waves][back]feedback=w=32:h=18[shown][round];[round]null[back];[fill]anull")
+    return beside_video(ffmpeg, chain(frames(4800), drop((20, 319))), "", 0,
+                        [real(0, 2 * SECOND), silence(30 * SECOND), real(32 * SECOND, 8 * SECOND)],
+                        after=loop, discarded=["[shown]"])
+
+
 # The audio output takes 20 frames, the 2 s before a gap of 31,000 years, and is then finished. The
 # video keeps its size, so the graph is never rebuilt. Once the video has ended, the finished audio
 # output is the only one left, and the filter writes the gap's silence without new input. Unless

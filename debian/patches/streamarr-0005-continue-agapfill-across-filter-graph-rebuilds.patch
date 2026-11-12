@@ -32,7 +32,10 @@ Description: fftools/ffmpeg_filter: continue the output of agapfill when a filte
  filter has not output yet, and send_frame() now asks the outputs behind
  each agapfill filter for frames until none is pending. It does not ask an
  output whose consumer has finished, for example after -frames, which
- would only discard the rest of the gap.
+ would only discard the rest of the gap. A graph may hold a cycle, for
+ example through the feedback filter, and the search for the outputs
+ behind a filter followed it until the stack overflowed. The search now
+ enters each filter once.
 Author: Streamarr
 Forwarded: no
 Last-Update: 2026-11-12
@@ -170,20 +173,42 @@ Index: FFmpeg/fftools/ffmpeg_filter.c
      fgp->is_meta = graph_is_meta(fgt->graph);
  
      /* limit the lists of allowed formats to the ones selected, to
-@@ -3106,6 +3165,90 @@ static const char *unknown_if_null(const
+@@ -3106,6 +3165,117 @@ static const char *unknown_if_null(const
      return str ? str : "unknown";
  }
  
-+/* Whether frames that leave f reach sink. */
-+static int filter_feeds(const AVFilterContext *f, const AVFilterContext *sink)
++/* Marks in reached, by their index in graph, the filters that frames leaving
++ * graph->filters[from] pass. A graph may hold a cycle, for example through the
++ * feedback filter, so the walk enters each filter once. */
++static void mark_reached(const AVFilterGraph *graph, unsigned from, uint8_t *reached)
 +{
-+    if (f == sink)
-+        return 1;
++    const AVFilterContext *f = graph->filters[from];
 +
++    reached[from] = 1;
 +    for (unsigned i = 0; i < f->nb_outputs; i++)
-+        if (f->outputs[i] && filter_feeds(f->outputs[i]->dst, sink))
-+            return 1;
++        for (unsigned j = 0; f->outputs[i] && j < graph->nb_filters; j++)
++            if (!reached[j] && graph->filters[j] == f->outputs[i]->dst)
++                mark_reached(graph, j, reached);
++}
 +
++/* Marks in fed the outputs of fg that frames leaving graph->filters[from] reach. */
++static int find_outputs_behind(FilterGraph *fg, const AVFilterGraph *graph,
++                               unsigned from, uint8_t *fed)
++{
++    uint8_t *reached = av_calloc(graph->nb_filters, sizeof(*reached));
++
++    if (!reached)
++        return AVERROR(ENOMEM);
++
++    mark_reached(graph, from, reached);
++    for (int i = 0; i < fg->nb_outputs; i++) {
++        fed[i] = 0;
++        for (unsigned j = 0; j < graph->nb_filters; j++)
++            if (graph->filters[j] == fg->outputs[i]->filter)
++                fed[i] = reached[j];
++    }
++
++    av_free(reached);
 +    return 0;
 +}
 +
@@ -195,11 +220,11 @@ Index: FFmpeg/fftools/ffmpeg_filter.c
 +           strcmp(pending, "0");
 +}
 +
-+/* Ask each output that f feeds for a frame, then send on what the outputs
++/* Ask each output marked in fed for a frame, then send on what the outputs
 + * hold. Returns whether a frame came. An output whose consumer has finished,
 + * for example after -frames, would discard every frame, so it is not asked. */
 +static int pull_frames_behind(FilterGraph *fg, FilterGraphThread *fgt,
-+                              const AVFilterContext *f, AVFrame *frame)
++                              const uint8_t *fed, AVFrame *frame)
 +{
 +    int pulled = 0;
 +
@@ -207,7 +232,7 @@ Index: FFmpeg/fftools/ffmpeg_filter.c
 +        AVFilterContext *sink = fg->outputs[i]->filter;
 +        int ret;
 +
-+        if (fgt->eof_out[i] || !filter_feeds(f, sink))
++        if (fgt->eof_out[i] || !fed[i])
 +            continue;
 +
 +        ret = av_buffersink_get_frame_flags(sink, NULL, AV_BUFFERSINK_FLAG_PEEK);
@@ -240,28 +265,33 @@ Index: FFmpeg/fftools/ffmpeg_filter.c
 + */
 +static int finish_gap_fills(FilterGraph *fg, FilterGraphThread *fgt, AVFrame *frame)
 +{
-+    for (unsigned i = 0; i < fgt->graph->nb_filters; i++) {
-+        AVFilterContext *f = fgt->graph->filters[i];
-+        int ret = 1;
++    uint8_t *fed = av_calloc(fg->nb_outputs, sizeof(*fed));
++    int ret = fed ? 0 : AVERROR(ENOMEM);
 +
-+        if (!is_gap_fill(f))
++    for (unsigned i = 0; ret >= 0 && i < fgt->graph->nb_filters; i++) {
++        AVFilterContext *f = fgt->graph->filters[i];
++
++        if (!is_gap_fill(f) || !gap_fill_is_pending(f))
 +            continue;
 +
++        ret = find_outputs_behind(fg, fgt->graph, i, fed);
 +        /* No frame comes when a filter behind f has ended its output or
 +         * waits for another input, or when no output behind f takes frames. */
-+        while (ret > 0 && gap_fill_is_pending(f))
-+            ret = pull_frames_behind(fg, fgt, f, frame);
-+        if (ret < 0)
-+            return ret;
++        while (ret >= 0 && gap_fill_is_pending(f)) {
++            ret = pull_frames_behind(fg, fgt, fed, frame);
++            if (!ret)
++                break;
++        }
 +    }
 +
-+    return 0;
++    av_free(fed);
++    return FFMIN(ret, 0);
 +}
 +
  static int send_frame(FilterGraph *fg, FilterGraphThread *fgt,
                        InputFilter *ifilter, AVFrame *frame)
  {
-@@ -3194,6 +3337,8 @@ static int send_frame(FilterGraph *fg, F
+@@ -3194,6 +3364,8 @@ static int send_frame(FilterGraph *fg, F
          }
  
          ret = fgt->graph ? read_frames(fg, fgt, tmp) : 0;
@@ -270,7 +300,7 @@ Index: FFmpeg/fftools/ffmpeg_filter.c
          av_frame_free(&tmp);
          if (ret < 0)
              return ret;
-@@ -3226,6 +3371,10 @@ static int send_frame(FilterGraph *fg, F
+@@ -3226,6 +3398,10 @@ static int send_frame(FilterGraph *fg, F
              if (reason.len > 1)
                  reason.str[reason.len - 2] = '\0'; // remove last comma
              av_log(fg, AV_LOG_INFO, "Reconfiguring filter graph%s%s\n", reason.len ? " because " : "", reason.str);
@@ -281,7 +311,7 @@ Index: FFmpeg/fftools/ffmpeg_filter.c
          } else {
              /* Choke all input to avoid buffering excessive frames while the
               * initial filter graph is being configured, and before we have a
-@@ -3291,6 +3440,7 @@ static void fg_thread_uninit(FilterGraph
+@@ -3291,6 +3467,7 @@ static void fg_thread_uninit(FilterGraph
      av_frame_free(&fgt->frame);
      av_freep(&fgt->eof_in);
      av_freep(&fgt->eof_out);
