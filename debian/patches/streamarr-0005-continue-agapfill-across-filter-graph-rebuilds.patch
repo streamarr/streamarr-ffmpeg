@@ -503,7 +503,7 @@ Index: FFmpeg/libavfilter/af_agapfill.c
  
      int64_t nb_gaps;        ///< runs of silence written, the leading one included
      int64_t nb_silence;     ///< samples of silence in those runs
-@@ -178,6 +185,7 @@ static int place_frame(AVFilterContext *
+@@ -196,6 +203,7 @@ static int place_frame(AVFilterContext *
          if (pts > start)
              silence = av_sat_sub64(pts, start);
          s->out_pos = pts - silence;
@@ -511,7 +511,7 @@ Index: FFmpeg/libavfilter/af_agapfill.c
          s->started = 1;
      } else {
          if (pts == AV_NOPTS_VALUE)
-@@ -193,6 +201,7 @@ static int place_frame(AVFilterContext *
+@@ -211,6 +219,7 @@ static int place_frame(AVFilterContext *
      s->max_offset = FFMAX(s->max_offset,
                            FFABS(av_sat_sub64(av_sat_add64(s->out_pos, silence), pts)));
      s->in_end     = av_sat_add64(pts, frame->nb_samples);
@@ -519,7 +519,7 @@ Index: FFmpeg/libavfilter/af_agapfill.c
      s->held       = frame;
  
      return 0;
-@@ -229,6 +238,7 @@ static int send_held(AVFilterContext *ct
+@@ -247,6 +256,7 @@ static int send_held(AVFilterContext *ct
      frame->duration = frame->nb_samples;
  
      s->out_pos = av_sat_add64(s->out_pos, frame->nb_samples);
@@ -527,7 +527,7 @@ Index: FFmpeg/libavfilter/af_agapfill.c
  
      return ff_filter_frame(ctx->outputs[0], frame);
  }
-@@ -241,9 +251,16 @@ static int activate(AVFilterContext *ctx
+@@ -259,9 +269,16 @@ static int activate(AVFilterContext *ctx
      int64_t pts;
      int ret, status;
  
@@ -546,7 +546,7 @@ Index: FFmpeg/libavfilter/af_agapfill.c
          AVFrame *frame;
  
          ret = ff_inlink_consume_frame(inlink, &frame);
-@@ -258,25 +275,38 @@ static int activate(AVFilterContext *ctx
+@@ -276,25 +293,38 @@ static int activate(AVFilterContext *ctx
          }
      }
  
@@ -597,7 +597,7 @@ Index: FFmpeg/libavfilter/af_agapfill.c
          return 0;
      }
  
-@@ -310,6 +340,104 @@ static int config_output(AVFilterLink *o
+@@ -328,6 +358,104 @@ static int config_output(AVFilterLink *o
      return 0;
  }
  
@@ -702,7 +702,7 @@ Index: FFmpeg/libavfilter/af_agapfill.c
  static av_cold void uninit(AVFilterContext *ctx)
  {
      AGapFillContext *s = ctx->priv;
-@@ -331,12 +459,13 @@ static const AVFilterPad agapfill_output
+@@ -349,12 +477,13 @@ static const AVFilterPad agapfill_output
  };
  
  const FFFilter ff_af_agapfill = {

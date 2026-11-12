@@ -196,7 +196,7 @@ Index: FFmpeg/libavfilter/af_agapfill.c
 ===================================================================
 --- /dev/null
 +++ FFmpeg/libavfilter/af_agapfill.c
-@@ -0,0 +1,342 @@
+@@ -0,0 +1,360 @@
 +/*
 + * This file is part of FFmpeg.
 + *
@@ -263,13 +263,15 @@ Index: FFmpeg/libavfilter/af_agapfill.c
 +
 +AVFILTER_DEFINE_CLASS(agapfill);
 +
-+/* Whether samples last longer than microseconds, neither below zero. Whole
-+ * seconds first, then the rest: av_compare_ts() is undefined where one value
-+ * does not fit the other's time base, as 10^18 samples at 48 kHz do not. */
-+static int is_longer(const AVFilterLink *link, int64_t samples, int64_t microseconds)
++/* Whether samples last longer than microseconds, which is not below zero.
++ * Whole seconds first, then the rest: av_compare_ts() is undefined where one
++ * value does not fit the other's time base, as 10^18 samples at 48 kHz do
++ * not. samples is unsigned, so that it holds the step between any two
++ * timestamps. */
++static int is_longer(const AVFilterLink *link, uint64_t samples, int64_t microseconds)
 +{
-+    const int64_t rate    = link->sample_rate;
-+    const int64_t seconds = samples / rate, limit = microseconds / AV_TIME_BASE;
++    const uint64_t rate    = link->sample_rate;
++    const uint64_t seconds = samples / rate, limit = microseconds / AV_TIME_BASE;
 +
 +    if (seconds != limit)
 +        return seconds > limit;
@@ -290,15 +292,33 @@ Index: FFmpeg/libavfilter/af_agapfill.c
 +    return ts < 0 ? INT64_MIN + 1 : INT64_MAX;
 +}
 +
++/* How far the timestamp to lies from the timestamp from. The distance
++ * between the largest and the smallest timestamp takes 64 unsigned bits. */
++static uint64_t distance(int64_t from, int64_t to)
++{
++    return to >= from ? (uint64_t)to - (uint64_t)from : (uint64_t)from - (uint64_t)to;
++}
++
++/* pos moved forward or back by length. It stops at the largest or the
++ * smallest timestamp, as the output position does. */
++static int64_t moved(int64_t pos, uint64_t length, int forward)
++{
++    if (forward)
++        return length >= (uint64_t)INT64_MAX - (uint64_t)pos ?
++               INT64_MAX : (int64_t)((uint64_t)pos + length);
++    return length >= (uint64_t)pos - (uint64_t)(INT64_MIN + 1) ?
++           INT64_MIN + 1 : (int64_t)((uint64_t)pos - length);
++}
++
 +/* The silence that the step from the end of the previous input frame to
 + * input that begins at pts puts before that input. The step alone decides.
 + * Steps at or below the threshold never add up to a gap. */
 +static int64_t silence_after_step(AVFilterContext *ctx, int64_t pts)
 +{
 +    AGapFillContext *s = ctx->priv;
-+    const int64_t step = av_sat_sub64(pts, s->in_end);
 +
-+    if (step > 0 && is_longer(ctx->inputs[0], step, s->threshold))
++    if (pts > s->in_end &&
++        is_longer(ctx->inputs[0], distance(s->in_end, pts), s->threshold))
 +        return FFMAX(av_sat_sub64(pts, s->out_pos), 0);
 +    return 0;
 +}
@@ -311,18 +331,16 @@ Index: FFmpeg/libavfilter/af_agapfill.c
 +static void pass_short_step(AVFilterContext *ctx, int64_t pts)
 +{
 +    AGapFillContext *s = ctx->priv;
-+    const int64_t step = av_sat_sub64(pts, s->in_end);
-+    /* -INT64_MIN does not fit, and no threshold reaches that far. */
-+    const int64_t length = step == INT64_MIN ? INT64_MAX : FFABS(step);
++    const uint64_t length = distance(s->in_end, pts);
 +
-+    if (!step)
++    if (!length)
 +        return;
 +    if (is_longer(ctx->inputs[0], length, s->threshold)) {
-+        if (step < 0)
++        if (pts < s->in_end)
 +            s->nb_joined++;
 +        return;
 +    }
-+    s->out_pos = av_sat_add64(s->out_pos, step);
++    s->out_pos = moved(s->out_pos, length, pts > s->in_end);
 +    s->nb_passed++;
 +}
 +
