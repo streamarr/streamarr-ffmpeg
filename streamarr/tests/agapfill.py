@@ -1414,10 +1414,11 @@ def rebuild_during_gap_before_merge(ffmpeg):
                                             "aformat=sample_fmts=s16")
 
 
-def split_beside_mix(ffmpeg, sizes):
+def split_beside_mix(ffmpeg, sizes, mix_frames=None):
     """Fills audio with a gap from 2 s to 602 s beside a video made of `sizes`. A split behind the
-    fill feeds the audio output and a mix whose other input is a third input. Returns the measured
-    run and its problems."""
+    fill feeds the audio output and a mix whose other input is a third input. The mix's output
+    takes at most `mix_frames` frames. Returns the measured run and its problems."""
+    limit = [] if mix_frames is None else ["-frames:a", str(mix_frames)]
     counter = COUNTERS["s16"]
     quiet = ["-nostdin", "-hide_banner", "-v", "error"]
     with tempfile.TemporaryDirectory() as work:
@@ -1443,7 +1444,7 @@ def split_beside_mix(ffmpeg, sizes):
                         "-f", "mjpeg", "-framerate", "24", "-i", video, "-i", audio,
                         "-f", "lavfi", "-i", "sine=f=440:r=48000:d=660",
                         "-filter_complex", graph, "-map", "[v]", "-f", "null", "-",
-                        "-map", "[m]", "-f", "null", "-",
+                        "-map", "[m]"] + limit + ["-f", "null", "-",
                         "-map", "[a]", "-c:a", counter.codec, "-f", counter.raw, "-"],
                        lambda out: out.read(), timeout=5 * TIME_LIMIT, measure=True)
     if done.code:
@@ -1455,18 +1456,13 @@ def split_beside_mix(ffmpeg, sizes):
                                (2 * SECOND, 602 * SECOND, 2 * SECOND), 640 * SECOND)
 
 
-# A split behind the fill feeds the audio output and a mix whose other input is a third input. The
-# video changes size at 10 s, inside a gap of 10 min. No frame of the third input can reach the
-# mix before the rebuild. Unless ffmpeg stops asking for frames as soon as one output behind the
-# fill gives none, the audio output keeps asking, and the mix keeps every frame of the gap.
-@check("rebuild-during-gap-before-split-mix", "fills a gap in the memory the same gap takes "
-       "without a rebuild when a split behind the filter feeds a mix that waits for another input")
-def rebuild_during_gap_before_split_mix(ffmpeg):
+def split_mix_memory_problems(ffmpeg, mix_frames=None):
+    """Compares the peak memory of split_beside_mix with a rebuild with its peak without one."""
     allowance = 16 << 20
-    steady, problems = split_beside_mix(ffmpeg, STEADY_SIZE)
+    steady, problems = split_beside_mix(ffmpeg, STEADY_SIZE, mix_frames)
     if problems:
         return ["without a rebuild: " + problem for problem in problems]
-    rebuilt, problems = split_beside_mix(ffmpeg, CHANGING_SIZE)
+    rebuilt, problems = split_beside_mix(ffmpeg, CHANGING_SIZE, mix_frames)
     if problems:
         return problems
     megabytes = "at most %.1f MB with a rebuild and %.1f MB without one" % (
@@ -1475,6 +1471,16 @@ def rebuild_during_gap_before_split_mix(ffmpeg):
     if rebuilt.peak() > steady.peak() + allowance:
         return ["peak memory is %s: more than %d MB apart" % (megabytes, allowance >> 20)]
     return []
+
+
+# A split behind the fill feeds the audio output and a mix whose other input is a third input. The
+# video changes size at 10 s, inside a gap of 10 min. No frame of the third input can reach the
+# mix before the rebuild. Unless ffmpeg stops asking for frames as soon as one output behind the
+# fill gives none, the audio output keeps asking, and the mix keeps every frame of the gap.
+@check("rebuild-during-gap-before-split-mix", "fills a gap in the memory the same gap takes "
+       "without a rebuild when a split behind the filter feeds a mix that waits for another input")
+def rebuild_during_gap_before_split_mix(ffmpeg):
+    return split_mix_memory_problems(ffmpeg)
 
 
 def shortest_problems(ffmpeg, sizes, *, at_most):
