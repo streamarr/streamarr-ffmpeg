@@ -21,7 +21,9 @@ code is compared with the value the profile 5 definition gives, computed here in
     6. Y = round(64 + 876 Y'), Cb = round(512 + 896 Cb), Cr = round(512 + 896 Cr)
 
 A grey patch must be within GREY_TOLERANCE codes of that value and a coloured patch within
-COLOUR_TOLERANCE. Colours within 1 % of the gamut boundary are not checked. Above the PQ range no
+COLOUR_TOLERANCE. Over all checked samples, the mean of written minus exact code must be within
+MAX_BIAS of zero for each component: a filter that rounds lands near 0, one that truncates near
+-0.5, which the per-patch tolerance alone lets through. Colours within 1 % of the gamut boundary are not checked. Above the PQ range no
 standard gives the value: L'M'S' above 1.0 still takes the EOTF formula, and tonemapx clips linear
 RGB to 0..1 before the OETF where tonemap_cuda does not. So the bright colours whose L'M'S' exceeds
 1.0, all of whose linear channels are above 200 nits, are checked for tonemapx only, with linear RGB
@@ -44,6 +46,7 @@ COLUMNS, ROWS = 24, 39
 WIDTH, HEIGHT = COLUMNS * PATCH, ROWS * PATCH
 GREY_TOLERANCE = 1
 COLOUR_TOLERANCE = 1
+MAX_BIAS = 0.25
 
 # The RPU's reshaping curves: one second-order piece for I, one first-order piece for P and T.
 COEFFICIENT_BITS = 23
@@ -325,6 +328,7 @@ def check(triples, planes, mapping, arguments):
     """Prints the patches out of tolerance and returns how many were checked and how many failed."""
     above_range = FILTERS[arguments.filter][2]
     checked, failures = 0, []
+    difference, samples_checked = [0, 0, 0], [0, 0, 0]
     for index, triple in enumerate(triples):
         expected, kind = exact_codes(triple, mapping)
         if kind != IN_GAMUT and not (kind == ABOVE_RANGE and above_range):
@@ -332,6 +336,9 @@ def check(triples, planes, mapping, arguments):
         checked += 1
         tolerance = GREY_TOLERANCE if triple[1:] == (512, 512) else COLOUR_TOLERANCE
         written = [interior(planes[component], index, component) for component in range(3)]
+        for component, samples in enumerate(written):
+            difference[component] += sum(samples) - expected[component] * len(samples)
+            samples_checked[component] += len(samples)
         furthest = [max(samples, key=lambda sample: abs(sample - expected[component]))
                     for component, samples in enumerate(written)]
         if any(abs(furthest[component] - expected[component]) > tolerance for component in range(3)):
@@ -342,7 +349,11 @@ def check(triples, planes, mapping, arguments):
     print("%s, %s RPU: %d of %d checked patches are further from the exact code than allowed "
           "(grey %d, colour %d)" % (arguments.filter, mapping, len(failures), checked, GREY_TOLERANCE,
                                     COLOUR_TOLERANCE))
-    return checked, len(failures)
+    bias = [total / count for total, count in zip(difference, samples_checked)]
+    biased = any(abs(value) > MAX_BIAS for value in bias)
+    print("%s, %s RPU: mean of written minus exact code Y %+.3f, Cb %+.3f, Cr %+.3f (allowed %.2f): %s"
+          % ((arguments.filter, mapping) + tuple(bias) + (MAX_BIAS, "BIASED" if biased else "ok")))
+    return checked, len(failures) + biased
 
 
 def main():

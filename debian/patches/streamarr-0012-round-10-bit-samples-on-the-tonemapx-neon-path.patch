@@ -1,0 +1,90 @@
+Description: avfilter/tonemapx: round 10-bit samples on the NEON path
+ The NEON routines added TEN_BIT_ROUNDING, 512, before shifting by
+ TEN_BIT_SCALE_SHIFT, 19, where rounding needs 2^18. So every 10-bit
+ sample they wrote was truncated: half a code low on average, and a
+ neutral grey came out with Cb and Cr 511 instead of 512. Their 10-bit
+ input conversion added the same 512 before a shift by 9, where the C
+ and x86 paths add 256. Linux arm64 and macOS arm64 run this path.
+ .
+ Round as the C path does: add 2^18 before the output shift and 2^8
+ before the input shift. TEN_BIT_ROUNDING has no other use and goes.
+ .
+ Cross-compiled for aarch64 and run under emulation, the NEON path
+ now writes the same bytes as the x86 C path on 10 of 12 outputs of
+ plain PQ, HLG and Dolby Vision profile 5 input, and within one code on
+ the rest. Before, 10-bit output had 50 % of its samples one code below
+ the C path's. 8-bit output keeps its rounding.
+Author: Streamarr
+Forwarded: no
+Last-Update: 2026-11-11
+---
+Index: FFmpeg/libavfilter/aarch64/vf_tonemapx_intrin_neon.c
+===================================================================
+--- FFmpeg.orig/libavfilter/aarch64/vf_tonemapx_intrin_neon.c
++++ FFmpeg/libavfilter/aarch64/vf_tonemapx_intrin_neon.c
+@@ -242,7 +242,7 @@ inline static void yuv2rgbx8(uint16x8_t *rx8, uint16x8_t *gx8, uint16x8_t *bx8,
+ 
+     int32x4_t rx4a, gx4a, bx4a, rx4b, gx4b, bx4b;
+ 
+-    rx4a = gx4a = bx4a = vmlaq_n_s32(vdupq_n_s32(TEN_BIT_ROUNDING), yx4a,  cy);
++    rx4a = gx4a = bx4a = vmlaq_n_s32(vdupq_n_s32(1 << (9 - 1)), yx4a,  cy);
+     rx4a = vmlaq_n_s32(rx4a, vx4a, crv);
+     rx4a = vshrq_n_s32(rx4a, 9); // 9 = 10bit - 1
+ 
+@@ -253,7 +253,7 @@ inline static void yuv2rgbx8(uint16x8_t *rx8, uint16x8_t *gx8, uint16x8_t *bx8,
+     bx4a = vmlaq_n_s32(bx4a, ux4a, cbu);
+     bx4a = vshrq_n_s32(bx4a, 9);
+ 
+-    rx4b = gx4b = bx4b = vmlaq_n_s32(vdupq_n_s32(TEN_BIT_ROUNDING), yx4b,  cy);
++    rx4b = gx4b = bx4b = vmlaq_n_s32(vdupq_n_s32(1 << (9 - 1)), yx4b,  cy);
+     rx4b = vmlaq_n_s32(rx4b, vx4b, crv);
+     rx4b = vshrq_n_s32(rx4b, 9);
+ 
+@@ -1282,7 +1282,7 @@ void tonemap_frame_dovi_2_420p10_neon(uint16_t *dsty, uint16_t *dstu, uint16_t *
+     int32x2_t ravgax2, gavgax2, bavgax2, ravgbx2, gavgbx2, bavgbx2;
+     int32x4_t ravgx4, gavgx4, bavgx4, uox4, vox4;
+     int32x4_t out_yuv_offx4 = vdupq_n_s32(params->out_yuv_off);
+-    int32x4_t out_rndx4 = vdupq_n_s32(TEN_BIT_ROUNDING);
++    int32x4_t out_rndx4 = vdupq_n_s32(1 << (TEN_BIT_SCALE_SHIFT - 1));
+     int32x4_t out_uv_offsetx4 = vdupq_n_s32(TEN_BIT_UV_OFFSET);
+     int32x4_t rgb_avg_rndx4 = vdupq_n_s32(CHROMA_AVG_ROUNDING);
+     float32x4_t ipt0, ipt1, ipt2, ipt3;
+@@ -1635,7 +1635,7 @@ void tonemap_frame_dovi_2_420hdr_neon(uint16_t *dsty, uint16_t *dstu, uint16_t *
+     int32x2_t ravgax2, gavgax2, bavgax2, ravgbx2, gavgbx2, bavgbx2;
+     int32x4_t ravgx4, gavgx4, bavgx4, uox4, vox4;
+     int32x4_t out_yuv_offx4 = vdupq_n_s32(params->out_yuv_off);
+-    int32x4_t out_rndx4 = vdupq_n_s32(TEN_BIT_ROUNDING);
++    int32x4_t out_rndx4 = vdupq_n_s32(1 << (TEN_BIT_SCALE_SHIFT - 1));
+     int32x4_t out_uv_offsetx4 = vdupq_n_s32(TEN_BIT_UV_OFFSET);
+     int32x4_t rgb_avg_rndx4 = vdupq_n_s32(CHROMA_AVG_ROUNDING);
+     float32x4_t ipt0, ipt1, ipt2, ipt3;
+@@ -1989,7 +1989,7 @@ void tonemap_frame_420p10_2_420p10_neon(uint16_t *dsty, uint16_t *dstu, uint16_t
+     int32x2_t ravgax2, gavgax2, bavgax2, ravgbx2, gavgbx2, bavgbx2;
+     int32x4_t ravgx4, gavgx4, bavgx4, uox4, vox4;
+     int32x4_t out_yuv_offx4 = vdupq_n_s32(params->out_yuv_off);
+-    int32x4_t out_rndx4 = vdupq_n_s32(TEN_BIT_ROUNDING);
++    int32x4_t out_rndx4 = vdupq_n_s32(1 << (TEN_BIT_SCALE_SHIFT - 1));
+     int32x4_t out_uv_offsetx4 = vdupq_n_s32(TEN_BIT_UV_OFFSET);
+     int32x4_t rgb_avg_rndx4 = vdupq_n_s32(CHROMA_AVG_ROUNDING);
+     for (; height > 1; height -= 2,
+@@ -2198,7 +2198,7 @@ void tonemap_frame_p010_2_p010_neon(uint16_t *dsty, uint16_t *dstuv,
+     int32x2_t ravgax2, gavgax2, bavgax2, ravgbx2, gavgbx2, bavgbx2;
+     int32x4_t ravgx4, gavgx4, bavgx4, uox4, vox4;
+     int32x4_t out_yuv_offx4 = vdupq_n_s32(params->out_yuv_off);
+-    int32x4_t out_rndx4 = vdupq_n_s32(TEN_BIT_ROUNDING);
++    int32x4_t out_rndx4 = vdupq_n_s32(1 << (TEN_BIT_SCALE_SHIFT - 1));
+     int32x4_t out_uv_offsetx4 = vdupq_n_s32(TEN_BIT_UV_OFFSET);
+     int32x4_t rgb_avg_rndx4 = vdupq_n_s32(CHROMA_AVG_ROUNDING);
+     for (; height > 1; height -= 2,
+Index: FFmpeg/libavfilter/vf_tonemapx.h
+===================================================================
+--- FFmpeg.orig/libavfilter/vf_tonemapx.h
++++ FFmpeg/libavfilter/vf_tonemapx.h
+@@ -65,7 +65,6 @@
+ #define EIGHT_BIT_SCALE_SHIFT 21
+ #define TEN_BIT_SCALE 1023.0f
+ #define TEN_BIT_UV_OFFSET 512
+-#define TEN_BIT_ROUNDING 512
+ #define TEN_BIT_BIPLANAR_SHIFT 6
+ #define TEN_BIT_SCALE_SHIFT 19
+ 
