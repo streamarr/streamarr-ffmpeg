@@ -27,8 +27,9 @@ Every size between is refused or written in whole blocks, and FFmpeg must stop: 
 cannot write a block writes empty packets forever.
 
 Last, it writes 24-bit DVD PCM alone into VOBs: 5.1 that FFmpeg encodes and 7 channels that
-FFmpeg copies, in packets of the default 2048 bytes and of 1000 to 3000 bytes. Whole blocks leave
-up to a block of a packet unused, so FFmpeg must raise the mux rate, which it computes from the
+FFmpeg copies, in packets of the default 2048 bytes and of 125 to 3000 bytes. Whole blocks leave
+up to a block of a packet unused, and the headers of a small packet take more than the 5 % that
+FFmpeg adds to the mux rate for them, so FFmpeg must raise the mux rate, which it computes from the
 stream's bit rate, to carry them. The pack that completes a block must start to arrive, by its
 SCR, before the block's first sample is due. A block that arrives later leaves a player that keeps
 to that clock without the samples it must play.
@@ -56,12 +57,12 @@ SMALL_PACKET_SAMPLES = 24000
 # Half a second of 24-bit 5.1 fills about 0.7 MB of these packets. A muxer that never drains its
 # queue writes past this limit within a second, and the limit stops it.
 OUTPUT_LIMIT = 16 << 20
-# The default, then a step prime to the 72-byte block of 24-bit 5.1 and the 84-byte block of 7
-# channels, so the bytes that whole blocks leave unused take every value below a block. With or
-# without whole blocks, below about 1000 bytes the headers alone outgrow the 5 % that FFmpeg adds
-# to the mux rate for them, and above about 3500 the 4 KB audio buffer that the muxer models holds
-# each packet back until its first block is all but due.
-ARRIVAL_PACKET_SIZES = [2048] + list(range(1000, 3001, 11))
+# The default, then from the smallest packet with room for a block of 7 channels after a pack
+# header, a PTS and a DTS, in a step prime to the 72-byte block of 24-bit 5.1 and the 84-byte block
+# of 7 channels, so the bytes that whole blocks leave unused take every value below a block. Above
+# about 3500 bytes the 4 KB audio buffer that the muxer models holds each packet back until its
+# first block is all but due.
+ARRIVAL_PACKET_SIZES = [2048] + list(range(125, 3001, 11))
 
 
 def block_size(bits, channels):
