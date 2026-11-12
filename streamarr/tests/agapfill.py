@@ -949,14 +949,15 @@ def seek_past_graph_rebuild(ffmpeg):
     return rebuild_problems(ffmpeg, hole=3, start=1, seek=6)
 
 
-def beside_changing_video(ffmpeg, shape, option, first, runs, after="anull"):
+def beside_changing_video(ffmpeg, shape, option, first, runs, after="anull", audio_frames=None):
     """Fills the counter in one filter graph with a video whose frame size changes at 10 s.
 
     The audio file carries the timestamps `shape` gives. ffmpeg reads its first frame after the
     hole, or its late first frame, while the video is still short of 10 s, so the filter is
     writing silence when the change of size makes ffmpeg free the graph and build a new one.
-    `after` is the filter behind the fill.
+    `after` is the filter behind the fill. The audio output takes at most `audio_frames` frames.
     """
+    limit = [] if audio_frames is None else ["-frames:a", str(audio_frames)]
     counter = COUNTERS["s16"]
     quiet = ["-nostdin", "-hide_banner", "-v", "error"]
     with tempfile.TemporaryDirectory() as work:
@@ -979,7 +980,7 @@ def beside_changing_video(ffmpeg, shape, option, first, runs, after="anull"):
         done = execute([ffmpeg, "-nostdin", "-hide_banner", "-nostats", "-v", "info", "-copyts",
                         "-f", "mjpeg", "-framerate", "24", "-i", video, "-i", audio,
                         "-filter_complex", graph, "-map", "[v]", "-f", "null", "-",
-                        "-map", "[a]", "-c:a", counter.codec, "-f", counter.raw, "-"],
+                        "-map", "[a]"] + limit + ["-c:a", counter.codec, "-f", counter.raw, "-"],
                        lambda out: compare_samples(out, first, runs, counter, RATE))
     if done.code:
         return ["FFmpeg ended with status %d: %s" % (done.code, last_lines(done.log))]
@@ -1003,6 +1004,16 @@ def rebuild_during_gap(ffmpeg):
 def rebuild_during_gap_behind_end(ffmpeg):
     return beside_changing_video(ffmpeg, chain(frames(4800), drop((20, 319))), "", 0,
                                  [real(0, 2 * SECOND), silence(10 * SECOND)], after="atrim=end=12")
+
+
+# The audio output takes 20 frames, the 2 s before a gap of 31,000 years, and is then finished. One
+# last frame follows the gap. No filter ends. Unless ffmpeg stops asking an output that is finished
+# for frames, it writes the whole gap before it builds the new graph, and it never ends.
+@check("rebuild-during-gap-behind-finished-output", "lets ffmpeg rebuild the filter graph when the "
+       "output behind the filter takes no more frames")
+def rebuild_during_gap_behind_finished_output(ffmpeg):
+    shape = chain(frames(4800), drop((21, 399)), stamp("PTS+48000*1e12*gte(N,96000)"))
+    return beside_changing_video(ffmpeg, shape, "", 0, [real(0, 2 * SECOND)], audio_frames=20)
 
 
 @check("rebuild-during-lead", "keeps every sample and the whole lead when ffmpeg rebuilds the "

@@ -23,7 +23,9 @@ Description: fftools/ffmpeg_filter: continue the output of agapfill when a filte
  A gap of 30 s under way at such a change lost 4,096 to 16,384 samples
  and the rest of the silence. The pending command reports the frames a
  filter has not output yet, and send_frame() now asks the outputs behind
- each agapfill filter for frames until none is pending.
+ each agapfill filter for frames until none is pending. It does not ask an
+ output whose consumer has finished, for example after -frames, which
+ would only discard the rest of the gap.
 Author: Streamarr
 Forwarded: no
 Last-Update: 2026-11-11
@@ -32,7 +34,7 @@ Index: FFmpeg/doc/filters.texi
 ===================================================================
 --- FFmpeg.orig/doc/filters.texi
 +++ FFmpeg/doc/filters.texi
-@@ -2163,6 +2163,41 @@ agapfill=start=0:max_gap=600
+@@ -2163,6 +2163,42 @@ agapfill=start=0:max_gap=600
  @end example
  @end itemize
  
@@ -69,7 +71,8 @@ Index: FFmpeg/doc/filters.texi
 +agapfill filter for frames until the filter has output every frame it has, so
 +a rebuild while the filter writes silence loses neither the rest of the
 +silence nor a sample. Samples that other filters of the old graph hold are
-+lost, as they are without this filter.
++lost, as they are without this filter. An output that takes no more frames,
++for example after @option{-frames}, is not asked.
 +
  @section agate
  
@@ -158,7 +161,7 @@ Index: FFmpeg/fftools/ffmpeg_filter.c
      fgp->is_meta = graph_is_meta(fgt->graph);
  
      /* limit the lists of allowed formats to the ones selected, to
-@@ -3104,6 +3163,89 @@ static const char *unknown_if_null(const
+@@ -3104,6 +3163,90 @@ static const char *unknown_if_null(const
      return str ? str : "unknown";
  }
  
@@ -184,7 +187,8 @@ Index: FFmpeg/fftools/ffmpeg_filter.c
 +}
 +
 +/* Ask each output that f feeds for a frame, then send on what the outputs
-+ * hold. Returns whether a frame came. */
++ * hold. Returns whether a frame came. An output whose consumer has finished,
++ * for example after -frames, would discard every frame, so it is not asked. */
 +static int pull_frames_behind(FilterGraph *fg, FilterGraphThread *fgt,
 +                              const AVFilterContext *f, AVFrame *frame)
 +{
@@ -194,7 +198,7 @@ Index: FFmpeg/fftools/ffmpeg_filter.c
 +        AVFilterContext *sink = fg->outputs[i]->filter;
 +        int ret;
 +
-+        if (!filter_feeds(f, sink))
++        if (fgt->eof_out[i] || !filter_feeds(f, sink))
 +            continue;
 +
 +        ret = av_buffersink_get_frame_flags(sink, NULL, AV_BUFFERSINK_FLAG_PEEK);
@@ -235,7 +239,7 @@ Index: FFmpeg/fftools/ffmpeg_filter.c
 +            continue;
 +
 +        /* No frame comes when a filter behind f has ended its output or
-+         * waits for another input. */
++         * waits for another input, or when no output behind f takes frames. */
 +        while (ret > 0 && gap_fill_is_pending(f))
 +            ret = pull_frames_behind(fg, fgt, f, frame);
 +        if (ret < 0)
@@ -248,7 +252,7 @@ Index: FFmpeg/fftools/ffmpeg_filter.c
  static int send_frame(FilterGraph *fg, FilterGraphThread *fgt,
                        InputFilter *ifilter, AVFrame *frame)
  {
-@@ -3192,6 +3334,8 @@ static int send_frame(FilterGraph *fg, F
+@@ -3192,6 +3335,8 @@ static int send_frame(FilterGraph *fg, F
          }
  
          ret = fgt->graph ? read_frames(fg, fgt, tmp) : 0;
@@ -257,7 +261,7 @@ Index: FFmpeg/fftools/ffmpeg_filter.c
          av_frame_free(&tmp);
          if (ret < 0)
              return ret;
-@@ -3224,6 +3368,10 @@ static int send_frame(FilterGraph *fg, F
+@@ -3224,6 +3369,10 @@ static int send_frame(FilterGraph *fg, F
              if (reason.len > 1)
                  reason.str[reason.len - 2] = '\0'; // remove last comma
              av_log(fg, AV_LOG_INFO, "Reconfiguring filter graph%s%s\n", reason.len ? " because " : "", reason.str);
@@ -268,7 +272,7 @@ Index: FFmpeg/fftools/ffmpeg_filter.c
          } else {
              /* Choke all input to avoid buffering excessive frames while the
               * initial filter graph is being configured, and before we have a
-@@ -3289,6 +3437,7 @@ static void fg_thread_uninit(FilterGraph
+@@ -3289,6 +3438,7 @@ static void fg_thread_uninit(FilterGraph
      av_frame_free(&fgt->frame);
      av_freep(&fgt->eof_in);
      av_freep(&fgt->eof_out);
