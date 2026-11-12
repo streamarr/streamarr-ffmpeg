@@ -861,17 +861,32 @@ def resume_command(position, at=0):
 # at 8 s, so its first frame is a step of nothing and follows at 2 s.
 timeline_check("resume-command", "continues from the position of another filter, given in that "
                "filter's sample rate, and ignores start",
-               chain(LATE_BY_8_SECONDS, resume_command("88200/352800/44100")), "start=0",
+               chain(LATE_BY_8_SECONDS, resume_command("88200/352800/352800/44100")), "start=0",
                2 * SECOND, [real(0, 10 * SECOND)], count=10 * SECOND)
 
 timeline_check("resume-command-before-gap", "fills the gap between the other filter's last frame "
                "and its own first frame",
-               chain(LATE_BY_8_SECONDS, resume_command("96000/96000/48000")), "", 2 * SECOND,
+               chain(LATE_BY_8_SECONDS, resume_command("96000/96000/96000/48000")), "", 2 * SECOND,
                [silence(6 * SECOND), real(0, 10 * SECOND)], count=10 * SECOND)
 
 timeline_check("resume-command-after-first-frame", "ignores the resume command once it has taken "
-               "a frame", chain(LATE_BY_8_SECONDS, resume_command("0/0/48000", at=9)), "",
+               "a frame", chain(LATE_BY_8_SECONDS, resume_command("0/0/0/48000", at=9)), "",
                8 * SECOND, [real(0, 10 * SECOND)], count=10 * SECOND)
+
+# The other filter stood at 2 s of output, had output audio up to 2 s and had taken audio up to
+# 10 s, which a rebuild lost with its graph. aselect lets no frame through, so the input ends before
+# a frame comes. Unless the end of the audio the other filter took is one more step, the output
+# stops at 2 s and the 8 s that audio covered are missing.
+NOTHING_AFTER_RESUME = chain(LATE_BY_8_SECONDS, resume_command("96000/96000/480000/48000"),
+                             "aselect=0")
+
+timeline_check("resume-command-before-end", "writes silence up to the end of the audio the other "
+               "filter took when the input ends before a frame comes",
+               NOTHING_AFTER_RESUME, "", 2 * SECOND, [silence(8 * SECOND)], count=10 * SECOND)
+
+refusal_check("max-gap-on-the-end-after-resume", "fails on silence up to the end of the audio the "
+              "other filter took that is longer than max_gap", NOTHING_AFTER_RESUME, "max_gap=7",
+              "max_gap", count=10 * SECOND)
 
 timeline_check("resume-command-incomplete", "starts afresh when the resume command names no "
                "whole position", chain(LATE_BY_8_SECONDS, resume_command("96000/96000")), "start=0", 0,
@@ -890,7 +905,7 @@ def resume_command_past_the_range(ffmpeg):
     counter = COUNTERS["s16"]
     # ffmpeg adds a frame's length to its timestamp. The last filter stamps the frames from zero, so
     # that this sum stays in range.
-    shape = chain(LATE_BY_8_SECONDS, resume_command("%d/%d/44100" % (FAR, FAR)), "agapfill",
+    shape = chain(LATE_BY_8_SECONDS, resume_command("%d/%d/%d/44100" % (FAR, FAR, FAR)), "agapfill",
                   "ashowinfo", stamp("N"))
     command = filter_command(ffmpeg, counter.lavfi(10 * SECOND, RATE), "anull", counter)
     command[command.index("-af") + 1] = shape
@@ -912,7 +927,7 @@ def resume_command_past_the_range(ffmpeg):
 # timestamp, and the first frame of silence comes out without one.
 timeline_check("resume-command-before-the-range", "stops a position that its own sample rate cannot "
                "reach at the smallest timestamp",
-               chain(LATE_BY_8_SECONDS, resume_command("%d/%d/44100" % (-FAR, -FAR))), "",
+               chain(LATE_BY_8_SECONDS, resume_command("%d/%d/%d/44100" % (-FAR, -FAR, -FAR))), "",
                -LARGEST_TIMESTAMP, [silence(2 * DEFAULT_PACKET)],
                after="atrim=end_sample=%d" % (2 * DEFAULT_PACKET), count=10 * SECOND)
 
@@ -1193,6 +1208,35 @@ def pending_after_end(ffmpeg):
     return problems + done.result
 
 
+# The second branch of a split ahead of the fill stamps the source 30 s earlier, so ffmpeg asks the
+# two outputs in turn, and each frame that branch takes also waits on the fill's input while the
+# fill writes a gap from 2 s to 32 s. The branch asks the fill where it stands with the frame it
+# stamps 3 s, the source from 33 s. The fill has then output audio up to 2 s and has taken audio up
+# to the end of that frame, 33.1 s, the frames that wait on its input included. Unless it counts
+# them, a rebuild that loses them with the graph leaves their time out when no frame follows.
+@check("position-with-frames-waiting", "reports the end of the frames that wait on its input as "
+       "the end of the audio it has taken")
+def position_with_frames_waiting(ffmpeg):
+    counter = COUNTERS["s16"]
+    graph = ("%s,%s,asplit[x][y];[x]agapfill[a];[y]%s,asendcmd=c='3 agapfill position'[b]"
+             % (counter.lavfi(40 * SECOND, RATE), chain(frames(4800), drop((20, 319))),
+                stamp("PTS-%d" % (30 * SECOND))))
+    done = execute([ffmpeg, "-nostdin", "-hide_banner", "-nostats", "-v", "verbose",
+                    "-filter_complex", graph, "-map", "[a]", "-f", "null", "-",
+                    "-map", "[b]", "-f", "null", "-"])
+    if done.code:
+        return ["FFmpeg ended with status %d: %s" % (done.code, last_lines(done.log))]
+    replies = COMMAND_REPLY.findall(done.log)
+    if len(replies) != 1:
+        raise Unusable("the second branch sent %d of the 1 position command" % len(replies))
+    expected = "%d/%d/%d" % (2 * SECOND, 33 * SECOND + 4800, RATE)
+    reported = replies[0].split("/", 1)[-1]
+    if reported != expected:
+        return ["after the output position it reports '%s', expected '%s': output up to 2 s and "
+                "taken up to 33.1 s, at 48 kHz" % (reported, expected)]
+    return []
+
+
 # A split behind the fill also draws the audio as a waveform, and the feedback filter sends that
 # video round a loop of filters, which a filter graph may hold. At the rebuild ffmpeg looks for the
 # outputs behind the fill, and the scaled video's output is not one of them. Unless that search
@@ -1418,6 +1462,17 @@ def rebuild_during_lead_before_mix(ffmpeg):
 def rebuild_during_gap_before_merge(ffmpeg):
     return gap_before_waiting_mixer(ffmpeg, "amerge=inputs=2,pan=stereo|c0=c0|c1=c1,"
                                             "aformat=sample_fmts=s16")
+
+
+# The frame from after the gap is the last one: the gap runs from 2 s to 39.9 s. At the rebuild the
+# fill holds that frame, the mix waits, and the frame is lost with the old graph. No frame follows.
+# Unless the new graph's fill learns where the audio the old one took ends, and writes silence up
+# to there when its input ends, the output stops at the rebuild, about 35 s early.
+@check("rebuild-during-last-gap-before-mix", "writes the audio it holds as silence up to its end "
+       "when ffmpeg rebuilds the filter graph while a mix behind it waits and no audio follows")
+def rebuild_during_last_gap_before_mix(ffmpeg):
+    return before_waiting_mixer(ffmpeg, MIX, shape=chain(frames(4800), drop((20, 398))),
+                                gap=(2 * SECOND, 40 * SECOND, None), end=40 * SECOND)
 
 
 def split_beside_mix(ffmpeg, sizes, mix_frames=None):
