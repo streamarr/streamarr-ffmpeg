@@ -6,13 +6,15 @@
 
 Everything is synthetic. The picture is a frame of flat patches, each one base-layer code triple
 (I, P, T): a grey ramp, rings of colours 16 to 260 codes around neutral, and bright colours whose
-L'M'S' goes above the PQ range. FFmpeg's libx265 encodes it
-losslessly, and this script writes the profile 5 RPU itself and appends it to the access unit.
+L'M'S' goes above the PQ range. FFmpeg's libx265 encodes it losslessly, and this script writes a
+profile 5 RPU itself and appends it to the access unit. It checks two RPUs on the same picture: one
+reshapes P and T with polynomials, the other with MMR, which maps each of them from the base-layer
+I, P and T together.
 Inside a flat patch, chroma siting and interpolation cannot change the result, so every output
 code is compared with the value the profile 5 definition gives, computed here in double precision:
 
     1. s = code / 1023 for I, P and T (the base layer is full range)
-    2. reshape each with its polynomial, clamp to 0..1
+    2. reshape each, from the base-layer values, with its polynomial or MMR; clamp to 0..1
     3. L'M'S' = ycc_to_rgb_matrix x (I, P - 0.5, T - 0.5)
     4. LMS = PQ EOTF(L'M'S'), RGB = lms2rgb x rgb_to_lms_matrix x LMS, R'G'B' = PQ OETF(RGB)
     5. Y' = 0.2627 R' + 0.6780 G' + 0.0593 B', Cb = (B' - Y') / 1.8814, Cr = (R' - Y') / 1.4746
@@ -47,6 +49,12 @@ COLOUR_TOLERANCE = 1
 COEFFICIENT_BITS = 23
 LUMA_CURVE = (0.01, 0.85, 0.14)
 CHROMA_CURVE = (0.03, 0.94)
+# The other RPU reshapes P and T with one first-order MMR piece each: a constant and coefficients on
+# I, P, T, IP, IT, PT and IPT. P + 0.3 (I - 0.5) (P - 0.5), and
+# T + 0.3 (I - 0.5) (T - 0.5) + 0.2 (P - 0.5) (T - 0.5).
+MMR_CURVES = ((0.075, (-0.15, 0.85, 0, 0.3, 0, 0, 0)),
+              (0.125, (-0.15, -0.1, 0.75, 0, 0.3, 0.2, 0)))
+POLYNOMIAL, MMR = "polynomial", "MMR"
 
 # The IPT-PQ-C2 colour space of profile 5, as the RPU carries it.
 YCC_TO_RGB = (8192, 799, 1681, 8192, -933, 1091, 8192, 267, -5545)  # / 2^13
@@ -89,6 +97,13 @@ def reshape(curve, signal):
     return min(max(value, 0.0), 1.0)
 
 
+def reshape_mmr(curve, i, p, t):
+    constant, coefficients = curve
+    terms = (i, p, t, i * p, i * t, p * t, i * p * t)
+    value = fixed(constant) + sum(fixed(c) * term for c, term in zip(coefficients, terms))
+    return min(max(value / (1 << COEFFICIENT_BITS), 0.0), 1.0)
+
+
 def multiply(matrix, vector):
     return [sum(m * v for m, v in zip(row, vector)) for row in matrix]
 
@@ -96,11 +111,15 @@ def multiply(matrix, vector):
 IN_GAMUT, ABOVE_RANGE = "in gamut", "above the PQ range"
 
 
-def exact_codes(triple):
+def exact_codes(triple, mapping=POLYNOMIAL):
     """Returns the exact output codes of a base-layer triple and its kind: IN_GAMUT, ABOVE_RANGE
     or None for a colour that is not checked."""
     i, p, t = (code / 1023 for code in triple)
-    signal = [reshape(LUMA_CURVE, i), reshape(CHROMA_CURVE, p) - 0.5, reshape(CHROMA_CURVE, t) - 0.5]
+    if mapping == MMR:
+        chroma = [reshape_mmr(curve, i, p, t) for curve in MMR_CURVES]
+    else:
+        chroma = [reshape(CHROMA_CURVE, p), reshape(CHROMA_CURVE, t)]
+    signal = [reshape(LUMA_CURVE, i), chroma[0] - 0.5, chroma[1] - 0.5]
     nonlinear = [YCC_TO_RGB[k:k + 3] for k in (0, 3, 6)]
     lms_pq = [value / 8192 for value in multiply(nonlinear, signal)]
     crosstalk = [[value / 16384 for value in RGB_TO_LMS[k:k + 3]] for k in (0, 3, 6)]
@@ -194,7 +213,7 @@ def crc32_mpeg2(data):
     return crc
 
 
-def rpu_nal():
+def rpu_nal(mapping):
     """A profile 5 RPU in the order libavcodec/dovi_rpudec.c reads it, as an HEVC NAL unit of type 62."""
     bits = Bits()
     bits.put(2, 6)      # rpu_type
@@ -225,7 +244,15 @@ def rpu_nal():
         bits.put(1023, 10)
     bits.ue(0)          # num_x_partitions_minus1
     bits.ue(0)          # num_y_partitions_minus1
-    for curve in (LUMA_CURVE, CHROMA_CURVE, CHROMA_CURVE):
+    for curve in (LUMA_CURVE,) + ((CHROMA_CURVE, CHROMA_CURVE) if mapping == POLYNOMIAL else MMR_CURVES):
+        if isinstance(curve[1], tuple):
+            constant, coefficients = curve
+            bits.ue(1)           # mapping_idc: MMR
+            bits.put(0, 2)       # mmr_order_minus1
+            bits.coefficient(constant)
+            for value in coefficients:
+                bits.coefficient(value)
+            continue
         bits.ue(0)      # mapping_idc: polynomial
         bits.ue(len(curve) - 2)  # poly_order_minus1
         if len(curve) == 2:
@@ -294,47 +321,12 @@ def interior(plane, index, component):
             for y in range(margin, size - margin) for x in range(margin, size - margin)]
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    parser.add_argument("--ffmpeg", required=True)
-    parser.add_argument("--filter", required=True, choices=sorted(FILTERS))
-    parser.add_argument("--cpuflags", help="FFmpeg's -cpuflags for the filtering run")
-    parser.add_argument("--keep", help="write the fixture and the output to this directory")
-    arguments = parser.parse_args()
-    triples = patch_triples()
-    with tempfile.TemporaryDirectory() as temporary:
-        folder = arguments.keep or temporary
-        os.makedirs(folder, exist_ok=True)
-        source, base, stream = (os.path.join(folder, name) for name in ("patches.yuv", "base.hevc", "profile5.hevc"))
-        frame = picture(triples)
-        with open(source, "wb") as file:
-            file.write(frame)
-        ffmpeg = [arguments.ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-y"]
-        run(ffmpeg + ["-f", "rawvideo", "-pix_fmt", "yuv420p10le", "-s", "%dx%d" % (WIDTH, HEIGHT),
-                      "-color_range", "pc", "-i", source, "-frames:v", "1", "-c:v", "libx265",
-                      "-x265-params", "lossless=1:range=full:log-level=error", "-f", "hevc", base])
-        with open(base, "rb") as file:
-            access_unit = file.read()
-        with open(stream, "wb") as file:
-            file.write(access_unit + rpu_nal())
-        decoded = run(ffmpeg + ["-i", stream, "-frames:v", "1", "-pix_fmt", "yuv420p10le", "-f", "rawvideo", "-"])
-        if decoded != frame:
-            sys.stderr.write("The decoded base layer differs from the patches, so the fixture is unusable.\n")
-            sys.exit(2)
-        device, graph, above_range = FILTERS[arguments.filter]
-        cpuflags = ["-cpuflags", arguments.cpuflags] if arguments.cpuflags is not None else []
-        output = run(ffmpeg + cpuflags + device + ["-i", stream, "-vf", graph, "-frames:v", "1",
-                                                   "-pix_fmt", "yuv420p10le", "-f", "rawvideo", "-"])
-        if arguments.keep:
-            with open(os.path.join(folder, arguments.filter + ".yuv"), "wb") as file:
-                file.write(output)
-    if len(output) != len(frame):
-        sys.stderr.write("%s wrote %d bytes where one frame is %d.\n" % (arguments.filter, len(output), len(frame)))
-        sys.exit(2)
-    planes = planes_of(output)
+def check(triples, planes, mapping, arguments):
+    """Prints the patches out of tolerance and returns how many were checked and how many failed."""
+    above_range = FILTERS[arguments.filter][2]
     checked, failures = 0, []
     for index, triple in enumerate(triples):
-        expected, kind = exact_codes(triple)
+        expected, kind = exact_codes(triple, mapping)
         if kind != IN_GAMUT and not (kind == ABOVE_RANGE and above_range):
             continue
         checked += 1
@@ -344,15 +336,66 @@ def main():
                     for component, samples in enumerate(written)]
         if any(abs(furthest[component] - expected[component]) > tolerance for component in range(3)):
             failures.append((triple, expected, furthest))
-    if checked < 300:
-        sys.stderr.write("Only %d of %d patches are checked, so the fixture is unusable.\n" % (checked, len(triples)))
-        sys.exit(2)
     for triple, expected, furthest in failures[:12]:
-        print("I/P/T %4d/%4d/%4d: exact Y/Cb/Cr %4d/%4d/%4d, %s wrote %4d/%4d/%4d"
-              % (tuple(triple) + tuple(expected) + (arguments.filter,) + tuple(furthest)))
-    print("%s: %d of %d checked patches are further from the exact code than allowed "
-          "(grey %d, colour %d)" % (arguments.filter, len(failures), checked, GREY_TOLERANCE, COLOUR_TOLERANCE))
-    sys.exit(1 if failures else 0)
+        print("%s, I/P/T %4d/%4d/%4d: exact Y/Cb/Cr %4d/%4d/%4d, %s wrote %4d/%4d/%4d"
+              % ((mapping,) + tuple(triple) + tuple(expected) + (arguments.filter,) + tuple(furthest)))
+    print("%s, %s RPU: %d of %d checked patches are further from the exact code than allowed "
+          "(grey %d, colour %d)" % (arguments.filter, mapping, len(failures), checked, GREY_TOLERANCE,
+                                    COLOUR_TOLERANCE))
+    return checked, len(failures)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    parser.add_argument("--ffmpeg", required=True)
+    parser.add_argument("--filter", required=True, choices=sorted(FILTERS))
+    parser.add_argument("--cpuflags", help="FFmpeg's -cpuflags for the filtering run")
+    parser.add_argument("--keep", help="write the fixture and the output to this directory")
+    arguments = parser.parse_args()
+    triples = patch_triples()
+    device, graph, _ = FILTERS[arguments.filter]
+    cpuflags = ["-cpuflags", arguments.cpuflags] if arguments.cpuflags is not None else []
+    outputs = {}
+    with tempfile.TemporaryDirectory() as temporary:
+        folder = arguments.keep or temporary
+        os.makedirs(folder, exist_ok=True)
+        source, base = (os.path.join(folder, name) for name in ("patches.yuv", "base.hevc"))
+        frame = picture(triples)
+        with open(source, "wb") as file:
+            file.write(frame)
+        ffmpeg = [arguments.ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-y"]
+        run(ffmpeg + ["-f", "rawvideo", "-pix_fmt", "yuv420p10le", "-s", "%dx%d" % (WIDTH, HEIGHT),
+                      "-color_range", "pc", "-i", source, "-frames:v", "1", "-c:v", "libx265",
+                      "-x265-params", "lossless=1:range=full:log-level=error", "-f", "hevc", base])
+        with open(base, "rb") as file:
+            access_unit = file.read()
+        for mapping in (POLYNOMIAL, MMR):
+            stream = os.path.join(folder, "profile5-%s.hevc" % mapping.lower())
+            with open(stream, "wb") as file:
+                file.write(access_unit + rpu_nal(mapping))
+            decoded = run(ffmpeg + ["-i", stream, "-frames:v", "1", "-pix_fmt", "yuv420p10le", "-f", "rawvideo", "-"])
+            if decoded != frame:
+                sys.stderr.write("The decoded base layer differs from the patches, so the fixture is unusable.\n")
+                sys.exit(2)
+            output = run(ffmpeg + cpuflags + device + ["-i", stream, "-vf", graph, "-frames:v", "1",
+                                                       "-pix_fmt", "yuv420p10le", "-f", "rawvideo", "-"])
+            if arguments.keep:
+                with open(os.path.join(folder, "%s-%s.yuv" % (arguments.filter, mapping.lower())), "wb") as file:
+                    file.write(output)
+            if len(output) != len(frame):
+                sys.stderr.write("%s wrote %d bytes where one frame is %d.\n"
+                                 % (arguments.filter, len(output), len(frame)))
+                sys.exit(2)
+            outputs[mapping] = planes_of(output)
+    failed = 0
+    for mapping, planes in outputs.items():
+        checked, failures = check(triples, planes, mapping, arguments)
+        if checked < 300:
+            sys.stderr.write("Only %d of %d patches are checked, so the fixture is unusable.\n"
+                             % (checked, len(triples)))
+            sys.exit(2)
+        failed += failures
+    sys.exit(1 if failed else 0)
 
 
 if __name__ == "__main__":

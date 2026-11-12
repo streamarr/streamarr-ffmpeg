@@ -1,0 +1,160 @@
+Description: avfilter/tonemapx: reshape with MMR from the base-layer values
+ A Dolby Vision MMR piece maps a component from the base-layer values
+ of all three components: a constant plus coefficients on I, P, T and
+ their products. tonemapx reshaped I, then P, then T, and wrote each
+ result back into the values it passed to the next MMR. So the MMR of P
+ read the reshaped I, and the MMR of T read the reshaped I and P. The
+ C, SSE4.2, AVX2 and NEON routines all did. libplacebo and this tree's
+ tonemap_cuda feed MMR the base-layer values.
+ .
+ The error depends on how far the luma curve moves I and on how
+ strongly the chroma MMR couples to I and P. On flat synthetic profile 5
+ patches whose P and T carry one first-order MMR piece each, converted
+ to BT.2020 PQ, luma was up to 9 codes and chroma up to 7 codes off, and
+ 2.8 % of the colours were more than one luma code off.
+ .
+ Pass the base-layer values to every MMR. Reshaping that uses only
+ polynomials does not change.
+Author: Streamarr
+Forwarded: no
+Last-Update: 2026-11-11
+---
+Index: FFmpeg/libavfilter/aarch64/vf_tonemapx_intrin_neon.c
+===================================================================
+--- FFmpeg.orig/libavfilter/aarch64/vf_tonemapx_intrin_neon.c
++++ FFmpeg/libavfilter/aarch64/vf_tonemapx_intrin_neon.c
+@@ -134,6 +134,7 @@ inline static float32x4_t reshape_dovi_iptpqc2(float32x4_t sig, const TonemapInt
+ 
+     float32x4_t coeffs, result;
+ 
++    // MMR maps each component from the base-layer values in sig, not from those reshaped so far.
+     // reshape I
+     s = vgetq_lane_f32(sig, 0);
+     result = sig;
+@@ -154,7 +155,7 @@ inline static float32x4_t reshape_dovi_iptpqc2(float32x4_t sig, const TonemapInt
+     if ((has_mmr_poly && vgetq_lane_f32(coeffs, 3) == 0.0f) || (!has_mmr_poly && dovi_has_poly_i))
+         s = reshape_poly(s, coeffs);
+     else
+-        s = reshape_mmr(result, coeffs, dovi_mmr_i,
++        s = reshape_mmr(sig, coeffs, dovi_mmr_i,
+                         dovi_mmr_single_i, dovi_min_order_i, dovi_max_order_i);
+ 
+     result = vsetq_lane_f32(CLAMP(s, dovi_lo_i, dovi_hi_i), result, 0);
+@@ -167,7 +168,7 @@ inline static float32x4_t reshape_dovi_iptpqc2(float32x4_t sig, const TonemapInt
+     if ((has_mmr_poly && vgetq_lane_f32(coeffs, 3) == 0.0f) || (!has_mmr_poly && dovi_has_poly_p))
+         s = reshape_poly(s, coeffs);
+     else
+-        s = reshape_mmr(result, coeffs, dovi_mmr_p,
++        s = reshape_mmr(sig, coeffs, dovi_mmr_p,
+                         dovi_mmr_single_p, dovi_min_order_p, dovi_max_order_p);
+ 
+     result = vsetq_lane_f32(CLAMP(s, dovi_lo_p, dovi_hi_p), result, 1);
+@@ -180,7 +181,7 @@ inline static float32x4_t reshape_dovi_iptpqc2(float32x4_t sig, const TonemapInt
+     if ((has_mmr_poly && vgetq_lane_f32(coeffs, 3) == 0.0f) || (!has_mmr_poly && dovi_has_poly_t))
+         s = reshape_poly(s, coeffs);
+     else
+-        s = reshape_mmr(result, coeffs, dovi_mmr_t,
++        s = reshape_mmr(sig, coeffs, dovi_mmr_t,
+                         dovi_mmr_single_t, dovi_min_order_t, dovi_max_order_t);
+ 
+     result = vsetq_lane_f32(CLAMP(s, dovi_lo_t, dovi_hi_t), result, 2);
+Index: FFmpeg/libavfilter/vf_tonemapx.c
+===================================================================
+--- FFmpeg.orig/libavfilter/vf_tonemapx.c
++++ FFmpeg/libavfilter/vf_tonemapx.c
+@@ -335,6 +335,8 @@ inline static void reshape_dovi_yuv(float* dest, float* src, const TonemapIntPar
+     float s;
+     float coeffs[4] = {0, 0, 0, 0};
+     float sig_arr[3] = {src[0],src[1],src[2]};
++    // MMR maps each component from the base-layer values of all three, not from those reshaped so far.
++    const float base[3] = {src[0], src[1], src[2]};
+ 
+     int dovi_num_pivots, dovi_has_mmr, dovi_has_poly;
+     int dovi_mmr_single, dovi_min_order, dovi_max_order;
+@@ -427,7 +429,7 @@ inline static void reshape_dovi_yuv(float* dest, float* src, const TonemapIntPar
+         if ((has_mmr_poly && coeffs[3] == 0.0f) || (!has_mmr_poly && dovi_has_poly))
+             s = reshape_poly(s, coeffs);
+         else
+-            s = reshape_mmr(sig_arr, coeffs, dovi_mmr,
++            s = reshape_mmr(base, coeffs, dovi_mmr,
+                             dovi_mmr_single, dovi_min_order, dovi_max_order);
+ 
+         sig_arr[i] = CLAMP(s, dovi_lo, dovi_hi);
+Index: FFmpeg/libavfilter/x86/vf_tonemapx_intrin_avx.c
+===================================================================
+--- FFmpeg.orig/libavfilter/x86/vf_tonemapx_intrin_avx.c
++++ FFmpeg/libavfilter/x86/vf_tonemapx_intrin_avx.c
+@@ -151,6 +151,7 @@ X86_64_V3 inline static __m128 reshape_dovi_iptpqc2(__m128 sig, const TonemapInt
+ 
+     __m128 coeffs, result;
+ 
++    // MMR maps each component from the base-layer values in sig, not from those reshaped so far.
+     // reshape I
+     s = _mm_cvtss_f32(sig);
+     result = sig;
+@@ -171,7 +172,7 @@ X86_64_V3 inline static __m128 reshape_dovi_iptpqc2(__m128 sig, const TonemapInt
+     if ((has_mmr_poly && _mm_cvtss_f32(_mm_shuffle_ps(coeffs, coeffs, _MM_SHUFFLE(3, 3, 3, 3))) == 0.0f) || (!has_mmr_poly && dovi_has_poly_i))
+         s = reshape_poly(s, coeffs);
+     else
+-        s = reshape_mmr(result, coeffs, dovi_mmr_i,
++        s = reshape_mmr(sig, coeffs, dovi_mmr_i,
+                         dovi_mmr_single_i, dovi_min_order_i, dovi_max_order_i);
+ 
+     result = _mm_insert_ps(result, _mm_set1_ps(CLAMP(s, dovi_lo_i, dovi_hi_i)), _MM_MK_INSERTPS_NDX(0, 0, 0));
+@@ -184,7 +185,7 @@ X86_64_V3 inline static __m128 reshape_dovi_iptpqc2(__m128 sig, const TonemapInt
+     if ((has_mmr_poly && _mm_cvtss_f32(_mm_shuffle_ps(coeffs, coeffs, _MM_SHUFFLE(3, 3, 3, 3))) == 0.0f) || (!has_mmr_poly && dovi_has_poly_p))
+         s = reshape_poly(s, coeffs);
+     else
+-        s = reshape_mmr(result, coeffs, dovi_mmr_p,
++        s = reshape_mmr(sig, coeffs, dovi_mmr_p,
+                         dovi_mmr_single_p, dovi_min_order_p, dovi_max_order_p);
+ 
+     result = _mm_insert_ps(result, _mm_set1_ps(CLAMP(s, dovi_lo_p, dovi_hi_p)), _MM_MK_INSERTPS_NDX(0, 1, 0));
+@@ -197,7 +198,7 @@ X86_64_V3 inline static __m128 reshape_dovi_iptpqc2(__m128 sig, const TonemapInt
+     if ((has_mmr_poly && _mm_cvtss_f32(_mm_shuffle_ps(coeffs, coeffs, _MM_SHUFFLE(3, 3, 3, 3))) == 0.0f) || (!has_mmr_poly && dovi_has_poly_t))
+         s = reshape_poly(s, coeffs);
+     else
+-        s = reshape_mmr(result, coeffs, dovi_mmr_t,
++        s = reshape_mmr(sig, coeffs, dovi_mmr_t,
+                         dovi_mmr_single_t, dovi_min_order_t, dovi_max_order_t);
+ 
+     result = _mm_insert_ps(result, _mm_set1_ps(CLAMP(s, dovi_lo_t, dovi_hi_t)), _MM_MK_INSERTPS_NDX(0, 2, 0));
+Index: FFmpeg/libavfilter/x86/vf_tonemapx_intrin_sse.c
+===================================================================
+--- FFmpeg.orig/libavfilter/x86/vf_tonemapx_intrin_sse.c
++++ FFmpeg/libavfilter/x86/vf_tonemapx_intrin_sse.c
+@@ -188,6 +188,7 @@ X86_64_V2 inline static __m128 reshape_dovi_iptpqc2(__m128 sig, const TonemapInt
+ 
+     __m128 coeffs, result;
+ 
++    // MMR maps each component from the base-layer values in sig, not from those reshaped so far.
+     // reshape I
+     s = _mm_cvtss_f32(sig);
+     result = sig;
+@@ -208,7 +209,7 @@ X86_64_V2 inline static __m128 reshape_dovi_iptpqc2(__m128 sig, const TonemapInt
+     if ((has_mmr_poly && _mm_cvtss_f32(_mm_shuffle_ps(coeffs, coeffs, _MM_SHUFFLE(3, 3, 3, 3))) == 0.0f) || (!has_mmr_poly && dovi_has_poly_i))
+         s = reshape_poly(s, coeffs);
+     else
+-        s = reshape_mmr(result, coeffs, dovi_mmr_i,
++        s = reshape_mmr(sig, coeffs, dovi_mmr_i,
+                         dovi_mmr_single_i, dovi_min_order_i, dovi_max_order_i);
+ 
+     result = _mm_insert_ps(result, _mm_set1_ps(CLAMP(s, dovi_lo_i, dovi_hi_i)), _MM_MK_INSERTPS_NDX(0, 0, 0));
+@@ -221,7 +222,7 @@ X86_64_V2 inline static __m128 reshape_dovi_iptpqc2(__m128 sig, const TonemapInt
+     if ((has_mmr_poly && _mm_cvtss_f32(_mm_shuffle_ps(coeffs, coeffs, _MM_SHUFFLE(3, 3, 3, 3))) == 0.0f) || (!has_mmr_poly && dovi_has_poly_p))
+         s = reshape_poly(s, coeffs);
+     else
+-        s = reshape_mmr(result, coeffs, dovi_mmr_p,
++        s = reshape_mmr(sig, coeffs, dovi_mmr_p,
+                         dovi_mmr_single_p, dovi_min_order_p, dovi_max_order_p);
+ 
+     result = _mm_insert_ps(result, _mm_set1_ps(CLAMP(s, dovi_lo_p, dovi_hi_p)), _MM_MK_INSERTPS_NDX(0, 1, 0));
+@@ -234,7 +235,7 @@ X86_64_V2 inline static __m128 reshape_dovi_iptpqc2(__m128 sig, const TonemapInt
+     if ((has_mmr_poly && _mm_cvtss_f32(_mm_shuffle_ps(coeffs, coeffs, _MM_SHUFFLE(3, 3, 3, 3))) == 0.0f) || (!has_mmr_poly && dovi_has_poly_t))
+         s = reshape_poly(s, coeffs);
+     else
+-        s = reshape_mmr(result, coeffs, dovi_mmr_t,
++        s = reshape_mmr(sig, coeffs, dovi_mmr_t,
+                         dovi_mmr_single_t, dovi_min_order_t, dovi_max_order_t);
+ 
+     result = _mm_insert_ps(result, _mm_set1_ps(CLAMP(s, dovi_lo_t, dovi_hi_t)), _MM_MK_INSERTPS_NDX(0, 2, 0));
