@@ -928,14 +928,16 @@ def ac3_parts(ffmpeg, work, parts):
     return path
 
 
-def rebuild_problems(ffmpeg, *, hole, ahead="anull", start=None, seek=None):
+def rebuild_problems(ffmpeg, *, hole, ahead="anull", start=None, seek=None, names=("agapfill",)):
     """Fills audio that changes layout and compares the output with the rules' timeline.
 
-    `ahead` is the filter chain ahead of the fill. The reference is the same decode without the
-    fill: its frames are the input, and its samples are the real audio. ffmpeg builds a new filter
-    graph at the change of layout.
+    `ahead` is the filter chain ahead of the fill. The fill is one agapfill filter for each of
+    `names`, one after the other. The reference is the same decode without the fill: its frames
+    are the input, and its samples are the real audio. ffmpeg builds a new filter graph at the
+    change of layout.
     """
-    fill = "agapfill" if start is None else "agapfill=start=%d" % start
+    option = "" if start is None else "=start=%d" % start
+    fill = chain(*(name + option for name in names))
     with tempfile.TemporaryDirectory() as work:
         source = ac3_parts(ffmpeg, work, [("5.1", RATE, 0), ("stereo", RATE, hole)])
 
