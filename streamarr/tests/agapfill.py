@@ -1352,6 +1352,69 @@ def rebuild_during_gap_before_merge(ffmpeg):
                                             "aformat=sample_fmts=s16")
 
 
+def split_beside_mix(ffmpeg, sizes):
+    """Fills audio with a gap from 2 s to 602 s beside a video made of `sizes`. A split behind the
+    fill feeds the audio output and a mix whose other input is a third input. Returns the measured
+    run and its problems."""
+    counter = COUNTERS["s16"]
+    quiet = ["-nostdin", "-hide_banner", "-v", "error"]
+    with tempfile.TemporaryDirectory() as work:
+        video, audio = os.path.join(work, "video.mjpeg"), os.path.join(work, "audio.nut")
+        with open(video, "wb") as out:
+            for size, seconds in sizes:
+                part = execute([ffmpeg] + quiet + ["-f", "lavfi", "-i",
+                                                   "testsrc2=s=%s:r=24:d=%d" % (size, seconds),
+                                                   "-c:v", "mjpeg", "-q:v", "20", "-f", "mjpeg", "-"],
+                               lambda stream: stream.read())
+                if part.code:
+                    raise Unusable("FFmpeg could not encode the video: %s" % last_lines(part.log))
+                out.write(part.result)
+        made = execute([ffmpeg] + quiet + ["-f", "lavfi", "-i", counter.lavfi(40 * SECOND, RATE),
+                                           "-af", chain(frames(4800),
+                                                        stamp("PTS+%d*gte(N,96000)" % (600 * SECOND))),
+                                           "-c:a", counter.codec, "-f", "nut", "-y", audio])
+        if made.code:
+            raise Unusable("FFmpeg could not write the audio: %s" % last_lines(made.log))
+        graph = ("[0:v]scale=64:36[v];[1:a]agapfill,asplit[direct][mixed];"
+                 "[mixed][2:a]amix=inputs=2:duration=first[m];[direct]ashowinfo[a]")
+        done = execute([ffmpeg, "-nostdin", "-hide_banner", "-nostats", "-v", "info", "-copyts",
+                        "-f", "mjpeg", "-framerate", "24", "-i", video, "-i", audio,
+                        "-f", "lavfi", "-i", "sine=f=440:r=48000:d=660",
+                        "-filter_complex", graph, "-map", "[v]", "-f", "null", "-",
+                        "-map", "[m]", "-f", "null", "-",
+                        "-map", "[a]", "-c:a", counter.codec, "-f", counter.raw, "-"],
+                       lambda out: out.read(), timeout=5 * TIME_LIMIT, measure=True)
+    if done.code:
+        return done, ["FFmpeg ended with status %d: %s" % (done.code, last_lines(done.log))]
+    rebuilt = "Reconfiguring filter graph because video parameters changed" in done.log
+    if len(sizes) > 1 and not rebuilt:
+        raise Unusable("ffmpeg did not rebuild the filter graph at the change of frame size")
+    return done, held_problems(frames_of(done.log), done.result, counter,
+                               (2 * SECOND, 602 * SECOND, 2 * SECOND), 640 * SECOND)
+
+
+# A split behind the fill feeds the audio output and a mix whose other input is a third input. The
+# video changes size at 10 s, inside a gap of 10 min. No frame of the third input can reach the
+# mix before the rebuild. Unless ffmpeg stops asking for frames as soon as one output behind the
+# fill gives none, the audio output keeps asking, and the mix keeps every frame of the gap.
+@check("rebuild-during-gap-before-split-mix", "fills a gap in the memory the same gap takes "
+       "without a rebuild when a split behind the filter feeds a mix that waits for another input")
+def rebuild_during_gap_before_split_mix(ffmpeg):
+    allowance = 16 << 20
+    steady, problems = split_beside_mix(ffmpeg, STEADY_SIZE)
+    if problems:
+        return ["without a rebuild: " + problem for problem in problems]
+    rebuilt, problems = split_beside_mix(ffmpeg, CHANGING_SIZE)
+    if problems:
+        return problems
+    megabytes = "at most %.1f MB with a rebuild and %.1f MB without one" % (
+        rebuilt.peak() / 2 ** 20, steady.peak() / 2 ** 20)
+    print("         peak memory of FFmpeg: " + megabytes)
+    if rebuilt.peak() > steady.peak() + allowance:
+        return ["peak memory is %s: more than %d MB apart" % (megabytes, allowance >> 20)]
+    return []
+
+
 CHECKS_BY_NAME = {name: (title, function) for name, title, function in CHECKS}
 
 

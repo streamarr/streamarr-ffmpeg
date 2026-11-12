@@ -62,6 +62,14 @@ Description: fftools/ffmpeg_filter: continue the output of agapfill when a filte
  them keeps its own time. Until the filter has output an input frame, it
  reports the smallest timestamp, so a lead that start began is filled up
  to the new filter's first frame however short the rest of it is.
+ .
+ A split behind agapfill can feed an output and such a waiting filter.
+ The output kept giving frames, so send_frame() asked for the whole rest
+ of the gap, and the waiting filter kept every frame of it until the graph
+ was freed: with a gap of 10 minutes, ffmpeg peaked at 232 MB instead of
+ 14 MB. send_frame() now stops asking as soon as one output behind
+ agapfill gives no frame, and the frames agapfill holds become silence as
+ above.
 Author: Streamarr
 Forwarded: no
 Last-Update: 2026-11-12
@@ -115,13 +123,13 @@ Index: FFmpeg/doc/filters.texi
 +Before @command{ffmpeg} frees the old graph, it asks the outputs behind each
 +agapfill filter for frames until the filter has output every frame it has, so
 +a rebuild while the filter writes silence loses neither the rest of the
-+silence nor a sample. No frame comes when a filter behind agapfill waits for
-+another input of the graph, for example @code{amix}. The frames the filter
-+still holds are then lost, and the filter of the new graph writes their time
-+as silence, so the audio after them keeps its own time. Samples that other
-+filters of the old graph hold are lost, as they are without this filter. An
-+output that takes no more frames, for example after @option{-frames}, is not
-+asked.
++silence nor a sample. It stops asking as soon as one of those outputs gives no
++frame, because a filter behind agapfill waits for another input of the graph,
++for example @code{amix}. The frames the filter still holds are then lost, and
++the filter of the new graph writes their time as silence, so the audio after
++them keeps its own time. Samples that other filters of the old graph hold are
++lost, as they are without this filter. An output that takes no more frames,
++for example after @option{-frames}, is not asked.
 +
  @section agate
  
@@ -211,7 +219,7 @@ Index: FFmpeg/fftools/ffmpeg_filter.c
      fgp->is_meta = graph_is_meta(fgt->graph);
  
      /* limit the lists of allowed formats to the ones selected, to
-@@ -3106,6 +3166,117 @@ static const char *unknown_if_null(const
+@@ -3106,6 +3166,126 @@ static const char *unknown_if_null(const
      return str ? str : "unknown";
  }
  
@@ -258,15 +266,16 @@ Index: FFmpeg/fftools/ffmpeg_filter.c
 +           strcmp(pending, "0");
 +}
 +
-+/* Ask each output marked in fed for a frame, then send on what the outputs
-+ * hold. Returns whether a frame came. An output whose consumer has finished,
-+ * for example after -frames, would discard every frame, so it is not asked. */
++/* Ask each output marked in fed for a frame until one gives none, then send
++ * on what the outputs hold. Returns whether every output asked gave a frame,
++ * and 0 when none was asked. An output whose consumer has finished, for
++ * example after -frames, would discard every frame, so it is not asked. */
 +static int pull_frames_behind(FilterGraph *fg, FilterGraphThread *fgt,
 +                              const uint8_t *fed, AVFrame *frame)
 +{
-+    int pulled = 0;
++    int asked = 0, waits = 0;
 +
-+    for (int i = 0; i < fg->nb_outputs; i++) {
++    for (int i = 0; i < fg->nb_outputs && !waits; i++) {
 +        AVFilterContext *sink = fg->outputs[i]->filter;
 +        int ret;
 +
@@ -274,12 +283,13 @@ Index: FFmpeg/fftools/ffmpeg_filter.c
 +            continue;
 +
 +        ret = av_buffersink_get_frame_flags(sink, NULL, AV_BUFFERSINK_FLAG_PEEK);
-+        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
++        if (ret == AVERROR_EOF)
 +            continue;
-+        if (ret < 0)
++        if (ret < 0 && ret != AVERROR(EAGAIN))
 +            return ret;
 +
-+        pulled = 1;
++        asked = 1;
++        waits = ret == AVERROR(EAGAIN);
 +    }
 +
 +    for (int i = 0; i < fg->nb_outputs; i++) {
@@ -292,7 +302,7 @@ Index: FFmpeg/fftools/ffmpeg_filter.c
 +        }
 +    }
 +
-+    return pulled;
++    return asked && !waits;
 +}
 +
 +/**
@@ -300,6 +310,13 @@ Index: FFmpeg/fftools/ffmpeg_filter.c
 + * output asks for, and holds the frame after the gap and the frames behind it
 + * until then. Freeing the graph would take those frames with it. So ask the
 + * outputs for frames until every agapfill filter has output all it has.
++ *
++ * An output gives no frame when a filter behind agapfill waits for another
++ * input of the graph, for example amix. That input cannot arrive before the
++ * graph is rebuilt, so asking the other outputs on would only pile the rest
++ * of the gap up in the waiting filter. The asking stops there, and the filter
++ * of the new graph writes the time of the frames agapfill still holds as
++ * silence: its position leaves them out.
 + */
 +static int finish_gap_fills(FilterGraph *fg, FilterGraphThread *fgt, AVFrame *frame)
 +{
@@ -313,8 +330,8 @@ Index: FFmpeg/fftools/ffmpeg_filter.c
 +            continue;
 +
 +        ret = find_outputs_behind(fg, fgt->graph, i, fed);
-+        /* No frame comes when a filter behind f has ended its output or
-+         * waits for another input, or when no output behind f takes frames. */
++        /* The asking stops when a filter behind f waits for another input,
++         * or when no output behind f takes frames. */
 +        while (ret >= 0 && gap_fill_is_pending(f)) {
 +            ret = pull_frames_behind(fg, fgt, fed, frame);
 +            if (!ret)
@@ -329,7 +346,7 @@ Index: FFmpeg/fftools/ffmpeg_filter.c
  static int send_frame(FilterGraph *fg, FilterGraphThread *fgt,
                        InputFilter *ifilter, AVFrame *frame)
  {
-@@ -3194,6 +3365,8 @@ static int send_frame(FilterGraph *fg, F
+@@ -3194,6 +3374,8 @@ static int send_frame(FilterGraph *fg, F
          }
  
          ret = fgt->graph ? read_frames(fg, fgt, tmp) : 0;
@@ -338,7 +355,7 @@ Index: FFmpeg/fftools/ffmpeg_filter.c
          av_frame_free(&tmp);
          if (ret < 0)
              return ret;
-@@ -3226,6 +3399,10 @@ static int send_frame(FilterGraph *fg, F
+@@ -3226,6 +3408,10 @@ static int send_frame(FilterGraph *fg, F
              if (reason.len > 1)
                  reason.str[reason.len - 2] = '\0'; // remove last comma
              av_log(fg, AV_LOG_INFO, "Reconfiguring filter graph%s%s\n", reason.len ? " because " : "", reason.str);
@@ -349,7 +366,7 @@ Index: FFmpeg/fftools/ffmpeg_filter.c
          } else {
              /* Choke all input to avoid buffering excessive frames while the
               * initial filter graph is being configured, and before we have a
-@@ -3291,6 +3468,7 @@ static void fg_thread_uninit(FilterGraph
+@@ -3291,6 +3477,7 @@ static void fg_thread_uninit(FilterGraph
      av_frame_free(&fgt->frame);
      av_freep(&fgt->eof_in);
      av_freep(&fgt->eof_out);
