@@ -111,3 +111,4 @@ streamarr-0006-keep-one-dolby-vision-mapping-in-tonemapx.patch
 streamarr-0007-build-one-input-format-list-in-tonemapx.patch
 streamarr-0010-apply-the-rpu-linear-matrix-before-lms-to-rgb.patch
 streamarr-0011-reshape-with-mmr-from-the-base-layer-values.patch
+streamarr-0012-round-10-bit-samples-on-the-tonemapx-neon-path.patch
