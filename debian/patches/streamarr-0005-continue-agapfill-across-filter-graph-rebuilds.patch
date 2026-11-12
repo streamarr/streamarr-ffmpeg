@@ -16,6 +16,12 @@ Description: fftools/ffmpeg_filter: continue the output of agapfill when a filte
  silence. That is the case after a seek whose discarded frames hold the
  change.
  .
+ Filter names differ when their case does, but the positions were noted
+ in a dictionary whose keys matched regardless of case. The position of
+ agapfill@A replaced that of agapfill@a, so agapfill@a of the new graph
+ started from nothing, and the source above came out as 19.07 s again.
+ The positions now match by case.
+ .
  resume counts the position in the new graph's sample rate. When the rate
  rises, a position near the end of the 64-bit range can pass it, and
  av_rescale_q_rnd() then answers INT64_MIN, which means no timestamp. A
@@ -113,7 +119,7 @@ Index: FFmpeg/fftools/ffmpeg_filter.c
  } FilterGraphThread;
  
  typedef struct InputFilterPriv {
-@@ -2077,6 +2081,56 @@ static int graph_is_meta(AVFilterGraph *
+@@ -2077,6 +2081,57 @@ static int graph_is_meta(AVFilterGraph *
      return 1;
  }
  
@@ -135,8 +141,9 @@ Index: FFmpeg/fftools/ffmpeg_filter.c
 +            continue;
 +
 +        ret = avfilter_process_command(f, "position", NULL, position, sizeof(position), 0);
++        /* Two filters may have names that differ only in case. */
 +        if (ret >= 0 && position[0])
-+            ret = av_dict_set(positions, f->name, position, 0);
++            ret = av_dict_set(positions, f->name, position, AV_DICT_MATCH_CASE);
 +        if (ret < 0)
 +            return ret;
 +    }
@@ -170,7 +177,7 @@ Index: FFmpeg/fftools/ffmpeg_filter.c
  static int sub2video_frame(InputFilter *ifilter, AVFrame *frame, int buffer);
  
  static int configure_filtergraph(FilterGraph *fg, FilterGraphThread *fgt)
-@@ -2160,6 +2214,11 @@ static int configure_filtergraph(FilterG
+@@ -2160,6 +2215,11 @@ static int configure_filtergraph(FilterG
      if ((ret = avfilter_graph_config(fgt->graph, NULL)) < 0)
          goto fail;
  
@@ -182,7 +189,7 @@ Index: FFmpeg/fftools/ffmpeg_filter.c
      fgp->is_meta = graph_is_meta(fgt->graph);
  
      /* limit the lists of allowed formats to the ones selected, to
-@@ -3106,6 +3165,117 @@ static const char *unknown_if_null(const
+@@ -3106,6 +3166,117 @@ static const char *unknown_if_null(const
      return str ? str : "unknown";
  }
  
@@ -300,7 +307,7 @@ Index: FFmpeg/fftools/ffmpeg_filter.c
  static int send_frame(FilterGraph *fg, FilterGraphThread *fgt,
                        InputFilter *ifilter, AVFrame *frame)
  {
-@@ -3194,6 +3364,8 @@ static int send_frame(FilterGraph *fg, F
+@@ -3194,6 +3365,8 @@ static int send_frame(FilterGraph *fg, F
          }
  
          ret = fgt->graph ? read_frames(fg, fgt, tmp) : 0;
@@ -309,7 +316,7 @@ Index: FFmpeg/fftools/ffmpeg_filter.c
          av_frame_free(&tmp);
          if (ret < 0)
              return ret;
-@@ -3226,6 +3398,10 @@ static int send_frame(FilterGraph *fg, F
+@@ -3226,6 +3399,10 @@ static int send_frame(FilterGraph *fg, F
              if (reason.len > 1)
                  reason.str[reason.len - 2] = '\0'; // remove last comma
              av_log(fg, AV_LOG_INFO, "Reconfiguring filter graph%s%s\n", reason.len ? " because " : "", reason.str);
@@ -320,7 +327,7 @@ Index: FFmpeg/fftools/ffmpeg_filter.c
          } else {
              /* Choke all input to avoid buffering excessive frames while the
               * initial filter graph is being configured, and before we have a
-@@ -3291,6 +3467,7 @@ static void fg_thread_uninit(FilterGraph
+@@ -3291,6 +3468,7 @@ static void fg_thread_uninit(FilterGraph
      av_frame_free(&fgt->frame);
      av_freep(&fgt->eof_in);
      av_freep(&fgt->eof_out);

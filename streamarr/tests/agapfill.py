@@ -1001,6 +1001,17 @@ def seek_past_graph_rebuild(ffmpeg):
     return rebuild_problems(ffmpeg, hole=3, start=1, seek=6)
 
 
+@check("case-distinct-names-at-graph-rebuild", "continues each of two filters whose names differ "
+       "only in case when ffmpeg rebuilds the filter graph")
+def case_distinct_names_at_graph_rebuild(ffmpeg):
+    # The audio of graph-rebuild through two fills one after the other, named agapfill@a and
+    # agapfill@A. Filter names differ when their case does, and ffmpeg notes where each filter
+    # stood by its name. Unless the two notes stay apart, one filter of the new graph starts
+    # afresh and writes silence from zero a second time.
+    return rebuild_problems(ffmpeg, hole=0, ahead="asetpts=PTS+%d" % (2 * SECOND), start=0,
+                            names=("agapfill@a", "agapfill@A"))
+
+
 @check("rate-rise-at-graph-rebuild-past-the-range", "keeps every sample and writes no silence when "
        "the sample rate rises at a rebuild where the new rate cannot reach the old position")
 def rate_rise_past_the_range(ffmpeg):
