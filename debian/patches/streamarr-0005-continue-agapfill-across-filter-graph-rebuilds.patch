@@ -92,7 +92,7 @@ Index: FFmpeg/fftools/ffmpeg_filter.c
  } FilterGraphThread;
  
  typedef struct InputFilterPriv {
-@@ -2075,6 +2079,56 @@ static int graph_is_meta(AVFilterGraph *
+@@ -2077,6 +2081,56 @@ static int graph_is_meta(AVFilterGraph *
      return 1;
  }
  
@@ -149,7 +149,7 @@ Index: FFmpeg/fftools/ffmpeg_filter.c
  static int sub2video_frame(InputFilter *ifilter, AVFrame *frame, int buffer);
  
  static int configure_filtergraph(FilterGraph *fg, FilterGraphThread *fgt)
-@@ -2158,6 +2212,11 @@ static int configure_filtergraph(FilterG
+@@ -2160,6 +2214,11 @@ static int configure_filtergraph(FilterG
      if ((ret = avfilter_graph_config(fgt->graph, NULL)) < 0)
          goto fail;
  
@@ -161,7 +161,7 @@ Index: FFmpeg/fftools/ffmpeg_filter.c
      fgp->is_meta = graph_is_meta(fgt->graph);
  
      /* limit the lists of allowed formats to the ones selected, to
-@@ -3104,6 +3163,90 @@ static const char *unknown_if_null(const
+@@ -3106,6 +3165,90 @@ static const char *unknown_if_null(const
      return str ? str : "unknown";
  }
  
@@ -252,7 +252,7 @@ Index: FFmpeg/fftools/ffmpeg_filter.c
  static int send_frame(FilterGraph *fg, FilterGraphThread *fgt,
                        InputFilter *ifilter, AVFrame *frame)
  {
-@@ -3192,6 +3335,8 @@ static int send_frame(FilterGraph *fg, F
+@@ -3194,6 +3337,8 @@ static int send_frame(FilterGraph *fg, F
          }
  
          ret = fgt->graph ? read_frames(fg, fgt, tmp) : 0;
@@ -261,7 +261,7 @@ Index: FFmpeg/fftools/ffmpeg_filter.c
          av_frame_free(&tmp);
          if (ret < 0)
              return ret;
-@@ -3224,6 +3369,10 @@ static int send_frame(FilterGraph *fg, F
+@@ -3226,6 +3371,10 @@ static int send_frame(FilterGraph *fg, F
              if (reason.len > 1)
                  reason.str[reason.len - 2] = '\0'; // remove last comma
              av_log(fg, AV_LOG_INFO, "Reconfiguring filter graph%s%s\n", reason.len ? " because " : "", reason.str);
@@ -272,7 +272,7 @@ Index: FFmpeg/fftools/ffmpeg_filter.c
          } else {
              /* Choke all input to avoid buffering excessive frames while the
               * initial filter graph is being configured, and before we have a
-@@ -3289,6 +3438,7 @@ static void fg_thread_uninit(FilterGraph
+@@ -3291,6 +3440,7 @@ static void fg_thread_uninit(FilterGraph
      av_frame_free(&fgt->frame);
      av_freep(&fgt->eof_in);
      av_freep(&fgt->eof_out);

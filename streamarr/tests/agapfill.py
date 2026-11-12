@@ -1012,6 +1012,18 @@ def rebuild_during_gap_behind_end(ffmpeg):
                         [real(0, 2 * SECOND), silence(10 * SECOND)], after="atrim=end=12")
 
 
+# The audio output takes 20 frames, the 2 s before a gap of 31,000 years, and is then finished. The
+# video keeps its size, so the graph is never rebuilt. Once the video has ended, the finished audio
+# output is the only one left, and the filter writes the gap's silence without new input. Unless
+# ffmpeg returns to its scheduler after each such frame, as it does for apad, it never ends.
+@check("gap-behind-finished-output", "lets ffmpeg end when the only output left behind the filter "
+       "takes no more frames")
+def gap_behind_finished_output(ffmpeg):
+    shape = chain(frames(4800), drop((21, 399)), stamp("PTS+48000*1e12*gte(N,96000)"))
+    return beside_video(ffmpeg, shape, "", 0, [real(0, 2 * SECOND)], audio_frames=20,
+                        sizes=STEADY_SIZE)
+
+
 # The audio output takes 20 frames, the 2 s before a gap of 31,000 years, and is then finished. One
 # last frame follows the gap. No filter ends. Unless ffmpeg stops asking an output that is finished
 # for frames, it writes the whole gap before it builds the new graph, and it never ends.

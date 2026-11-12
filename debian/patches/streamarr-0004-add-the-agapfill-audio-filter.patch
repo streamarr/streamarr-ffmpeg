@@ -22,6 +22,15 @@ Description: avfilter: add agapfill, which fills gaps between audio frames with 
  asks for a frame, so memory does not grow with the gap. max_gap makes a
  longer gap an error.
  .
+ Like apad, the filter outputs frames without new input while it writes
+ a gap. ffmpeg's read_frames() returns to the scheduler after each step
+ only for a graph that it counts as having a source, and only the
+ scheduler can end a graph whose outputs are all finished. A graph with
+ agapfill was not counted. Once the video of such a graph had ended, an
+ audio output finished by -frames:a kept read_frames() writing the rest
+ of the gap for nothing, and a gap of 31,000 years never ended. ffmpeg
+ now counts agapfill as it counts apad.
+ .
  streamarr/tests/agapfill.py checks the filter.
 Author: Streamarr
 Forwarded: no
@@ -128,6 +137,23 @@ Index: FFmpeg/doc/filters.texi
  @section agate
  
  A gate is mainly used to reduce lower parts of a signal. This kind of signal
+Index: FFmpeg/fftools/ffmpeg_filter.c
+===================================================================
+--- FFmpeg.orig/fftools/ffmpeg_filter.c
++++ FFmpeg/fftools/ffmpeg_filter.c
+@@ -1145,9 +1145,11 @@ int fg_create(FilterGraph **pfg, char **
+ 
+     for (unsigned i = 0; i < graph->nb_filters; i++) {
+         const AVFilter *f = graph->filters[i]->filter;
++        /* apad and agapfill output frames without new input, so the
++         * scheduler must get control back after each one to end the graph. */
+         if ((!avfilter_filter_pad_count(f, 0) &&
+              !(f->flags & AVFILTER_FLAG_DYNAMIC_INPUTS)) ||
+-            !strcmp(f->name, "apad")) {
++            !strcmp(f->name, "apad") || !strcmp(f->name, "agapfill")) {
+             fgp->have_sources = 1;
+             break;
+         }
 Index: FFmpeg/libavfilter/Makefile
 ===================================================================
 --- FFmpeg.orig/libavfilter/Makefile
