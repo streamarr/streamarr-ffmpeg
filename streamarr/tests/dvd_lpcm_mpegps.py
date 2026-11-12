@@ -30,6 +30,7 @@ Exits 0 when every check passes, 1 when one fails, 2 when FFmpeg fails.
 """
 import argparse
 import array
+import collections
 import os
 import resource
 import subprocess
@@ -131,12 +132,14 @@ def pes_body(data, position):
     return body + 1
 
 
-def lpcm_payloads(vob):
-    """The (frame count, first access unit pointer, payload) of every LPCM packet, in order, in
-    an MPEG-2 program stream or an MPEG-1 system stream."""
+LpcmPacket = collections.namedtuple("LpcmPacket", "frames pointer payload")
+
+
+def lpcm_packets(vob):
+    """Every LPCM packet, in order, of an MPEG-2 program stream or an MPEG-1 system stream."""
     with open(vob, "rb") as source:
         data = source.read()
-    payloads = []
+    packets = []
     position = 0
     while position + 4 <= len(data):
         if data[position:position + 3] != b"\x00\x00\x01":
@@ -154,20 +157,21 @@ def lpcm_payloads(vob):
         if stream_id == 0xBD:
             body = pes_body(data, position)
             if 0xA0 <= data[body] <= 0xAF:
-                pointer = int.from_bytes(data[body + 2:body + 4], "big")
-                payloads.append((data[body + 1], pointer, data[body + 7:end]))
+                packets.append(LpcmPacket(
+                    frames=data[body + 1], pointer=int.from_bytes(data[body + 2:body + 4], "big"),
+                    payload=data[body + 7:end]))
         position = end
-    return payloads
+    return packets
 
 
 def misaligned_payloads(vob, bits, channels):
     block = block_size(bits, channels)
     offset = misaligned = 0
-    payloads = lpcm_payloads(vob)
-    for _, _, payload in payloads:
+    packets = lpcm_packets(vob)
+    for packet in packets:
         misaligned += offset % block != 0
-        offset += len(payload)
-    return misaligned, len(payloads)
+        offset += len(packet.payload)
+    return misaligned, len(packets)
 
 
 def decoded_rows(ffmpeg, vob, bits, channels, seek):
