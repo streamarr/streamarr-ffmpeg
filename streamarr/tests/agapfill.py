@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Checks that agapfill writes a continuous audio timeline and keeps every real sample in place.
+"""Checks that agapfill fills every gap in an audio timeline and keeps every real sample in place.
 
     python3 streamarr/tests/agapfill.py --ffmpeg PATH [--only NAME ...] [--list]
 
@@ -9,19 +9,22 @@ so each output sample is either one source sample or silence. Filters ahead of a
 in the source (aselect) or change its timestamps (asetpts). ashowinfo after agapfill reports the
 timestamp and length of every frame, and FFmpeg writes the samples as raw PCM.
 
-Each check states the timeline it expects: the first timestamp, then runs of source samples and
-of silence. The expectations come from the rules the filter documents, not from its output:
+Each check states the timeline it expects: the first timestamp, then runs of source samples, of
+silence and of steps, where the timestamps move with no sample between. The expectations come
+from the rules the filter documents, not from its output:
 
-    1. Output is continuous. Each frame begins where the previous frame ends.
+    1. Each frame begins where the previous frame ends, moved by the step that rule 3 passes on.
     2. A forward step between two frames that is longer than `threshold` (2 ms) is a gap. The
        filter writes silence up to the later frame's own timestamp.
-    3. Any other step, an overlap and a backward step included, writes no silence and drops no
-       sample. The frame follows the previous frame directly.
-    4. `start` puts silence from that time up to the first frame.
-    5. Silence comes one frame of `packet_size` samples at a time, so memory does not grow with
+    3. A step at or under `threshold`, forward or backward, passes through: the output takes the
+       same step, so the frame keeps its own timestamp, as it does without the filter.
+    4. A longer overlap or backward step writes no silence and drops no sample. The frame follows
+       the previous frame directly.
+    5. `start` puts silence from that time up to the first frame.
+    6. Silence comes one frame of `packet_size` samples at a time, so memory does not grow with
        the gap, and a gap longer than `max_gap` is an error.
-    6. When ffmpeg builds a new filter graph mid-stream, the new graph's filter continues the
-       output of the old one, so rules 1 to 4 hold across the change. The old one first outputs
+    7. When ffmpeg builds a new filter graph mid-stream, the new graph's filter continues the
+       output of the old one, so rules 1 to 5 hold across the change. The old one first outputs
        every frame it has. When a filter behind it waits for another input of the graph, the
        real audio the old one still holds becomes silence instead, and what the waiting filter
        holds is lost.
@@ -31,6 +34,7 @@ Exits 0 when every check passes, 1 when one fails, 2 when a fixture is unusable.
 import argparse
 import array
 import io
+import math
 import os
 import re
 import resource
@@ -452,29 +456,66 @@ timeline_check("gap-of-30-ms", "fills a gap of 30 ms",
 
 # --- The threshold decides each step by itself --------------------------------------------------
 
-timeline_check("step-of-1-ms", "writes no silence for a step of 1 ms",
-               chain(frames(480), stamp("PTS+48*gte(N,288000)")), "", 0,
-               [real(0, 10 * SECOND)], count=10 * SECOND)
+def own_times(stamps, length, count):
+    """The first timestamp and the runs of `count` source samples in frames of `length`, the frame
+    that begins with source sample n stamped stamps(n), when no step between two frames is longer
+    than the threshold: by rule 3 each frame keeps its own timestamp."""
+    runs, end = [], None
+    for first in range(0, count, length):
+        pts, size = stamps(first), min(length, count - first)
+        if end is not None and pts != end:
+            runs.append(step(pts - end))
+        runs.append(real(first, size))
+        end = pts + size
+    return stamps(0), runs
 
-timeline_check("step-of-2-ms", "writes no silence for a step of exactly 2 ms, the threshold",
+
+def stepping(first, count, every, size):
+    """`count` source samples from `first`, their timestamps moved by `size` more after every
+    `every` samples, as runs that keep each sample at its own timestamp."""
+    runs = []
+    for at in range(first, first + count, every):
+        if at != first:
+            runs.append(step(size))
+        runs.append(real(at, min(every, first + count - at)))
+    return runs
+
+
+timeline_check("step-of-1-ms", "passes a step of 1 ms through and writes no silence",
+               chain(frames(480), stamp("PTS+48*gte(N,288000)")), "", 0,
+               [real(0, 288000), step(48), real(288000, 192000)], count=10 * SECOND)
+
+timeline_check("step-of-2-ms", "passes a step of exactly 2 ms, the threshold, through",
                chain(frames(480), stamp("PTS+96*gte(N,288000)")), "", 0,
+               [real(0, 288000), step(96), real(288000, 192000)], count=10 * SECOND)
+
+timeline_check("backward-step-of-1-ms", "passes a backward step of 1 ms through and drops nothing",
+               chain(frames(480), stamp("PTS-48*gte(N,288000)")), "", 0,
+               [real(0, 288000), step(-48), real(288000, 192000)], count=10 * SECOND)
+
+timeline_check("backward-step-of-2-ms", "passes a backward step of exactly 2 ms, the threshold, "
+               "through", chain(frames(480), stamp("PTS-96*gte(N,288000)")), "", 0,
+               [real(0, 288000), step(-96), real(288000, 192000)], count=10 * SECOND)
+
+timeline_check("backward-step-above-2-ms", "joins a backward step one sample longer than 2 ms",
+               chain(frames(480), stamp("PTS-97*gte(N,288000)")), "", 0,
                [real(0, 10 * SECOND)], count=10 * SECOND)
 
 timeline_check("step-above-2-ms", "fills a step one sample longer than 2 ms",
                chain(frames(480), stamp("PTS+97*gte(N,288000)")), "", 0,
                [real(0, 288000), silence(97), real(288000, 192000)], count=10 * SECOND)
 
-timeline_check("step-of-88-samples-at-44100", "writes no silence for 88 samples at 44.1 kHz, "
-               "which is below 2 ms", chain(frames(441), stamp("PTS+88*gte(N,264600)")), "", 0,
-               [real(0, 441000)], count=441000, rate=44100)
+timeline_check("step-of-88-samples-at-44100", "passes 88 samples at 44.1 kHz, which is below 2 ms, "
+               "through", chain(frames(441), stamp("PTS+88*gte(N,264600)")), "", 0,
+               [real(0, 264600), step(88), real(264600, 176400)], count=441000, rate=44100)
 
 timeline_check("step-of-89-samples-at-44100", "fills 89 samples at 44.1 kHz, which is above 2 ms",
                chain(frames(441), stamp("PTS+89*gte(N,264600)")), "", 0,
                [real(0, 264600), silence(89), real(264600, 176400)], count=441000, rate=44100)
 
-timeline_check("threshold-option-step-at", "writes no silence for a step equal to threshold=0.01",
+timeline_check("threshold-option-step-at", "passes a step equal to threshold=0.01 through",
                chain(frames(480), stamp("PTS+480*gte(N,288000)")), "threshold=0.01", 0,
-               [real(0, 10 * SECOND)], count=10 * SECOND)
+               [real(0, 288000), step(480), real(288000, 192000)], count=10 * SECOND)
 
 timeline_check("threshold-option-step-above", "fills a step one sample above threshold=0.01",
                chain(frames(480), stamp("PTS+481*gte(N,288000)")), "threshold=0.01", 0,
@@ -484,16 +525,30 @@ timeline_check("threshold-of-zero", "fills a step of one sample with threshold=0
                chain(frames(480), stamp("PTS+gte(N,288000)")), "threshold=0", 0,
                [real(0, 288000), silence(1), real(288000, 192000)], count=10 * SECOND)
 
-timeline_check("small-steps-do-not-add-up", "writes no silence for nine steps of 2 ms, 18 ms in all",
-               chain(frames(4800), stamp("PTS+96*floor(N/48000)")), "", 0,
-               [real(0, 10 * SECOND)], count=10 * SECOND)
+timeline_check("small-steps-do-not-add-up", "passes nine steps of 2 ms, 18 ms in all, through and "
+               "writes no silence", chain(frames(4800), stamp("PTS+96*floor(N/48000)")), "", 0,
+               stepping(0, 10 * SECOND, SECOND, 96), count=10 * SECOND)
 
-# The five small steps before the gap leave the output 480 samples behind the timestamps. The fill
-# covers them too, so the first sample after the gap is at its own time, 14 s plus 14 steps.
-timeline_check("gap-after-small-steps", "fills a gap up to the next frame's own timestamp",
-               chain(frames(4800), stamp("PTS+96*floor(N/48000)"), drop((60, 139))), "", 0,
-               [real(0, 288000), silence(673344 - 288000), real(672000, 480000)],
-               count=24 * SECOND)
+# The five small steps before the gap keep the output at the timestamps, so the gap's silence is
+# the step alone: from 6 s plus five steps to 14 s plus fourteen steps.
+timeline_check("gap-after-small-steps", "fills a gap up to the next frame's own timestamp after "
+               "small forward steps", chain(frames(4800), stamp("PTS+96*floor(N/48000)"),
+                                            drop((60, 139))), "", 0,
+               stepping(0, 288000, SECOND, 96) + [silence(673344 - 288480)]
+               + stepping(672000, 480000, SECOND, 96), count=24 * SECOND)
+
+timeline_check("gap-after-small-backward-steps", "fills a gap up to the next frame's own timestamp "
+               "after small backward steps", chain(frames(4800), stamp("PTS-96*floor(N/48000)"),
+                                                   drop((60, 139))), "", 0,
+               stepping(0, 288000, SECOND, -96) + [silence(670656 - 287520)]
+               + stepping(672000, 480000, SECOND, -96), count=24 * SECOND)
+
+# After the overlap the output is 2,400 samples later than the timestamps, and the step of 1 ms
+# moves it by 1 ms alone. Put at its own timestamp, the frame at 6 s would step back by 2,352
+# samples and undo the joined overlap.
+timeline_check("small-step-after-overlap", "passes a small step after an overlap that it joined by "
+               "the step alone", chain(frames(480), stamp("PTS-2400*gte(N,144000)+48*gte(N,288000)")),
+               "", 0, [real(0, 288000), step(48), real(288000, 192000)], count=10 * SECOND)
 
 # --- Real audio is never trimmed ----------------------------------------------------------------
 
@@ -517,21 +572,22 @@ timeline_check("gap-shorter-than-overlap", "writes no silence and drops nothing 
                chain(frames(480), stamp("PTS-2400*gte(N,144000)"), drop((600, 602))), "", 0,
                [real(0, 288000), real(289440, 190560)], count=10 * SECOND)
 
-timeline_check("timestamps-run-fast", "inserts nothing when timestamps run 0.02 % fast",
-               chain(frames(4800), stamp("floor(PTS*1.0002)")), "", 0,
-               [real(0, 24 * SECOND)], count=24 * SECOND)
+# asetpts counts in doubles, and so does Python, so the timestamps below are the ones it writes.
+timeline_check("timestamps-run-fast", "keeps every frame at its own timestamp and inserts nothing "
+               "when timestamps run 0.02 % fast", chain(frames(4800), stamp("floor(PTS*1.0002)")), "",
+               *own_times(lambda n: math.floor(n * 1.0002), 4800, 24 * SECOND), count=24 * SECOND)
 
-timeline_check("timestamps-run-slow", "drops nothing when timestamps run 0.02 % slow",
-               chain(frames(4800), stamp("floor(PTS*0.9998)")), "", 0,
-               [real(0, 24 * SECOND)], count=24 * SECOND)
+timeline_check("timestamps-run-slow", "keeps every frame at its own timestamp and drops nothing "
+               "when timestamps run 0.02 % slow", chain(frames(4800), stamp("floor(PTS*0.9998)")), "",
+               *own_times(lambda n: math.floor(n * 0.9998), 4800, 24 * SECOND), count=24 * SECOND)
 
-# Timestamps step forward by 2 ms at 1 s, so the output is 96 samples behind them. The frames from
-# 2 s to 4 s have no timestamp. The frame at 4 s continues the timestamps from before 2 s. Unless
-# the frames without a timestamp count toward the end of the previous frame, it looks like a gap.
+# Timestamps step forward by 2 ms at 1 s, and the output takes that step. The frames from 2 s to
+# 4 s have no timestamp. The frame at 4 s continues the timestamps from before 2 s. Unless the
+# frames without a timestamp count toward the end of the previous frame, it looks like a gap.
 timeline_check("frames-without-timestamp", "places frames without a timestamp after the previous "
                "frame", chain(frames(4800),
                               stamp("if(between(N,96000,191999),NAN,PTS+96*gte(N,48000))")),
-               "", 0, [real(0, 10 * SECOND)], count=10 * SECOND)
+               "", 0, [real(0, SECOND), step(96), real(SECOND, 9 * SECOND)], count=10 * SECOND)
 
 # --- Silence before audio that starts late ------------------------------------------------------
 
@@ -675,9 +731,11 @@ def end_of_timestamp_range(ffmpeg):
 
 # --- Time bases ---------------------------------------------------------------------------------
 
-timeline_check("millisecond-time-base", "inserts nothing when timestamps are rounded to 1 ms",
-               chain(frames(1024), "asettb=1/1000"), "", 0, [real(0, 10 * SECOND)],
-               count=10 * SECOND)
+# asettb rounds each timestamp to the nearest millisecond, which is 48 whole samples. Frames of
+# 1,024 samples, 21.333 ms, then step by -16 or +32 samples.
+timeline_check("millisecond-time-base", "passes timestamps rounded to 1 ms through unchanged and "
+               "inserts nothing", chain(frames(1024), "asettb=1/1000"), "",
+               *own_times(lambda n: 48 * ((n + 24) // 48), 1024, 10 * SECOND), count=10 * SECOND)
 
 timeline_check("millisecond-time-base-gap", "fills a gap exactly when timestamps are in 1 ms",
                chain(EIGHT_SECOND_GAP, "asettb=1/1000"), "", 0, EIGHT_SECOND_TIMELINE,
@@ -722,10 +780,11 @@ def gap_of_two_hours(ffmpeg):
 
 # --- With an encoder that takes frames of a fixed length ----------------------------------------
 
-def decoded(ffmpeg, path, counter):
-    """Decodes a file to (frames, samples) with the timestamps the decoder gives."""
+def decoded(ffmpeg, path, counter, filters="anull"):
+    """Decodes a file through `filters` to (frames, samples) with the timestamps they come out
+    with."""
     command = [ffmpeg, "-nostdin", "-hide_banner", "-nostats", "-v", "info", "-i", path,
-               "-af", "ashowinfo", "-c:a", counter.codec, "-f", counter.raw, "-"]
+               "-af", chain(filters, "ashowinfo"), "-c:a", counter.codec, "-f", counter.raw, "-"]
     done = execute(command, lambda out: out.read())
     if done.code:
         raise Unusable("FFmpeg could not decode %s: %s" % (path, last_lines(done.log)))
@@ -789,6 +848,56 @@ def flac_frames(ffmpeg):
 
     return (check_frames(frame_list, 0, runs, 4608, RATE)
             + compare_samples(Bytes(samples), 0, runs, counter, RATE))
+
+
+# --- The same timestamps as without the filter --------------------------------------------------
+
+def unfilled_problems(ffmpeg, stamps):
+    """Writes 60 s of the counter to Matroska in frames of 1,024 samples, stamped by `stamps`, and
+    decodes it with and without agapfill=start=0, as an encode does. Matroska keeps whole
+    milliseconds, and ffmpeg's decoder takes their rounding out where it can, so a step of 1 ms
+    reaches the filter as one or more steps of up to about 1 ms. With no gap, every frame must
+    come out with the timestamp and the samples it has without the filter."""
+    counter = COUNTERS["s16"]
+    with tempfile.TemporaryDirectory() as work:
+        path = os.path.join(work, "drift.mkv")
+        made = execute([ffmpeg, "-nostdin", "-hide_banner", "-v", "error", "-f", "lavfi", "-i",
+                        counter.lavfi(60 * SECOND, RATE), "-af", chain(frames(1024), stamp(stamps)),
+                        "-c:a", counter.codec, "-f", "matroska", "-y", path])
+        if made.code:
+            raise Unusable("FFmpeg could not write the audio: %s" % last_lines(made.log))
+        plain, plain_samples = decoded(ffmpeg, path, counter)
+        filled, filled_samples = decoded(ffmpeg, path, counter, "agapfill=start=0")
+    steps = [after - before - length for (before, length, _, _), (after, _, _, _)
+             in zip(plain, plain[1:]) if after != before + length]
+    if len(steps) < 5 or any(abs(size) > 2 * RATE // 1000 for size in steps):
+        raise Unusable("without the filter the decode steps by %s samples, expected at least 5 "
+                       "steps of at most 2 ms" % steps)
+    problems = []
+    moved = [(want[0], got[0]) for want, got in zip(plain, filled) if want[:2] != got[:2]]
+    if moved or len(plain) != len(filled):
+        first = ""
+        if moved:
+            first = ": first the frame stamped %d without the filter, %s with it" % moved[0]
+        problems.append("%d of %d frames differ from the decode without the filter, which has %d "
+                        "frames%s" % (len(moved), len(filled), len(plain), first))
+    if filled_samples != plain_samples:
+        problems.append("the samples differ from the decode without the filter")
+    return problems
+
+
+# The timestamps step 1 ms forward every 5 s, as audio that runs 0.02 % fast does.
+@check("fast-drift-as-without-the-filter", "gives every frame the timestamp a decode without it "
+       "gives when Matroska timestamps step 1 ms forward every 5 s")
+def fast_drift_as_without_the_filter(ffmpeg):
+    return unfilled_problems(ffmpeg, "PTS+48*floor(N/240000)")
+
+
+# The timestamps step 1 ms back every 5 s, as audio that runs 0.02 % slow does.
+@check("slow-drift-as-without-the-filter", "gives every frame the timestamp a decode without it "
+       "gives when Matroska timestamps step 1 ms back every 5 s")
+def slow_drift_as_without_the_filter(ffmpeg):
+    return unfilled_problems(ffmpeg, "PTS-48*floor(N/240000)")
 
 
 # --- With a rate conversion after the fill ------------------------------------------------------
@@ -979,7 +1088,7 @@ timeline_check("resume-command-before-the-range", "stops a position that its own
 # --- When ffmpeg rebuilds the filter graph ------------------------------------------------------
 
 def timeline_by_the_rules(frame_list, start=None, threshold=RATE * 2 // 1000):
-    """The first timestamp and the runs that rules 1 to 4 give for input frames."""
+    """The first timestamp and the runs that rules 1 to 5 give for input frames."""
     runs, first, position, end, taken = [], None, None, None, 0
     for pts, length, _, _ in frame_list:
         quiet = 0
@@ -988,6 +1097,9 @@ def timeline_by_the_rules(frame_list, start=None, threshold=RATE * 2 // 1000):
             quiet = pts - position
         elif pts - end > threshold:
             quiet = max(pts - position, 0)
+        elif pts != end and end - pts <= threshold:
+            runs.append(step(pts - end))
+            position += pts - end
         if quiet:
             runs.append(silence(quiet))
         runs.append(("input", taken, length))
@@ -1090,6 +1202,20 @@ def overlap_at_graph_rebuild(ffmpeg):
     return rebuild_problems(ffmpeg, hole=-0.024)
 
 
+@check("short-step-at-graph-rebuild", "passes a step of 1 ms that falls where ffmpeg rebuilds the "
+       "filter graph through")
+def short_step_at_graph_rebuild(ffmpeg):
+    # The stereo part is stamped 1 ms after the 5.1 part ends. Unless the new graph's filter takes
+    # the step from where the old one's input ended, the stereo part leaves its own time.
+    return rebuild_problems(ffmpeg, hole=0.001)
+
+
+@check("short-overlap-at-graph-rebuild", "passes an overlap of 1 ms that falls where ffmpeg "
+       "rebuilds the filter graph through")
+def short_overlap_at_graph_rebuild(ffmpeg):
+    return rebuild_problems(ffmpeg, hole=-0.001)
+
+
 @check("gap-at-graph-rebuild", "fills a gap that falls where ffmpeg rebuilds the filter graph")
 def gap_at_graph_rebuild(ffmpeg):
     # The stereo part is stamped 3 s after the 5.1 part ends. Only the old graph's filter knows
@@ -1154,7 +1280,8 @@ def rate_rise_past_the_range(ffmpeg):
     # position is past the largest timestamp. Unless the new graph's filter stops the position
     # there, it wraps to the smallest timestamp, and the first 48 kHz frame looks like a gap that
     # never ends. The second part is a backward step, so the output is the audio without the fill.
-    # asetpts rounds the late timestamps to 1,024 samples, and threshold=0.03 joins those steps.
+    # asetpts rounds the late timestamps to 1,024 samples, and threshold=0.03 passes those steps
+    # through instead of filling them.
     late = stamp("PTS+%d*eq(SR,44100)" % FAR)
     with tempfile.TemporaryDirectory() as work:
         source = ac3_parts(ffmpeg, work, [("stereo", 44100, 0), ("stereo", RATE, 0)])
@@ -1434,7 +1561,7 @@ def held_problems(frame_list, data, counter, gap, end, lost=0, begin=0):
 
     `gap` is (first, last, source): the gap runs from timestamp first to timestamp last, and the
     sample stamped last is source sample `source`. The output begins at `begin`, and before the
-    gap each sample is the source sample its timestamp names. By rule 6 the real audio the fill
+    gap each sample is the source sample its timestamp names. By rule 7 the real audio the fill
     still held becomes silence, at most HELD_LIMIT samples, and the audio after it keeps its own
     time up to `end`. When last is `end`, the audio the fill held was the last, and the silence
     runs to the end. The filter behind the fill loses what it held, so the timeline may step
@@ -1516,9 +1643,9 @@ def before_waiting_mixer(ffmpeg, mixer, *, shape, gap, end, ahead="", options="t
     `mixer`, whose other input changes from 5.1 to stereo after 5 s. ffmpeg rebuilds the graph
     there, while the mixer waits for that input. held_problems explains `gap`, `end` and `begin`.
 
-    threshold=20 joins any step shorter than 20 s. However many frames ffmpeg had queued behind the
-    held one, the frame after them follows the old output directly unless the old filter's
-    position leaves out the frames it held.
+    threshold=20 passes any step shorter than 20 s through, so it moves the output by that step
+    alone. However many frames ffmpeg had queued behind the held one, the frame after them lands
+    at its own time only when the old filter's position leaves out the frames it held.
     """
     counter = COUNTERS["s16"]
     with tempfile.TemporaryDirectory() as work:
@@ -1564,8 +1691,8 @@ def rebuild_during_gap_before_mix(ffmpeg):
 # 40 s of audio without a gap, stamped 25 s late. start=10 makes the filter write silence from
 # 10 s, so the rebuild comes at about 15 s, while the filter holds its first frame. The step from
 # start to the new filter's first frame, about 15 s, is shorter than threshold=20. Unless the
-# position says that no frame has left the filter, the new filter joins its first frame to the
-# old output, 10 s early.
+# position says that no frame has left the filter, the new filter passes that step through, and
+# its first frame does not land at its own time.
 @check("rebuild-during-lead-before-mix", "writes the audio it holds as silence and keeps later "
        "audio at its own time when ffmpeg rebuilds the filter graph during the lead while a mix "
        "behind it waits")
