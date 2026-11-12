@@ -170,7 +170,7 @@ Index: FFmpeg/libavfilter/af_agapfill.c
 ===================================================================
 --- /dev/null
 +++ FFmpeg/libavfilter/af_agapfill.c
-@@ -0,0 +1,283 @@
+@@ -0,0 +1,297 @@
 +/*
 + * This file is part of FFmpeg.
 + *
@@ -247,6 +247,20 @@ Index: FFmpeg/libavfilter/af_agapfill.c
 +    if (seconds != limit)
 +        return seconds > limit;
 +    return (samples % rate) * AV_TIME_BASE > (microseconds % AV_TIME_BASE) * rate;
++}
++
++/* A timestamp in the time base from, counted in the time base to. Where no
++ * timestamp in to reaches it, it stops at the largest or the smallest
++ * timestamp, as the output position does. av_rescale_q_rnd() answers
++ * INT64_MIN there, the value that means no timestamp. */
++static int64_t rescale_saturated(int64_t ts, AVRational from, AVRational to,
++                                 enum AVRounding rounding)
++{
++    const int64_t rescaled = av_rescale_q_rnd(ts, from, to, rounding);
++
++    if (rescaled != INT64_MIN)
++        return rescaled;
++    return ts < 0 ? INT64_MIN + 1 : INT64_MAX;
 +}
 +
 +/**

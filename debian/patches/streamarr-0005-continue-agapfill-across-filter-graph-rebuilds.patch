@@ -445,7 +445,7 @@ Index: FFmpeg/libavfilter/af_agapfill.c
      int64_t silence_left;   ///< samples of silence still to write before the held frame
      AVFrame *held;          ///< input frame that waits for the silence before it
  
-@@ -101,6 +106,7 @@ static int place_frame(AVFilterContext *
+@@ -115,6 +120,7 @@ static int place_frame(AVFilterContext *
          if (pts > start)
              silence = av_sat_sub64(pts, start);
          s->out_pos = pts - silence;
@@ -453,7 +453,7 @@ Index: FFmpeg/libavfilter/af_agapfill.c
          s->started = 1;
      } else {
          int64_t step;
-@@ -170,6 +176,7 @@ static int send_held(AVFilterContext *ct
+@@ -184,6 +190,7 @@ static int send_held(AVFilterContext *ct
      frame->duration = frame->nb_samples;
  
      s->out_pos = av_sat_add64(s->out_pos, frame->nb_samples);
@@ -461,7 +461,7 @@ Index: FFmpeg/libavfilter/af_agapfill.c
  
      return ff_filter_frame(ctx->outputs[0], frame);
  }
-@@ -182,7 +189,14 @@ static int activate(AVFilterContext *ctx
+@@ -196,7 +203,14 @@ static int activate(AVFilterContext *ctx
      int64_t pts;
      int ret, status;
  
@@ -477,7 +477,7 @@ Index: FFmpeg/libavfilter/af_agapfill.c
  
      if (!s->held) {
          AVFrame *frame;
-@@ -206,8 +220,12 @@ static int activate(AVFilterContext *ctx
+@@ -220,8 +234,12 @@ static int activate(AVFilterContext *ctx
              if (!ff_outlink_frame_wanted(outlink))
                  return FFERROR_NOT_READY;
              ret = send_silence(ctx);
@@ -492,24 +492,10 @@ Index: FFmpeg/libavfilter/af_agapfill.c
          }
          return send_held(ctx);
      }
-@@ -251,6 +269,79 @@ static int config_output(AVFilterLink *o
+@@ -265,6 +283,68 @@ static int config_output(AVFilterLink *o
      return 0;
  }
  
-+/* A position in samples at the rate from, counted in samples at the rate to.
-+ * Where no timestamp at the rate to reaches it, the position stops at the end
-+ * of the range, as the output position does. av_rescale_q_rnd() answers
-+ * INT64_MIN there, the value that means no timestamp. */
-+static int64_t rescale_position(int64_t position, int from, int to)
-+{
-+    const int64_t rescaled = av_rescale_q_rnd(position, (AVRational){ 1, from },
-+                                              (AVRational){ 1, to }, AV_ROUND_NEAR_INF);
-+
-+    if (rescaled != INT64_MIN)
-+        return rescaled;
-+    return position < 0 ? INT64_MIN + 1 : INT64_MAX;
-+}
-+
 +/**
 + * Continue the output of another agapfill filter, from what its position
 + * command reported. The first frame is then one more step for place_frame.
@@ -518,6 +504,7 @@ Index: FFmpeg/libavfilter/af_agapfill.c
 +{
 +    AVFilterLink *inlink = ctx->inputs[0];
 +    AGapFillContext *s = ctx->priv;
++    const AVRational sample = { 1, inlink->sample_rate };
 +    int64_t out_pos, in_end;
 +    int sample_rate;
 +
@@ -531,8 +518,10 @@ Index: FFmpeg/libavfilter/af_agapfill.c
 +    if (s->started)
 +        return 0;
 +
-+    s->out_pos = rescale_position(out_pos, sample_rate, inlink->sample_rate);
-+    s->in_end  = rescale_position(in_end, sample_rate, inlink->sample_rate);
++    s->out_pos = rescale_saturated(out_pos, (AVRational){ 1, sample_rate }, sample,
++                                   AV_ROUND_NEAR_INF);
++    s->in_end  = rescale_saturated(in_end, (AVRational){ 1, sample_rate }, sample,
++                                   AV_ROUND_NEAR_INF);
 +    s->sent_end = s->in_end;
 +    s->started = 1;
 +
@@ -572,7 +561,7 @@ Index: FFmpeg/libavfilter/af_agapfill.c
  static av_cold void uninit(AVFilterContext *ctx)
  {
      AGapFillContext *s = ctx->priv;
-@@ -272,12 +363,13 @@ static const AVFilterPad agapfill_output
+@@ -286,12 +366,13 @@ static const AVFilterPad agapfill_output
  };
  
  const FFFilter ff_af_agapfill = {
