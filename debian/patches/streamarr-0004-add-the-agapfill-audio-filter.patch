@@ -179,7 +179,7 @@ Index: FFmpeg/libavfilter/af_agapfill.c
 ===================================================================
 --- /dev/null
 +++ FFmpeg/libavfilter/af_agapfill.c
-@@ -0,0 +1,297 @@
+@@ -0,0 +1,320 @@
 +/*
 + * This file is part of FFmpeg.
 + *
@@ -272,6 +272,47 @@ Index: FFmpeg/libavfilter/af_agapfill.c
 +    return ts < 0 ? INT64_MIN + 1 : INT64_MAX;
 +}
 +
++/* The silence that the step from the end of the previous input frame to
++ * input that begins at pts puts before that input. The step alone decides.
++ * Steps below the threshold never add up to a gap, and an overlap or a
++ * backward step trims nothing. */
++static int64_t silence_after_step(AVFilterContext *ctx, int64_t pts)
++{
++    AGapFillContext *s = ctx->priv;
++    const int64_t step = av_sat_sub64(pts, s->in_end);
++
++    if (step > 0 && is_longer(ctx->inputs[0], step, s->threshold))
++        return FFMAX(av_sat_sub64(pts, s->out_pos), 0);
++    if (step)
++        s->nb_joined++;
++    return 0;
++}
++
++/* Owe silence before the input that begins at pts, unless the silence is
++ * longer than max_gap. */
++static int owe_silence(AVFilterContext *ctx, int64_t pts, int64_t silence)
++{
++    AVFilterLink *inlink = ctx->inputs[0];
++    AGapFillContext *s = ctx->priv;
++
++    if (silence && s->max_gap > 0 && is_longer(inlink, silence, s->max_gap)) {
++        av_log(ctx, AV_LOG_ERROR,
++               "The frame at sample %"PRId64" needs %"PRId64" samples of silence "
++               "before it, which is longer than max_gap.\n", pts, silence);
++        return AVERROR(EINVAL);
++    }
++    if (silence) {
++        s->nb_gaps++;
++        s->nb_silence += silence;
++        av_log(ctx, AV_LOG_VERBOSE,
++               "Writing %"PRId64" samples of silence from sample %"PRId64".\n",
++               silence, s->out_pos);
++    }
++    s->silence_left = silence;
++
++    return 0;
++}
++
 +/**
 + * Find where the frame begins on the output timeline and how much silence
 + * the filter writes before the frame. The filter then holds the frame.
@@ -282,6 +323,7 @@ Index: FFmpeg/libavfilter/af_agapfill.c
 +    AGapFillContext *s = ctx->priv;
 +    const AVRational sample = { 1, inlink->sample_rate };
 +    int64_t pts = AV_NOPTS_VALUE, silence = 0;
++    int ret;
 +
 +    if (frame->pts != AV_NOPTS_VALUE)
 +        pts = rescale_saturated(frame->pts, inlink->time_base, sample, AV_ROUND_NEAR_INF);
@@ -299,38 +341,19 @@ Index: FFmpeg/libavfilter/af_agapfill.c
 +        s->out_pos = pts - silence;
 +        s->started = 1;
 +    } else {
-+        int64_t step;
-+
 +        if (pts == AV_NOPTS_VALUE)
 +            pts = s->in_end;
-+        /* The step alone decides. Steps below the threshold never add up to
-+         * a gap, and an overlap or a backward step trims nothing. */
-+        step = av_sat_sub64(pts, s->in_end);
-+        if (step > 0 && is_longer(inlink, step, s->threshold))
-+            silence = FFMAX(av_sat_sub64(pts, s->out_pos), 0);
-+        else if (step)
-+            s->nb_joined++;
++        silence = silence_after_step(ctx, pts);
 +    }
 +
-+    if (silence && s->max_gap > 0 && is_longer(inlink, silence, s->max_gap)) {
-+        av_log(ctx, AV_LOG_ERROR,
-+               "The frame at sample %"PRId64" needs %"PRId64" samples of silence "
-+               "before it, which is longer than max_gap.\n", pts, silence);
-+        return AVERROR(EINVAL);
-+    }
-+    if (silence) {
-+        s->nb_gaps++;
-+        s->nb_silence += silence;
-+        av_log(ctx, AV_LOG_VERBOSE,
-+               "Writing %"PRId64" samples of silence from sample %"PRId64".\n",
-+               silence, s->out_pos);
-+    }
++    ret = owe_silence(ctx, pts, silence);
++    if (ret < 0)
++        return ret;
 +
-+    s->max_offset   = FFMAX(s->max_offset,
-+                            FFABS(av_sat_sub64(av_sat_add64(s->out_pos, silence), pts)));
-+    s->in_end       = av_sat_add64(pts, frame->nb_samples);
-+    s->silence_left = silence;
-+    s->held         = frame;
++    s->max_offset = FFMAX(s->max_offset,
++                          FFABS(av_sat_sub64(av_sat_add64(s->out_pos, silence), pts)));
++    s->in_end     = av_sat_add64(pts, frame->nb_samples);
++    s->held       = frame;
 +
 +    return 0;
 +}
