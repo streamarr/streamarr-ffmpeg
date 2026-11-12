@@ -1112,6 +1112,46 @@ def rate_rise_past_the_range(ffmpeg):
     return []
 
 
+def far_rebuild_problems(ffmpeg, expression):
+    """rebuild_problems for audio without a hole, its timestamps moved far from zero by
+    `expression`. asetpts counts in doubles, which hold every multiple of 128 below 2^60, about
+    1.15 x 10^18. Each AC-3 frame begins on such a multiple, so the moved timestamps stay exact
+    and the two parts still meet without a step."""
+    # The trim ends a run that would write silence without end. Each graph trims on its own, and
+    # each part is 5 s.
+    return rebuild_problems(ffmpeg, hole=0, ahead=stamp(expression),
+                            after="atrim=end_sample=%d" % (10 * SECOND))
+
+
+# position reports three timestamps in samples, up to 20 characters each, and the sample rate.
+# Unless ffmpeg keeps the whole report, the sample rate loses digits or goes missing, and the new
+# graph's filter does not count from the old one's position.
+@check("graph-rebuild-at-minus-2-x-10-to-the-17", "keeps every sample and writes no silence when "
+       "ffmpeg rebuilds the filter graph 2 x 10^17 samples before zero")
+def graph_rebuild_at_minus_2_x_10_to_the_17(ffmpeg):
+    # Each timestamp of the report takes 19 characters. Cut short, the report ends in /480, and the
+    # old position reads as 100 times as far from zero: past the smallest timestamp, where it
+    # stops. The next frame then follows a gap of 6 million years.
+    return far_rebuild_problems(ffmpeg, "PTS-2e17")
+
+
+@check("graph-rebuild-at-minus-11-x-10-to-the-17", "keeps every sample and writes no silence when "
+       "ffmpeg rebuilds the filter graph 1.1 x 10^18 samples before zero")
+def graph_rebuild_at_minus_11_x_10_to_the_17(ffmpeg):
+    # Each timestamp takes 20 characters, as many as a timestamp can, so the report is the longest
+    # at 48 kHz. Cut short, it ends after the last slash, and the new graph's filter refuses it.
+    return far_rebuild_problems(ffmpeg, "PTS-1.1e18")
+
+
+@check("graph-rebuild-at-10-to-the-18", "keeps every sample and writes no silence when ffmpeg "
+       "rebuilds the filter graph 10^18 samples after zero")
+def graph_rebuild_at_10_to_the_18(ffmpeg):
+    # Each timestamp takes 19 characters. Cut short, the report ends in /480, and the old position
+    # reads as past the largest timestamp, where it stops. The next frame is then a step back, and
+    # every frame from there on is stamped with the largest timestamp.
+    return far_rebuild_problems(ffmpeg, "PTS+1e18")
+
+
 CHANGING_SIZE = (("64x36", 10), ("128x72", 30))
 STEADY_SIZE = (("64x36", 40),)
 

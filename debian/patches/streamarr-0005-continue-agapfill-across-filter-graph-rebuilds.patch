@@ -94,6 +94,17 @@ Description: fftools/ffmpeg_filter: continue the output of agapfill when a filte
  silence. send_frame() now walks the filters again until it finds none to
  ask, and does not ask a filter again once its asking has stopped.
  .
+ ffmpeg kept each position report in 64 bytes. A report holds three
+ timestamps of up to 20 characters and the sample rate, up to 74 bytes,
+ and snprintf() cut a longer one short. resume read what was left as a
+ lower sample rate, or refused it when the rate was gone. In audio stamped
+ 2 x 10^17 samples before zero, a report that ended in /48000 arrived as
+ /480. The position then stopped at the smallest timestamp, and the next
+ frame followed a gap of 6 million years. At 1.1 x 10^18 samples before
+ zero the rebuild failed, and at 10^18 samples after zero every frame after
+ it was stamped with the largest timestamp. ffmpeg now keeps 74 bytes, and
+ position fails instead of cutting its report short.
+ .
  The asking still keeps the other inputs of the graph waiting. With
  -shortest, the audio of an output can then run past its video, to about
  the end of the gap less -shortest_buf_duration. max_gap bounds that.
@@ -105,7 +116,7 @@ Index: FFmpeg/doc/filters.texi
 ===================================================================
 --- FFmpeg.orig/doc/filters.texi
 +++ FFmpeg/doc/filters.texi
-@@ -2165,6 +2165,66 @@ agapfill=start=0:max_gap=600
+@@ -2165,6 +2165,67 @@ agapfill=start=0:max_gap=600
  @end example
  @end itemize
  
@@ -122,7 +133,8 @@ Index: FFmpeg/doc/filters.texi
 +an input frame, the second number is the smallest timestamp, so a filter that
 +resumes from the report fills the time up to its first frame with silence,
 +however short that time is, as it does after @option{start}. The report is
-+empty before the first frame.
++empty before the first frame. It takes up to 74 bytes, the terminating null
++included, and the command fails when the space for the reply is shorter.
 +
 +@item pending
 +Report how many input frames the filter has not output yet: the frame it
@@ -187,7 +199,7 @@ Index: FFmpeg/fftools/ffmpeg_filter.c
  } FilterGraphThread;
  
  typedef struct InputFilterPriv {
-@@ -2077,6 +2081,57 @@ static int graph_is_meta(AVFilterGraph *
+@@ -2077,6 +2081,59 @@ static int graph_is_meta(AVFilterGraph *
      return 1;
  }
  
@@ -202,7 +214,9 @@ Index: FFmpeg/fftools/ffmpeg_filter.c
 +{
 +    for (unsigned i = 0; i < graph->nb_filters; i++) {
 +        AVFilterContext *f = graph->filters[i];
-+        char position[64] = "";
++        /* The longest report: three timestamps of 20 characters, each with a
++         * slash after it, and a sample rate of 10 digits. */
++        char position[3 * 21 + 10 + 1] = "";
 +        int ret;
 +
 +        if (!is_gap_fill(f))
@@ -245,7 +259,7 @@ Index: FFmpeg/fftools/ffmpeg_filter.c
  static int sub2video_frame(InputFilter *ifilter, AVFrame *frame, int buffer);
  
  static int configure_filtergraph(FilterGraph *fg, FilterGraphThread *fgt)
-@@ -2160,6 +2215,11 @@ static int configure_filtergraph(FilterG
+@@ -2160,6 +2217,11 @@ static int configure_filtergraph(FilterG
      if ((ret = avfilter_graph_config(fgt->graph, NULL)) < 0)
          goto fail;
  
@@ -257,7 +271,7 @@ Index: FFmpeg/fftools/ffmpeg_filter.c
      fgp->is_meta = graph_is_meta(fgt->graph);
  
      /* limit the lists of allowed formats to the ones selected, to
-@@ -3106,6 +3166,154 @@ static const char *unknown_if_null(const
+@@ -3106,6 +3168,154 @@ static const char *unknown_if_null(const
      return str ? str : "unknown";
  }
  
@@ -412,7 +426,7 @@ Index: FFmpeg/fftools/ffmpeg_filter.c
  static int send_frame(FilterGraph *fg, FilterGraphThread *fgt,
                        InputFilter *ifilter, AVFrame *frame)
  {
-@@ -3194,6 +3402,8 @@ static int send_frame(FilterGraph *fg, F
+@@ -3194,6 +3404,8 @@ static int send_frame(FilterGraph *fg, F
          }
  
          ret = fgt->graph ? read_frames(fg, fgt, tmp) : 0;
@@ -421,7 +435,7 @@ Index: FFmpeg/fftools/ffmpeg_filter.c
          av_frame_free(&tmp);
          if (ret < 0)
              return ret;
-@@ -3226,6 +3436,10 @@ static int send_frame(FilterGraph *fg, F
+@@ -3226,6 +3438,10 @@ static int send_frame(FilterGraph *fg, F
              if (reason.len > 1)
                  reason.str[reason.len - 2] = '\0'; // remove last comma
              av_log(fg, AV_LOG_INFO, "Reconfiguring filter graph%s%s\n", reason.len ? " because " : "", reason.str);
@@ -432,7 +446,7 @@ Index: FFmpeg/fftools/ffmpeg_filter.c
          } else {
              /* Choke all input to avoid buffering excessive frames while the
               * initial filter graph is being configured, and before we have a
-@@ -3291,6 +3505,7 @@ static void fg_thread_uninit(FilterGraph
+@@ -3291,6 +3507,7 @@ static void fg_thread_uninit(FilterGraph
      av_frame_free(&fgt->frame);
      av_freep(&fgt->eof_in);
      av_freep(&fgt->eof_out);
@@ -566,7 +580,7 @@ Index: FFmpeg/libavfilter/af_agapfill.c
          return 0;
      }
  
-@@ -288,6 +318,94 @@ static int config_output(AVFilterLink *o
+@@ -288,6 +318,104 @@ static int config_output(AVFilterLink *o
      return 0;
  }
  
@@ -631,6 +645,7 @@ Index: FFmpeg/libavfilter/af_agapfill.c
 +                           char *res, int res_len, int flags)
 +{
 +    AGapFillContext *s = ctx->priv;
++    int len;
 +
 +    if (!strcmp(cmd, "resume"))
 +        return resume(ctx, args);
@@ -651,9 +666,18 @@ Index: FFmpeg/libavfilter/af_agapfill.c
 +     * first frame is. When no frame follows, the end of the frames taken is
 +     * that step. */
 +    res[0] = 0;
-+    if (s->started)
-+        snprintf(res, res_len, "%"PRId64"/%"PRId64"/%"PRId64"/%d",
-+                 s->out_pos, s->sent_end, end_of_taken(ctx), ctx->inputs[0]->sample_rate);
++    if (!s->started)
++        return 0;
++
++    len = snprintf(res, res_len, "%"PRId64"/%"PRId64"/%"PRId64"/%d",
++                   s->out_pos, s->sent_end, end_of_taken(ctx), ctx->inputs[0]->sample_rate);
++    /* resume would read a report cut short as another position. */
++    if (len >= res_len) {
++        res[0] = 0;
++        av_log(ctx, AV_LOG_ERROR, "The position takes %d bytes, more than the %d given.\n",
++               len + 1, res_len);
++        return AVERROR_BUFFER_TOO_SMALL;
++    }
 +
 +    return 0;
 +}
@@ -661,7 +685,7 @@ Index: FFmpeg/libavfilter/af_agapfill.c
  static av_cold void uninit(AVFilterContext *ctx)
  {
      AGapFillContext *s = ctx->priv;
-@@ -309,12 +427,13 @@ static const AVFilterPad agapfill_output
+@@ -309,12 +437,13 @@ static const AVFilterPad agapfill_output
  };
  
  const FFFilter ff_af_agapfill = {
