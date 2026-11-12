@@ -14,8 +14,9 @@ Description: avformat/mpeg, avformat/mpegenc: stamp DVD PCM packets by their fir
  filled the payload once it was cut to whole blocks, the packet carried
  the timestamp of a frame that starts in a later packet.
  .
- The demuxer now moves the timestamp of a DVD PCM packet back by the
- bytes in front of its pointer. The muxer writes the number of frames
+ The demuxer now moves the timestamp of every DVD PCM packet back by the
+ bytes in front of its pointer, whatever its dynamic range byte, which a
+ disc can change from packet to packet. The muxer writes the number of frames
  that start in the payload and the true pointer, or 0 and no timestamp
  when none starts.
 Author: Streamarr
@@ -73,7 +74,7 @@ Index: FFmpeg/libavformat/mpeg.c
              len -=6;
        }
      }
-+    if (st->codecpar->codec_id == AV_CODEC_ID_PCM_DVD && pcm_dvd &&
++    if (st->codecpar->codec_id == AV_CODEC_ID_PCM_DVD &&
 +        lpcm_pointer > 4 && lpcm_pointer - 4 < len - 3) {
 +        /* The timestamp names the first frame that starts in the payload, lpcm_pointer - 4
 +         * bytes after the payload's first byte. Move it back to that byte, the packet's first

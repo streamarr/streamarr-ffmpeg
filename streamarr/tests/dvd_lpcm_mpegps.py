@@ -28,6 +28,10 @@ The check also requires:
     every decoded frame, from the start and after each seek, is stamped with the time of the source
     sample that it starts with, to within one sample
 
+The third byte of the LPCM header sets dynamic range control, 0x80 for none. FFmpeg's muxer writes
+0x80 into every packet, and a disc can change it from packet to packet. The decode checks also run
+on copies of two sources in which every second LPCM packet after the first carries 0x55.
+
 It also writes 24-bit 5.1, whose block is 72 bytes, alone into packets too small for a block. A
 VOB packet of 96 bytes has room for 60 after the pack header that every MPEG-2 packet carries, a
 PES header with a PTS and the LPCM header. An MPEG-1 system stream packet of 88 bytes has room for
@@ -65,6 +69,8 @@ SEEKS = (1.3, 2.6, 3.9, 5.2)
 SHAPES = [(16, 48000, 1, 0), (16, 48000, 2, 0), (16, 48000, 6, 0), (16, 96000, 6, 0),
           (24, 48000, 1, 0), (24, 48000, 2, 0), (24, 48000, 6, 0), (24, 96000, 1, 0),
           (24, 96000, 2, 0), (24, 48000, 6, 120)]
+# The shapes whose packets also get a dynamic range byte that changes from packet to packet.
+VARYING_DYNAMIC_RANGE_SHAPES = [(16, 48000, 2, 0), (24, 48000, 2, 0)]
 LAYOUTS = {1: "mono", 2: "stereo", 6: "5.1"}
 SMALL_PACKETS = {"vob": range(96, 129), "mpeg": range(88, 129)}
 FORMAT_NAMES = {"vob": "a VOB", "mpeg": "an MPEG-1 system stream"}
@@ -224,6 +230,20 @@ def lpcm_packets(vob):
     return packets
 
 
+def vary_dynamic_range(vob):
+    """A copy of the file in which every second LPCM packet after the first carries dynamic range
+    byte 0x55. The first keeps 0x80: FFmpeg's demuxer takes the stream for DVD PCM by it."""
+    with open(vob, "rb") as source:
+        data = bytearray(source.read())
+    for index, (_, body, _, _, _) in enumerate(lpcm_packet_bounds(data)):
+        if index % 2:
+            data[body + 6] = 0x55
+    varied = vob[:-len(".vob")] + "-varying-dynamic-range.vob"
+    with open(varied, "wb") as out:
+        out.write(data)
+    return varied
+
+
 def misaligned_payloads(vob, bits, channels):
     block = block_size(bits, channels)
     offset = misaligned = 0
@@ -349,6 +369,11 @@ def check_shape(ffmpeg, directory, shape):
     print("%s: %d of %d LPCM timestamps do not name the frame at the packet's pointer: %s"
           % (name, misplaced, stamped, "ok" if not misplaced else "WRONG"))
     return failures + check_decodes(ffmpeg, vob, shape, name)
+
+
+def check_varying_dynamic_range(ffmpeg, directory, shape):
+    vob = vary_dynamic_range(write_source(ffmpeg, directory, shape))
+    return check_decodes(ffmpeg, vob, shape, shape_name(shape) + " with a varying dynamic range byte")
 
 
 def check_decodes(ffmpeg, vob, shape, name):
@@ -530,6 +555,8 @@ def main():
     with tempfile.TemporaryDirectory() as directory:
         for shape in SHAPES:
             failures += check_shape(arguments.ffmpeg, directory, shape)
+        for shape in VARYING_DYNAMIC_RANGE_SHAPES:
+            failures += check_varying_dynamic_range(arguments.ffmpeg, directory, shape)
         failures += check_small_packets(arguments.ffmpeg, directory)
         failures += check_arrivals(arguments.ffmpeg, directory)
     print("%d checks failed" % failures)
