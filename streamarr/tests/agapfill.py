@@ -1201,6 +1201,27 @@ def rebuild_during_lead(ffmpeg):
                         "=start=0", 0, [silence(20 * SECOND), real(0, 40 * SECOND)])
 
 
+# Two fills, one behind the other. asetpts doubles the timestamps between them, so the second fill
+# finds a gap after every frame, as long as the frame, and writes it as silence. The graph declares
+# the second fill first, and ffmpeg keeps a graph's filters in the order of their declaration. At
+# the rebuild ffmpeg asks for frames until each fill in that order has output every frame it holds.
+# Asking for the rest of the first fill's gap hands the second fill frames again, last the frame
+# from after the gap and the frames behind it. Unless ffmpeg then asks the second fill again, the
+# graph is freed with those frames, and the new graph writes their time as silence.
+@check("rebuild-during-gap-behind-fill", "keeps every sample and every gap of a fill behind it "
+       "when ffmpeg rebuilds the filter graph and the graph declares that fill first")
+def rebuild_during_gap_behind_fill(ffmpeg):
+    def spread(first, count):
+        """Frames of 4,800 source samples, each followed by as much silence."""
+        return [part for at in range(first, first + count, 4800)
+                for part in (real(at, 4800), silence(4800))]
+
+    runs = spread(0, 2 * SECOND) + [silence(60 * SECOND)] + spread(32 * SECOND, 8 * SECOND)[:-1]
+    return beside_video(ffmpeg, chain(frames(4800), drop((20, 319))), "", 0, runs,
+                        chains="[x]asetpts=2*PTS,agapfill@second,ashowinfo[a];"
+                               "[1:a]agapfill@first[x]")
+
+
 # The real audio a fill may hold when ffmpeg frees a graph in which a filter behind the fill waits
 # for another input: the frame from after the gap and the frames queued behind it. Ten frames of
 # 4,800 samples.
