@@ -1,0 +1,53 @@
+Description: avfilter/tonemapx: keep one Dolby Vision mapping instead of one per frame
+ For every frame whose reshaping it applies, tonemapx allocated a
+ struct FFDOVIMetadataRemap, stored its address in the filter context
+ over the address of the previous frame's, and freed only the last one
+ when the filter closed. Each such frame left 2,728 bytes allocated and
+ unreachable. At 24 frames per second that is 225 MB (of 2^20 bytes)
+ for each hour of video. The frames are those with RPU profile 0 and
+ no enhancement layer residual, profile 5 among them.
+ .
+ Allocate the struct when the first such frame arrives and map every
+ later frame's metadata into it. ff_map_dovi_metadata() writes every
+ field that the reshaping of a frame reads: the two matrices and the
+ offset, the number of pivots, and for each piece its pivots, its
+ method and that method's coefficients. So the output does not change.
+ .
+ tonemap_cuda, tonemap_opencl and tonemap_videotoolbox free the struct
+ after each frame. tonemapx cannot: once it has seen such a frame it
+ keeps the Dolby Vision path for every later frame and reads the last
+ mapping there, so the struct stays until the filter closes, as the
+ last frame's did before.
+ .
+ A failed allocation now returns ENOMEM. Before, the frame was dropped
+ and the filter returned success.
+Author: Streamarr
+Forwarded: no
+Last-Update: 2026-11-11
+---
+Index: FFmpeg/libavfilter/vf_tonemapx.c
+===================================================================
+--- FFmpeg.orig/libavfilter/vf_tonemapx.c
++++ FFmpeg/libavfilter/vf_tonemapx.c
+@@ -1574,16 +1574,16 @@ static int filter_frame(AVFilterLink *link, AVFrame *in)
+         // such videos usually have vdr_rpu_profile == 0, for example profile 5 videos
+         // this could be wrong as there is no public documentation on this field
+         if (rpu->disable_residual_flag && rpu->vdr_rpu_profile == 0) {
+-            struct FFDOVIMetadataRemap *dovi;
+-
+             // Before s->dovi is set: a later frame takes the Dolby Vision path whenever it is.
+             if ((ret = compute_dovi_pq_luts(s)) < 0)
+                 goto fail;
+ 
+-            dovi = av_malloc(sizeof(*dovi));
+-            s->dovi = dovi;
+-            if (!s->dovi)
++            // One buffer serves every frame: the mapping below rewrites each field that the
++            // reshaping of this frame reads.
++            if (!s->dovi && !(s->dovi = av_malloc(sizeof(*s->dovi)))) {
++                ret = AVERROR(ENOMEM);
+                 goto fail;
++            }
+ 
+             ff_map_dovi_metadata(s->dovi, metadata);
+             in->color_trc = AVCOL_TRC_SMPTE2084;

@@ -205,6 +205,20 @@ jobs:
           "${check[@]}" --cpuflags 0
           if [[ "${TARGET}" == linux64 ]]; then "${check[@]}" --cpuflags sse4.2; fi
 
+      # Without streamarr-0006 tonemapx allocates the parsed RPU of every Dolby Vision profile 5
+      # frame again and frees only the last one, so its memory grows by 2,728 bytes a frame. The
+      # check writes its own profile 5 stream and compares the peak resident memory of a short
+      # and a long run of each tonemapx chain the transcode worker uses. Every code path of the
+      # filter shares the allocation, so one run per target covers it.
+      # linuxarm64 binaries cannot run on these runners.
+      - name: Check that tonemapx's memory does not grow with Dolby Vision profile 5 frames
+        if: matrix.target != 'linuxarm64'
+        run: |
+          set -euo pipefail
+          bin="$(mktemp -d)"
+          tar -xJf streamarr-release/*.tar.xz -C "${bin}" ffmpeg
+          python3 streamarr/tests/tonemapx_memory.py --ffmpeg "${bin}/ffmpeg"
+
       - name: Upload the archive
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
