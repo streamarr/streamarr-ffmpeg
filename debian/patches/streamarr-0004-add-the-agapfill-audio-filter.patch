@@ -14,11 +14,12 @@ Description: avfilter: add agapfill, which fills gaps between audio frames with 
  previous frame. A forward step above the threshold, 2 ms by default, is
  a gap, and the filter writes silence up to the frame's own timestamp. A
  step at or below the threshold, forward or backward, passes through:
- the frame keeps its own timestamp, as it does without the filter. A
- longer overlap or backward step writes no silence, and the frame
- follows the previous one. Each step is decided alone, so drift never
- adds up to a gap. The start option puts silence from a given time up
- to the first frame.
+ the output takes the same step, as it does without the filter. The
+ frame keeps its own timestamp, or stays as far from it as an earlier
+ joined overlap left the output. A longer overlap or backward step
+ writes no silence, and the frame follows the previous one. Each step
+ is decided alone, so drift never adds up to a gap. The start option
+ puts silence from a given time up to the first frame.
  .
  A short step passes through instead of joining the frame to the one
  before it. Joined, each step moved the audio after it, so audio whose
@@ -55,7 +56,7 @@ Index: FFmpeg/doc/filters.texi
 ===================================================================
 --- FFmpeg.orig/doc/filters.texi
 +++ FFmpeg/doc/filters.texi
-@@ -2073,6 +2073,105 @@ Set softness applied inside thresholding
+@@ -2073,6 +2073,106 @@ Set softness applied inside thresholding
  
  This filter supports the all above options as @ref{commands}.
  
@@ -82,9 +83,10 @@ Index: FFmpeg/doc/filters.texi
 +
 +@item
 +A step at or below @option{threshold}, forward or backward, passes through.
-+The output takes the same step, so the later frame keeps its own timestamp, as
-+it does without this filter. That covers rounded timestamps and timestamps
-+that drift against the sample count.
++The output takes the same step, as it does without this filter. The later
++frame keeps its own timestamp, or stays as far from it as an earlier joined
++overlap left the output. That covers rounded timestamps and timestamps that
++drift against the sample count.
 +
 +@item
 +A longer overlap or backward step writes no silence, and the later frame
@@ -194,7 +196,7 @@ Index: FFmpeg/libavfilter/af_agapfill.c
 ===================================================================
 --- /dev/null
 +++ FFmpeg/libavfilter/af_agapfill.c
-@@ -0,0 +1,341 @@
+@@ -0,0 +1,342 @@
 +/*
 + * This file is part of FFmpeg.
 + *
@@ -302,9 +304,10 @@ Index: FFmpeg/libavfilter/af_agapfill.c
 +}
 +
 +/* A step at or below the threshold, forward or backward, passes through:
-+ * the output takes the same step, so the frame keeps its own timestamp, as
-+ * it does without the filter. A longer overlap or backward step trims
-+ * nothing, and the frame follows the previous one. */
++ * the output takes the same step, as it does without the filter. The frame
++ * keeps its own timestamp, or stays as far from it as an earlier joined
++ * overlap left the output. A longer overlap or backward step trims nothing,
++ * and the frame follows the previous one. */
 +static void pass_short_step(AVFilterContext *ctx, int64_t pts)
 +{
 +    AGapFillContext *s = ctx->priv;

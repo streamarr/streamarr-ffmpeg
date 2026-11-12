@@ -17,7 +17,8 @@ from the rules the filter documents, not from its output:
     2. A forward step between two frames that is longer than `threshold` (2 ms) is a gap. The
        filter writes silence up to the later frame's own timestamp.
     3. A step at or under `threshold`, forward or backward, passes through: the output takes the
-       same step, so the frame keeps its own timestamp, as it does without the filter.
+       same step, as it does without the filter. The frame keeps its own timestamp, or stays as
+       far from it as an overlap that rule 4 joined left the output.
     4. A longer overlap or backward step writes no silence and drops no sample. The frame follows
        the previous frame directly.
     5. `start` puts silence from that time up to the first frame.
