@@ -38,6 +38,7 @@ import tempfile
 import threading
 
 RATE = 48000
+LARGEST_TIMESTAMP = 2 ** 63 - 1
 PERIOD, HALF = 30011, 15005
 DEFAULT_PACKET = 4096
 CHUNK = 1 << 16
@@ -574,7 +575,7 @@ def end_of_timestamp_range(ffmpeg):
     stamps = [pts for pts, _, _, _ in frames_of(done.log)]
     if None in stamps:
         return ["%d frames have no timestamp" % stamps.count(None)]
-    if not stamps or stamps[0] <= 2 ** 63 - 1 - 3 * SECOND:
+    if not stamps or stamps[0] <= LARGEST_TIMESTAMP - 3 * SECOND:
         raise Unusable("the audio does not reach the end of the timestamp range")
     problems = []
     backward = [(before, after) for before, after in zip(stamps, stamps[1:]) if after < before]
@@ -858,21 +859,31 @@ def timeline_by_the_rules(frame_list, start=None, threshold=RATE * 2 // 1000):
     return first, runs
 
 
-def changing_layout(ffmpeg, work, hole):
-    """Writes 5 s of 5.1 AC-3 and then 5 s of stereo AC-3, stamped `hole` seconds after the 5.1."""
-    # The encoder writes 5 s as 157 frames of 1,536 samples. Both parts are stamped from 1 s or
-    # later, because the muxer would move a part that begins below zero.
-    stream, end = b"", 157 * 1536 / RATE
-    for layout, channels, offset in (("5.1", 6, 1), ("stereo", 2, 1 + end + hole)):
-        tones = "|".join("0.3*sin(2*PI*%d*t)" % (220 * (channel + 1)) for channel in range(channels))
+AC3_CHANNELS = {"stereo": 2, "5.1": 6}
+
+
+def ac3_parts(ffmpeg, work, parts):
+    """Writes parts of 5 s of AC-3 one after the other into one MPEG-TS file and returns its path.
+
+    Each part is (channel layout, sample rate, hole) and is stamped `hole` seconds after the part
+    before it ends.
+    """
+    # The encoder ends a part on a whole frame of 1,536 samples: 5 s at 48 kHz are 157 frames. The
+    # first part is stamped from 1 s, because the muxer would move a part that begins below zero.
+    stream, offset = b"", 1
+    for layout, rate, hole in parts:
+        offset += hole
+        tones = "|".join("0.3*sin(2*PI*%d*t)" % (220 * (channel + 1))
+                         for channel in range(AC3_CHANNELS[layout]))
         done = execute([ffmpeg, "-nostdin", "-hide_banner", "-v", "error", "-f", "lavfi", "-i",
-                        "aevalsrc=exprs='%s':s=%d:c=%s:d=5" % (tones, RATE, layout),
+                        "aevalsrc=exprs='%s':s=%d:c=%s:d=5" % (tones, rate, layout),
                         "-c:a", "ac3", "-b:a", "384k", "-output_ts_offset", "%.6f" % offset,
                         "-f", "mpegts", "-"], lambda out: out.read())
         if done.code:
             raise Unusable("FFmpeg could not encode AC-3: %s" % last_lines(done.log))
         stream += done.result
-    path = os.path.join(work, "changing-layout.ts")
+        offset += -(-5 * rate // 1536) * 1536 / rate
+    path = os.path.join(work, "parts.ts")
     with open(path, "wb") as out:
         out.write(stream)
     return path
@@ -887,7 +898,7 @@ def rebuild_problems(ffmpeg, *, hole, ahead="anull", start=None, seek=None):
     """
     fill = "agapfill" if start is None else "agapfill=start=%d" % start
     with tempfile.TemporaryDirectory() as work:
-        source = changing_layout(ffmpeg, work, hole)
+        source = ac3_parts(ffmpeg, work, [("5.1", RATE, 0), ("stereo", RATE, hole)])
 
         def decode(filters):
             position = ["-ss", str(seek)] if seek is not None else []
