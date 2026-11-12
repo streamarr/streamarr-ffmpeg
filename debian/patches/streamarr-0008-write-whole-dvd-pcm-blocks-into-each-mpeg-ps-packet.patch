@@ -1,0 +1,505 @@
+Description: avformat/mpegenc: write whole DVD PCM blocks into each MPEG-PS packet
+ The muxer cut each DVD PCM payload at a multiple of one sample frame,
+ channels * bits / 8 bytes. The DVD PCM decoder reads 20 and 24 bit
+ samples in blocks: the upper 16 bits of four samples, then their lower
+ bits. A block is 12 bytes for one, two or four channels at 24 bits and
+ 72 bytes for 5.1, so most 24-bit payloads started inside a block.
+ .
+ A decode that starts after a seek takes the first byte of its first
+ packet as the start of a block. From such a payload it mixes the bytes
+ of different samples, and the carry from packet to packet keeps that
+ phase: near full-scale noise to the end of the decode.
+ .
+ Cut payloads at multiples of the decoder's block instead. A 16-bit block
+ is one sample frame, so 16-bit output does not change. 24-bit files grow
+ by the padding of the shorter payloads, 0.3 % for stereo and 2.7 % for
+ 5.1 in FATE.
+ .
+ A packet with no room for a block after its headers holds no samples. If
+ every packet of a stream is that small, the stream never drains and the
+ muxer writes empty packets forever, so refuse such packet sizes. 24-bit
+ 5.1 then needs packets of at least 113 bytes in an MPEG-2 program stream;
+ the default is 2048.
+ .
+ The SCR advances by one whole packet at the mux rate, so each packet
+ must carry the samples of that time. The automatic mux rate adds 5 % to
+ the streams' bit rates for headers. Whole blocks can leave most of a
+ block of a packet unused, and below about 1000 bytes the headers alone
+ take more than 5 % of a packet. 24-bit 5.1 in 2050-byte packets carried
+ 1944 bytes where whole sample frames carried 1998, and the SCR ran ahead
+ of the samples by 2.4 ms a second; 7 channels did the same in 2048-byte
+ packets. In 600-byte packets, even without whole blocks, 24-bit 5.1
+ carried 31 samples, 58.1 ticks of 90 kHz, while the SCR advanced 59. So
+ for the mux rate, each DVD PCM stream needs its bit rate times the
+ packet size over its smallest payload: the whole blocks that fit after a
+ pack header, a PTS and a DTS. That share holds the headers, and the 5 %
+ go spare. Where a block is one sample frame, as at 16 bits, the payloads
+ and the rate do not change.
+Author: Streamarr
+Forwarded: no
+Last-Update: 2026-11-12
+---
+Index: FFmpeg/libavformat/mpegenc.c
+===================================================================
+--- FFmpeg.orig/libavformat/mpegenc.c
++++ FFmpeg/libavformat/mpegenc.c
+@@ -300,6 +300,58 @@ static int get_system_header_size(AVFormatContext *ctx)
+     return buf_index;
+ }
+ 
++/* The bytes of one block of the DVD PCM decoder (libavcodec/pcm-dvd.c). 20 and 24 bit samples
++ * come in groups of four: the upper 16 bits of each, then their lower bits. A decode that
++ * starts after a seek takes the first byte of its first packet as the start of a block. */
++static int pcm_dvd_block_size(const AVCodecParameters *par)
++{
++    int channels = par->ch_layout.nb_channels;
++    int bits     = par->bits_per_coded_sample;
++
++    if (bits == 16)
++        return 2 * channels;
++    switch (channels) {
++    case 1:
++    case 2:
++    case 4:
++        return 4 * bits / 8;
++    case 8:
++        return 8 * bits / 8;
++    default:
++        return 4 * channels * bits / 8;
++    }
++}
++
++/* The bytes that flush_packet() writes before the samples of an LPCM packet with a pack header,
++ * a PTS and a DTS: the pack header, the PES header, the substream ID and the LPCM header. Only
++ * the first packet of a stream and a packet with a system header have more. */
++static int lpcm_packet_overhead(const MpegMuxContext *s)
++{
++    int pack_header = s->is_mpeg2 ? 14 : 12;
++    int pes_header  = 6 + (s->is_mpeg2 ? 3 + 1 : 0) + 5 + 5;
++
++    return pack_header + pes_header + 1 + 6;
++}
++
++/* The bit rate that a DVD PCM stream of the given rate needs in the mux rate. The SCR advances by
++ * one whole packet at the mux rate, so each packet must carry the samples of that time. Whole
++ * blocks can leave most of a block of a packet unused, and the headers of a small packet take
++ * more than the 5 % that mpeg_mux_init() adds for them. So the stream needs its rate times the
++ * packet size over its smallest payload: the whole blocks that fit after the headers of
++ * lpcm_packet_overhead(). That share holds the headers, and the 5 % go spare. Where a block is
++ * one sample frame, as for 16 bits, four channels or eight, the payloads and the rate do not
++ * change. */
++static int lpcm_whole_block_rate(const MpegMuxContext *s, const AVCodecParameters *par, int rate)
++{
++    int block = pcm_dvd_block_size(par);
++    int frame = par->ch_layout.nb_channels * par->bits_per_coded_sample / 8;
++    int room  = s->packet_size - lpcm_packet_overhead(s);
++
++    if (block == frame)
++        return rate;
++    return av_rescale(rate, s->packet_size, room - room % block);
++}
++
+ static av_cold int mpeg_mux_init(AVFormatContext *ctx)
+ {
+     MpegMuxContext *s = ctx->priv_data;
+@@ -410,7 +462,16 @@ static av_cold int mpeg_mux_init(AVFormatContext *ctx)
+                                          st->codecpar->ch_layout.nb_channels - 1;
+                 stream->lpcm_header[2] = 0x80;
+                 stream->id = lpcm_id++;
+-                stream->lpcm_align = st->codecpar->ch_layout.nb_channels * st->codecpar->bits_per_coded_sample / 8;
++                stream->lpcm_align = pcm_dvd_block_size(st->codecpar);
++                /* flush_packet() writes only whole blocks. Where the headers of
++                 * lpcm_packet_overhead() leave no room for one, the stream can stall, and the
++                 * muxer then writes empty packets forever. */
++                if (s->packet_size - lpcm_packet_overhead(s) < stream->lpcm_align) {
++                    av_log(ctx, AV_LOG_ERROR,
++                           "Packet size %d leaves no room for a %d-byte block of DVD PCM.\n",
++                           s->packet_size, stream->lpcm_align);
++                    return AVERROR(EINVAL);
++                }
+             } else if (st->codecpar->codec_id == AV_CODEC_ID_MLP ||
+                        st->codecpar->codec_id == AV_CODEC_ID_TRUEHD) {
+                        av_log(ctx, AV_LOG_ERROR, "Support for muxing audio codec %s not implemented.\n",
+@@ -503,6 +564,9 @@ static av_cold int mpeg_mux_init(AVFormatContext *ctx)
+         else
+             codec_rate = st->codecpar->bit_rate;
+ 
++        if (st->codecpar->codec_id == AV_CODEC_ID_PCM_DVD)
++            codec_rate = lpcm_whole_block_rate(s, st->codecpar, codec_rate);
++
+         if (!codec_rate)
+             codec_rate = (1 << 21) * 8 * 50 / ctx->nb_streams;
+ 
+Index: FFmpeg/tests/ref/fate/pcm_dvd-24-1-48000
+===================================================================
+--- FFmpeg.orig/tests/ref/fate/pcm_dvd-24-1-48000
++++ FFmpeg/tests/ref/fate/pcm_dvd-24-1-48000
+@@ -1,4 +1,4 @@
+-95a5e963bb6b654603089f3e17718b16 *tests/data/fate/pcm_dvd-24-1-48000.vob
++1b2aa0a9b9f0c1e3754e7bff0389e478 *tests/data/fate/pcm_dvd-24-1-48000.vob
+ 106496 tests/data/fate/pcm_dvd-24-1-48000.vob
+ #tb 0: 1/48000
+ #media_type 0: audio
+@@ -7,53 +7,53 @@
+ #channel_layout_name 0: mono
+ 0,          0,          0,      664,     1992, 0x722ccac0
+ 0,        672,        672,      668,     2004, 0x7a82f0db
+-0,       1344,       1344,      672,     2016, 0xe91cd0d1
+-0,       2016,       2016,      668,     2004, 0x76fbb193
+-0,       2688,       2688,      672,     2016, 0xc85bd904
+-0,       3360,       3360,      668,     2004, 0x698219fa
+-0,       4032,       4032,      672,     2016, 0xe74cd175
+-0,       4704,       4704,      668,     2004, 0x684bd409
+-0,       5376,       5376,      672,     2016, 0xf497da15
+-0,       6048,       6048,      668,     2004, 0x6166e1ea
+-0,       6720,       6720,      672,     2016, 0x3836159e
+-0,       7392,       7392,      668,     2004, 0x0827cfe5
+-0,       8064,       8064,      672,     2016, 0x78150039
+-0,       8736,       8736,      668,     2004, 0x28bcc323
+-0,       9408,       9408,      672,     2016, 0x7123c17d
+-0,      10080,      10080,      668,     2004, 0xcbfeed6f
+-0,      10752,      10752,      672,     2016, 0x05d6128d
+-0,      11424,      11424,      668,     2004, 0xb4f1e9b9
+-0,      12096,      12096,      672,     2016, 0xf83b0966
+-0,      12768,      12768,      668,     2004, 0x71a9f220
+-0,      13440,      13440,      672,     2016, 0x97b5fc85
+-0,      14112,      14112,      668,     2004, 0xda97b165
+-0,      14784,      14784,      672,     2016, 0x43c9cfcf
+-0,      15456,      15456,      668,     2004, 0x5d83e552
+-0,      16128,      16128,      672,     2016, 0xe1bbc192
+-0,      16800,      16800,      668,     2004, 0xdec9a0ba
+-0,      17472,      17472,      672,     2016, 0xcc01cd21
+-0,      18144,      18144,      668,     2004, 0x73f99e51
+-0,      18816,      18816,      672,     2016, 0x023ec896
+-0,      19488,      19488,      668,     2004, 0x4d5cd720
+-0,      20160,      20160,      672,     2016, 0x9af2bb31
+-0,      20832,      20832,      668,     2004, 0xd2a3dac6
+-0,      21504,      21504,      672,     2016, 0x02dbce4f
+-0,      22176,      22176,      668,     2004, 0xbba5f7e6
+-0,      22848,      22848,      672,     2016, 0xfb5501c1
+-0,      23520,      23520,      668,     2004, 0xe953ed65
+-0,      24192,      24192,      672,     2016, 0x5c83d800
+-0,      24864,      24864,      668,     2004, 0xabc0e62c
+-0,      25536,      25536,      672,     2016, 0xda8be7e0
+-0,      26208,      26208,      668,     2004, 0x0acbc166
+-0,      26880,      26880,      664,     1992, 0x46dddfa4
+-0,      27552,      27552,      672,     2016, 0x9a33b4cc
+-0,      28224,      28224,      668,     2004, 0xda13d604
+-0,      28896,      28896,      672,     2016, 0xe92dd4fb
+-0,      29568,      29568,      668,     2004, 0xedd2bcec
+-0,      30240,      30240,      672,     2016, 0x73afe253
+-0,      30912,      30912,      668,     2004, 0x17eae64a
+-0,      31584,      31584,      672,     2016, 0x48b0f6c2
+-0,      32256,      32256,      668,     2004, 0x4f72fb8d
+-0,      32928,      32928,      672,     2016, 0x3ad7dfdd
+-0,      33600,      33600,      668,     2004, 0x3e72ee51
+-0,      34272,      34272,      404,     1212, 0x416c4aef
++0,       1344,       1344,      668,     2004, 0x3a93cb88
++0,       2016,       2016,      668,     2004, 0x7fa1b304
++0,       2688,       2688,      668,     2004, 0xb9d5d5be
++0,       3360,       3360,      668,     2004, 0xee6f15af
++0,       4032,       4032,      668,     2004, 0x22d4d174
++0,       4704,       4704,      668,     2004, 0xc103d3cf
++0,       5376,       5376,      668,     2004, 0xf825d47f
++0,       6048,       6048,      668,     2004, 0x17e0e21e
++0,       6720,       6720,      668,     2004, 0x8bd901e8
++0,       7392,       7392,      668,     2004, 0x42cadf0d
++0,       8064,       8064,      668,     2004, 0xe88eefab
++0,       8736,       8736,      668,     2004, 0x92b2c10d
++0,       9408,       9408,      668,     2004, 0x008fb8f9
++0,      10080,      10080,      668,     2004, 0x547cedb6
++0,      10752,      10752,      668,     2004, 0x94560167
++0,      11424,      11424,      668,     2004, 0xff8bfacb
++0,      12096,      12096,      668,     2004, 0x591d0720
++0,      12768,      12768,      668,     2004, 0xfc82e4ed
++0,      13440,      13440,      668,     2004, 0x8a3204f8
++0,      14112,      14112,      668,     2004, 0x5587b321
++0,      14784,      14784,      668,     2004, 0xd323d6be
++0,      15456,      15456,      668,     2004, 0x3e41d3f2
++0,      16128,      16128,      668,     2004, 0x92d2c136
++0,      16800,      16800,      668,     2004, 0x7760ae84
++0,      17472,      17472,      668,     2004, 0x357c9c49
++0,      18144,      18144,      668,     2004, 0xd003d078
++0,      18816,      18816,      668,     2004, 0x4db0a04b
++0,      19488,      19488,      668,     2004, 0x50f8c386
++0,      20160,      20160,      668,     2004, 0xfdb3b1bf
++0,      20832,      20832,      668,     2004, 0x7594f93c
++0,      21504,      21504,      668,     2004, 0x11bcd390
++0,      22176,      22176,      668,     2004, 0xacb50289
++0,      22848,      22848,      668,     2004, 0x950fec22
++0,      23520,      23520,      668,     2004, 0x8e45f131
++0,      24192,      24192,      668,     2004, 0xb856d5a4
++0,      24864,      24864,      668,     2004, 0x5e32e378
++0,      25536,      25536,      668,     2004, 0xa25de0c5
++0,      26208,      26208,      668,     2004, 0xcea8b224
++0,      26880,      26880,      664,     1992, 0x5c6de08b
++0,      27384,      27384,      668,     2004, 0xfb2dbd42
++0,      28056,      28056,      668,     2004, 0x4ae2c6ca
++0,      28728,      28728,      668,     2004, 0xa91ecd4c
++0,      29400,      29400,      668,     2004, 0xe70cb872
++0,      30072,      30072,      668,     2004, 0x04d3fbf7
++0,      30744,      30744,      668,     2004, 0xfed6eb7e
++0,      31416,      31416,      668,     2004, 0xc6d0e464
++0,      32088,      32088,      668,     2004, 0x021ce32f
++0,      32760,      32760,      668,     2004, 0x2bfde86e
++0,      33432,      33432,      668,     2004, 0x564ee85c
++0,      34104,      34104,      500,     1500, 0x5facdc01
+Index: FFmpeg/tests/ref/fate/pcm_dvd-24-2-48000
+===================================================================
+--- FFmpeg.orig/tests/ref/fate/pcm_dvd-24-2-48000
++++ FFmpeg/tests/ref/fate/pcm_dvd-24-2-48000
+@@ -1,5 +1,5 @@
+-6fcd235f0c165f2c5f4431f9e0d60d28 *tests/data/fate/pcm_dvd-24-2-48000.vob
+-8218624 tests/data/fate/pcm_dvd-24-2-48000.vob
++e8d1ddc92be8fdb2651098fa88d00bfb *tests/data/fate/pcm_dvd-24-2-48000.vob
++8243200 tests/data/fate/pcm_dvd-24-2-48000.vob
+ #tb 0: 1/48000
+ #media_type 0: audio
+ #codec_id 0: pcm_s24le
+@@ -7,30 +7,30 @@
+ #channel_layout_name 0: stereo
+ 0,          0,          0,      332,     1992, 0x13af13b9
+ 0,        336,        336,      334,     2004, 0x178ac9be
+-0,        672,        672,      336,     2016, 0xc0c9266b
+-0,       1008,       1008,      334,     2004, 0x0266b229
+-0,       1344,       1344,      336,     2016, 0xe821e124
+-0,       1680,       1680,      334,     2004, 0xd7cedefd
+-0,       2016,       2016,      336,     2016, 0xb817b01c
+-0,       2352,       2352,      334,     2004, 0xd7a8e953
+-0,       2688,       2688,      336,     2016, 0xc20cf5fa
+-0,       3024,       3024,      334,     2004, 0xe5ee903e
+-0,       3360,       3360,      336,     2016, 0xbe20ec1d
+-0,       3696,       3696,      334,     2004, 0x9708d462
+-0,       4032,       4032,      336,     2016, 0x9e82f06c
+-0,       4368,       4368,      334,     2004, 0x5069d037
+-0,       4704,       4704,      336,     2016, 0xcfb6effe
+-0,       5040,       5040,      334,     2004, 0xe13c128a
+-0,       5376,       5376,      336,     2016, 0x8564d28e
+-0,       5712,       5712,      334,     2004, 0x116dc5c0
+-0,       6048,       6048,      336,     2016, 0xf0ca183b
+-0,       6384,       6384,      334,     2004, 0x39e5d580
+-0,       6720,       6720,      336,     2016, 0xaacbf84e
+-0,       7056,       7056,      334,     2004, 0x50b7ed68
+-0,       7392,       7392,      336,     2016, 0x83451550
+-0,       7728,       7728,      334,     2004, 0x4523eebf
+-0,       8064,       8064,      336,     2016, 0x5781de58
+-0,       8400,       8400,      334,     2004, 0x66f2e12a
+-0,       8736,       8736,      336,     2016, 0xdaebe5e0
+-0,       9072,       9072,      334,     2004, 0x9b83d9df
+-0,       9408,       9408,      192,     1152, 0xdaf44e66
++0,        672,        672,      334,     2004, 0x262a1e08
++0,       1008,       1008,      334,     2004, 0x3474b5fd
++0,       1344,       1344,      334,     2004, 0x9f1fe03c
++0,       1680,       1680,      334,     2004, 0x2f72d5a5
++0,       2016,       2016,      334,     2004, 0xff34b370
++0,       2352,       2352,      334,     2004, 0x82f2df16
++0,       2688,       2688,      334,     2004, 0xe51eefca
++0,       3024,       3024,      334,     2004, 0xa5f58e52
++0,       3360,       3360,      334,     2004, 0xc2a9e05c
++0,       3696,       3696,      334,     2004, 0xa543df98
++0,       4032,       4032,      334,     2004, 0x311aee77
++0,       4368,       4368,      334,     2004, 0x5306cb8f
++0,       4704,       4704,      334,     2004, 0x022ee386
++0,       5040,       5040,      334,     2004, 0x7102109e
++0,       5376,       5376,      334,     2004, 0xd057c28d
++0,       5712,       5712,      334,     2004, 0x3b6dcca1
++0,       6048,       6048,      334,     2004, 0xef161763
++0,       6384,       6384,      334,     2004, 0x07cbef13
++0,       6720,       6720,      334,     2004, 0x1711f063
++0,       7056,       7056,      334,     2004, 0xd465d52b
++0,       7392,       7392,      334,     2004, 0x5a000b52
++0,       7728,       7728,      334,     2004, 0xd06c0974
++0,       8064,       8064,      334,     2004, 0x9721db05
++0,       8400,       8400,      334,     2004, 0xaf0dc8f1
++0,       8736,       8736,      334,     2004, 0x3de6ec7a
++0,       9072,       9072,      334,     2004, 0x43b2ea07
++0,       9408,       9408,      192,     1152, 0x74b439e0
+Index: FFmpeg/tests/ref/fate/pcm_dvd-24-5.1-48000
+===================================================================
+--- FFmpeg.orig/tests/ref/fate/pcm_dvd-24-5.1-48000
++++ FFmpeg/tests/ref/fate/pcm_dvd-24-5.1-48000
+@@ -1,94 +1,96 @@
+-131d92cc9349ab808cf60dd0c9ed8df6 *tests/data/fate/pcm_dvd-24-5.1-48000.vob
+-2519040 tests/data/fate/pcm_dvd-24-5.1-48000.vob
++f1310eb45ebdb13776ca68a6b078d5ca *tests/data/fate/pcm_dvd-24-5.1-48000.vob
++2586624 tests/data/fate/pcm_dvd-24-5.1-48000.vob
+ #tb 0: 1/48000
+ #media_type 0: audio
+ #codec_id 0: pcm_s24le
+ #sample_rate 0: 48000
+ #channel_layout_name 0: 5.1
+ 0,          0,          0,      108,     1944, 0xd474b1dc
+-0,        112,        112,      112,     2016, 0x7b1a40cc
+-0,        224,        224,      112,     2016, 0xa5be1eff
+-0,        336,        336,      108,     1944, 0x8e889bbf
+-0,        448,        448,      112,     2016, 0x64de154d
+-0,        560,        560,      112,     2016, 0xd0d98f35
+-0,        672,        672,      112,     2016, 0xa607ff3b
+-0,        784,        784,      108,     1944, 0x3e32521e
+-0,        896,        896,      112,     2016, 0xc278e708
+-0,       1008,       1008,      112,     2016, 0x6228e57a
+-0,       1120,       1120,      112,     2016, 0xa0fbd56d
+-0,       1232,       1232,      108,     1944, 0xefa5d55c
+-0,       1344,       1344,      112,     2016, 0x309900c8
+-0,       1456,       1456,      112,     2016, 0x65d5154a
+-0,       1568,       1568,      112,     2016, 0x7a6777fd
+-0,       1680,       1680,      108,     1944, 0xeef5828c
+-0,       1792,       1792,      112,     2016, 0x05e2fe81
+-0,       1904,       1904,      112,     2016, 0xaf4a5c67
+-0,       2016,       2016,      112,     2016, 0xd881cccd
+-0,       2128,       2128,      108,     1944, 0xba7358a5
+-0,       2240,       2240,      112,     2016, 0x0341f0d2
+-0,       2352,       2352,      112,     2016, 0x0d5e2642
+-0,       2464,       2464,      112,     2016, 0xc3442415
+-0,       2576,       2576,      108,     1944, 0x04e23fa2
+-0,       2688,       2688,      112,     2016, 0xbe5d297d
+-0,       2800,       2800,      112,     2016, 0x36bee2ef
+-0,       2912,       2912,      112,     2016, 0x5b1fa6bf
+-0,       2996,       2996,      108,     1944, 0x842993a2
+-0,       3108,       3108,      112,     2016, 0xad60830b
+-0,       3220,       3220,      112,     2016, 0x59de6600
+-0,       3332,       3332,      112,     2016, 0xbf6f32f0
+-0,       3444,       3444,      108,     1944, 0x7a2d1b23
+-0,       3556,       3556,      112,     2016, 0x05755245
+-0,       3668,       3668,      112,     2016, 0x6f048e4b
+-0,       3780,       3780,      112,     2016, 0xbddb7141
+-0,       3892,       3892,      108,     1944, 0x27f927c3
+-0,       4004,       4004,      112,     2016, 0x1b72043a
+-0,       4116,       4116,      112,     2016, 0x8196613d
+-0,       4228,       4228,      112,     2016, 0x582803ae
+-0,       4340,       4340,      108,     1944, 0xe61b8fef
+-0,       4452,       4452,      112,     2016, 0xd6c793ac
+-0,       4564,       4564,      112,     2016, 0x9cd216a8
+-0,       4676,       4676,      108,     1944, 0x0329923f
+-0,       4788,       4788,      112,     2016, 0x389e4741
+-0,       4900,       4900,      112,     2016, 0x257b7c1c
+-0,       5012,       5012,      112,     2016, 0xbd6af710
+-0,       5124,       5124,      108,     1944, 0x1b1a08cd
+-0,       5236,       5236,      112,     2016, 0x7c1c56ab
+-0,       5348,       5348,      112,     2016, 0x8dd343a2
+-0,       5460,       5460,      112,     2016, 0xedef5b90
+-0,       5572,       5572,      108,     1944, 0x1cb19fa5
+-0,       5684,       5684,      112,     2016, 0x7262409f
+-0,       5796,       5796,      112,     2016, 0x39fb2f0c
+-0,       5908,       5908,      112,     2016, 0xfc2e6c94
+-0,       5992,       5992,      108,     1944, 0x5ebd2dc3
+-0,       6104,       6104,      112,     2016, 0x545aa3cf
+-0,       6216,       6216,      112,     2016, 0x2ccdb39d
+-0,       6328,       6328,      112,     2016, 0x1fd639a5
+-0,       6440,       6440,      108,     1944, 0x0788a815
+-0,       6552,       6552,      112,     2016, 0xe904c713
+-0,       6664,       6664,      112,     2016, 0x2451eb77
+-0,       6776,       6776,      112,     2016, 0x9cf3d1bf
+-0,       6888,       6888,      108,     1944, 0x25983223
+-0,       7000,       7000,      112,     2016, 0x4e426817
+-0,       7112,       7112,      112,     2016, 0x386fe97d
+-0,       7224,       7224,      112,     2016, 0x20ed0d8d
+-0,       7336,       7336,      108,     1944, 0xbc097653
+-0,       7448,       7448,      112,     2016, 0x6211057e
+-0,       7560,       7560,      112,     2016, 0x0a0825f3
+-0,       7672,       7672,      112,     2016, 0x377e6144
+-0,       7784,       7784,      108,     1944, 0xd163ff87
+-0,       7896,       7896,      112,     2016, 0xde483afa
+-0,       8008,       8008,      112,     2016, 0x8b80471f
+-0,       8120,       8120,      112,     2016, 0x35f27a6d
+-0,       8232,       8232,      108,     1944, 0xaa224460
+-0,       8344,       8344,      112,     2016, 0xda986b7e
+-0,       8456,       8456,      112,     2016, 0xea5058a6
+-0,       8568,       8568,      112,     2016, 0x74be6ed0
+-0,       8680,       8680,      108,     1944, 0x0526c60e
+-0,       8792,       8792,      112,     2016, 0x953f6390
+-0,       8904,       8904,      112,     2016, 0xc9cc0d3a
+-0,       8988,       8988,      108,     1944, 0xef0bc41e
+-0,       9100,       9100,      112,     2016, 0x2bcb9fff
+-0,       9212,       9212,      112,     2016, 0x21a51ee9
+-0,       9324,       9324,      112,     2016, 0x6cd1f18b
+-0,       9436,       9436,      108,     1944, 0x40e849a9
+-0,       9548,       9548,       52,      936, 0xd668ccc3
++0,        112,        112,      108,     1944, 0x60e22a2a
++0,        224,        224,      108,     1944, 0x56d8eed4
++0,        336,        336,      108,     1944, 0x683dc5dd
++0,        448,        448,      108,     1944, 0x061202b8
++0,        560,        560,      108,     1944, 0x646d5850
++0,        672,        672,      108,     1944, 0x9a6207b5
++0,        756,        756,      108,     1944, 0x1246576e
++0,        868,        868,      108,     1944, 0x6100c969
++0,        980,        980,      108,     1944, 0xb70bebc9
++0,       1092,       1092,      108,     1944, 0x65ea9038
++0,       1204,       1204,      108,     1944, 0xccb4c213
++0,       1316,       1316,      108,     1944, 0xdae7f53d
++0,       1428,       1428,      108,     1944, 0x68472fcf
++0,       1512,       1512,      108,     1944, 0x52782cf1
++0,       1624,       1624,      108,     1944, 0x8e697053
++0,       1736,       1736,      108,     1944, 0x1588455d
++0,       1848,       1848,      108,     1944, 0xf82ec19a
++0,       1960,       1960,      108,     1944, 0x9b35a4e7
++0,       2072,       2072,      108,     1944, 0x7a61b22b
++0,       2184,       2184,      108,     1944, 0xe09d44b9
++0,       2268,       2268,      108,     1944, 0xbaedee73
++0,       2380,       2380,      108,     1944, 0x9ec2e7a3
++0,       2492,       2492,      108,     1944, 0xd29b478b
++0,       2604,       2604,      108,     1944, 0x0b0d3289
++0,       2716,       2716,      108,     1944, 0x6327ccf2
++0,       2828,       2828,      108,     1944, 0x1f920456
++0,       2940,       2940,      108,     1944, 0x26c3b0be
++0,       3024,       3024,      108,     1944, 0x43ec8128
++0,       3136,       3136,      108,     1944, 0x819b6a1c
++0,       3248,       3248,      108,     1944, 0x2d6d3759
++0,       3360,       3360,      108,     1944, 0xd2973321
++0,       3472,       3472,      108,     1944, 0xfd0b1381
++0,       3584,       3584,      108,     1944, 0xb12f4bbe
++0,       3696,       3696,      108,     1944, 0xde536326
++0,       3780,       3780,      108,     1944, 0x7f9b6f59
++0,       3892,       3892,      108,     1944, 0xe3632307
++0,       4004,       4004,      108,     1944, 0x0123edd2
++0,       4116,       4116,      108,     1944, 0x04014cdb
++0,       4228,       4228,      108,     1944, 0x18a5fe52
++0,       4340,       4340,      108,     1944, 0xe6c289ab
++0,       4452,       4452,      108,     1944, 0x94837d9b
++0,       4536,       4536,      108,     1944, 0xafbe17f0
++0,       4648,       4648,      108,     1944, 0x41739464
++0,       4760,       4760,      108,     1944, 0xec4df915
++0,       4872,       4872,      108,     1944, 0x8e197483
++0,       4984,       4984,      108,     1944, 0x58e10b66
++0,       5096,       5096,      108,     1944, 0xb5aae156
++0,       5208,       5208,      108,     1944, 0x34054712
++0,       5292,       5292,      108,     1944, 0x9592514c
++0,       5404,       5404,      108,     1944, 0x89791fd4
++0,       5516,       5516,      108,     1944, 0x07b7decb
++0,       5628,       5628,      108,     1944, 0xd52adb51
++0,       5740,       5740,      108,     1944, 0x0a96509a
++0,       5852,       5852,      108,     1944, 0x92e71fc5
++0,       5964,       5964,      108,     1944, 0x0a4c2c70
++0,       6048,       6048,      108,     1944, 0xd8677d5c
++0,       6160,       6160,      108,     1944, 0xaa5a97c0
++0,       6272,       6272,      108,     1944, 0xc4be63f5
++0,       6384,       6384,      108,     1944, 0xd894e9a4
++0,       6496,       6496,      108,     1944, 0x4fd50ac8
++0,       6608,       6608,      108,     1944, 0x532dc3b5
++0,       6720,       6720,      108,     1944, 0xcbfd8fe8
++0,       6804,       6804,      108,     1944, 0xac5ba10a
++0,       6916,       6916,      108,     1944, 0x603c7490
++0,       7028,       7028,      108,     1944, 0xb1802221
++0,       7140,       7140,      108,     1944, 0x80f8d32d
++0,       7252,       7252,      108,     1944, 0xc4d61037
++0,       7364,       7364,      108,     1944, 0x39a26f5a
++0,       7476,       7476,      108,     1944, 0xb31cfe87
++0,       7560,       7560,      108,     1944, 0xc58dff1f
++0,       7672,       7672,      108,     1944, 0xdf364de4
++0,       7784,       7784,      108,     1944, 0xe35c0c13
++0,       7896,       7896,      108,     1944, 0x51f72933
++0,       8008,       8008,      108,     1944, 0x037932cd
++0,       8120,       8120,      108,     1944, 0x5748616a
++0,       8232,       8232,      108,     1944, 0x0ad1479e
++0,       8316,       8316,      108,     1944, 0x48af5e8d
++0,       8428,       8428,      108,     1944, 0x4633401c
++0,       8540,       8540,      108,     1944, 0x6a1f39f1
++0,       8652,       8652,      108,     1944, 0x603cc44a
++0,       8764,       8764,      108,     1944, 0x43717e25
++0,       8876,       8876,      108,     1944, 0x898bc7e7
++0,       8988,       8988,      108,     1944, 0x6bbfbb9c
++0,       9072,       9072,      108,     1944, 0x524a8fd5
++0,       9184,       9184,      108,     1944, 0xb2722b61
++0,       9296,       9296,      108,     1944, 0x3ef0ea22
++0,       9408,       9408,      108,     1944, 0x62e223fc
++0,       9520,       9520,       80,     1440, 0x0b497a94
