@@ -5,9 +5,10 @@
                                                             [--cpuflags FLAGS] [--keep DIR]
 
 Everything is synthetic. The picture is a frame of flat patches, each one base-layer code triple
-(I, P, T): a grey ramp, rings of colours 16 to 260 codes around neutral, and bright colours whose
-L'M'S' goes above the PQ range. FFmpeg's libx265 encodes it losslessly, and this script writes a
-profile 5 RPU itself and appends it to the access unit. It checks seven RPUs on the same picture.
+(I, P, T): a grey ramp, rings of colours 16 to 260 codes around neutral, bright colours whose
+L'M'S' goes above the PQ range, and colours on and beside the chroma pivots of the last RPU.
+FFmpeg's libx265 encodes it losslessly, and this script writes a profile 5 RPU itself and appends
+it to the access unit. It checks eight RPUs on the same picture.
 Two reshape P and T with one piece each: a polynomial, or MMR, which maps each of them from the
 base-layer I, P and T together. The others split P and T into pieces at pivots:
 
@@ -16,9 +17,10 @@ base-layer I, P and T together. The others split P and T into pieces at pivots:
     eight first-order pieces, the most an RPU carries, with I in eight pieces too
     two MMR pieces of different orders
     an MMR piece, a polynomial piece, then another MMR piece
+    three polynomial pieces with a step at each pivot, and patches on the pivots
 
 P and T never share a pivot code, and every piece reshapes at least MIN_PATCHES_PER_PIECE
-checked patches.
+checked patches. Only the last RPU has patches on its pivots.
 Inside a flat patch, chroma siting and interpolation cannot change the result, so every output
 code is compared with the value the profile 5 definition gives, computed here in double precision:
 
@@ -54,7 +56,7 @@ import sys
 import tempfile
 
 PATCH = 16
-COLUMNS, ROWS = 24, 39
+COLUMNS, ROWS = 24, 41
 WIDTH, HEIGHT = COLUMNS * PATCH, ROWS * PATCH
 GREY_TOLERANCE = 1
 COLOUR_TOLERANCE = 1
@@ -78,9 +80,9 @@ def one_piece(piece):
 LUMA = one_piece(Polynomial((0.01, 0.85, 0.14)))
 CHROMA = one_piece(Polynomial((0.03, 0.94)))
 POLYNOMIAL, MMR = "polynomial", "MMR"
-TWO_POLYNOMIALS, THREE_POLYNOMIALS, EIGHT_POLYNOMIALS, TWO_MMR, MIXED = (
+TWO_POLYNOMIALS, THREE_POLYNOMIALS, EIGHT_POLYNOMIALS, TWO_MMR, MIXED, PIVOT_PATCHES = (
     "two-piece polynomial chroma", "three-piece polynomial chroma", "eight-piece polynomial", "two-piece MMR chroma",
-    "mixed MMR and polynomial chroma")
+    "mixed MMR and polynomial chroma", "chroma pivots on patch codes")
 # name -> the curves of I, P and T. All but the eight-piece RPU reshape I with one second-order piece.
 RPUS = {
     POLYNOMIAL: (LUMA, CHROMA, CHROMA),
@@ -135,6 +137,13 @@ RPUS = {
             Curve((0, 470, 597, 1023), (Mmr(0.15, ((-0.15, 0, 0.55, 0, 0.3, 0, 0), (0, 0, 0.3, 0, 0, 0, 0))),
                                         Polynomial((0.3625, -0.45, 1.45)),
                                         Mmr(0.0, ((0.1, -0.1, 1.0, 0, -0.2, 0.2, 0),))))),
+    # P steps up by 0.03 at code 545 and back down at code 673. T steps down by 0.03 at code 549
+    # and back up at code 677. Patches sit on each pivot and one code either side of it, so a
+    # filter that reshapes a code on a pivot with the piece below fails. Read from a 16-bit
+    # texture in float32, each of these four codes can come out just below its own pivot.
+    PIVOT_PATCHES: (LUMA,
+                    Curve((0, 545, 673, 1023), tuple(map(Polynomial, ((0, 1), (0.03, 1), (0, 1))))),
+                    Curve((0, 549, 677, 1023), tuple(map(Polynomial, ((0, 1), (-0.03, 1), (0, 1)))))),
 }
 
 # The IPT-PQ-C2 colour space of profile 5, as the RPU carries it.
@@ -237,6 +246,10 @@ def patch_triples():
             triples += ring(luma, radius, 16)
     triples += [triple for luma in (960, 992, 1023) for radius in (90, 140) for triple in ring(luma, radius, 16)
                 if exact_codes(triple)[1] == ABOVE_RANGE]
+    _, p_curve, t_curve = RPUS[PIVOT_PATCHES]
+    for luma in (320, 512, 704):
+        triples += [(luma, pivot + step, 512) for pivot in p_curve.pivots[1:-1] for step in (-1, 0, 1)]
+        triples += [(luma, 512, pivot + step) for pivot in t_curve.pivots[1:-1] for step in (-1, 0, 1)]
     triples += [(512, 512, 512)] * (-len(triples) % COLUMNS)
     assert len(triples) == COLUMNS * ROWS
     return triples

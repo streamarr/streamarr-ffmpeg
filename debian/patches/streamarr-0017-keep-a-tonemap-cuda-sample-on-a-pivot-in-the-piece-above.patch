@@ -1,0 +1,40 @@
+Description: avfilter/tonemap_cuda: keep a sample on a pivot in the piece that starts there
+ The reshape kernel reads a 10-bit sample from a 16-bit texture and
+ rescales it in float32. For some codes, 545 among them, the result is
+ one ulp below the pivot of the same code, which is stored as
+ code * (1.0f / 1023). A sample on such a pivot took the piece before.
+ tonemapx divides each sample by 1023 and is not affected.
+ .
+ Store each inner pivot 2^-21 lower. That is 8 ulps at 0.5, and less
+ than any other 10-bit read lies below a pivot: a whole code lies at
+ least 1/1023 below, and chroma that the texture filters between two
+ codes at least 1/256 of a code. On a synthetic profile 5 picture with
+ patches on four chroma pivots, all 12 patches on a pivot took the
+ piece below before this patch, up to 16 chroma codes off, and none
+ after. Only samples that read exactly a pivot code change.
+Author: Streamarr
+Forwarded: no
+Last-Update: 2026-11-13
+---
+Index: FFmpeg/libavfilter/vf_tonemap_cuda.c
+===================================================================
+--- FFmpeg.orig/libavfilter/vf_tonemap_cuda.c
++++ FFmpeg/libavfilter/vf_tonemap_cuda.c
+@@ -505,10 +505,14 @@ static void update_dovi_buf(AVFilterContext *ctx)
+ 
+         // dovi_pivots
+         if (comp->num_pivots > 2) {
+-            // Skip the (irrelevant) lower and upper bounds
++            // The kernel reads a code to within a few float ulps of code / (2^depth - 1), sometimes
++            // just below the pivot of the same code. Lowering each pivot by 2^-21, 8 ulps at 0.5,
++            // keeps such a sample in the piece that starts at the pivot. Any other 10-bit read,
++            // a whole code or chroma the texture filters between codes, lies further from a pivot.
+             float pivots_data[7+1] = {0};
+-            memcpy(pivots_data, comp->pivots + 1,
+-                   (comp->num_pivots - 2) * sizeof(pivots_data[0]));
++            // Skip the (irrelevant) lower and upper bounds
++            for (i = 0; i < comp->num_pivots - 2; i++)
++                pivots_data[i] = comp->pivots[i + 1] - 0x1p-21f;
+             // Fill the remainder with a quasi-infinite sentinel pivot
+             for (i = comp->num_pivots - 2; i < FF_ARRAY_ELEMS(pivots_data); i++)
+                 pivots_data[i] = 1e9f;
