@@ -1,0 +1,55 @@
+Description: avfilter/tonemap_cuda: keep a sample on a pivot in the piece that starts there
+ The reshape kernel reads a 10-bit sample from a 16-bit texture and
+ rescales it in float32. For some codes, 545 among them, the result is
+ one ulp below the pivot of the same code, which is stored as
+ code * (1.0f / 1023). A sample on such a pivot took the piece before.
+ tonemapx divides each sample by 1023 and is not affected.
+ .
+ Store each inner pivot 2^-21 lower. That is 8 ulps at 0.5, above the
+ rounding of the read, and far below the 1/1023 between two 10-bit
+ codes. The texture filters chroma between texels. On the NVIDIA GPU
+ these patches were tested on, every filtered read is a whole 16-bit
+ step. One step is 1/64 of a 10-bit code and 32 times the margin. So a
+ filtered read below a pivot code lies at least one step below it, and
+ the margin moves no filtered chroma into the piece above. A GPU that
+ filtered to finer steps could move chroma filtered to within 2^-21
+ below a pivot.
+ .
+ On a synthetic profile 5 picture with patches on four chroma pivots,
+ all 12 patches on a pivot took the piece below before this patch, up
+ to 16 chroma codes off, and none after. On that picture only samples
+ that read exactly a pivot code change.
+ .
+ Other synthetic frames hold random chroma codes around a P pivot at
+ code 546 and a T pivot at code 550. They are cropped to odd sizes from
+ 511 by 511 to 1919 by 1079. Codes 546 and 550 read at or above their
+ own pivot without a margin, so only a filtered read could take another
+ piece. The filter wrote the same output for these frames with this
+ margin as with none. A margin of 2^-15, two steps, changed about 0.5 %
+ of their samples.
+Author: Streamarr
+Forwarded: no
+Last-Update: 2026-11-13
+---
+Index: FFmpeg/libavfilter/vf_tonemap_cuda.c
+===================================================================
+--- FFmpeg.orig/libavfilter/vf_tonemap_cuda.c
++++ FFmpeg/libavfilter/vf_tonemap_cuda.c
+@@ -505,10 +505,14 @@ static void update_dovi_buf(AVFilterContext *ctx)
+ 
+         // dovi_pivots
+         if (comp->num_pivots > 2) {
+-            // Skip the (irrelevant) lower and upper bounds
++            // The kernel reads a code to within a few float ulps of code / (2^depth - 1), sometimes
++            // just below the pivot of the same code. Lowering each pivot by 2^-21, 8 ulps at 0.5,
++            // keeps such a sample in the piece that starts at the pivot. The GPU tested filters
++            // chroma to whole 16-bit steps, 32 times 2^-21, so no filtered read changes piece.
+             float pivots_data[7+1] = {0};
+-            memcpy(pivots_data, comp->pivots + 1,
+-                   (comp->num_pivots - 2) * sizeof(pivots_data[0]));
++            // Skip the (irrelevant) lower and upper bounds
++            for (i = 0; i < comp->num_pivots - 2; i++)
++                pivots_data[i] = comp->pivots[i + 1] - 0x1p-21f;
+             // Fill the remainder with a quasi-infinite sentinel pivot
+             for (i = comp->num_pivots - 2; i < FF_ARRAY_ELEMS(pivots_data); i++)
+                 pivots_data[i] = 1e9f;

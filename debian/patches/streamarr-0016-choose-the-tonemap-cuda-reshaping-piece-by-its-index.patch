@@ -1,0 +1,50 @@
+Description: avfilter/tonemap_cuda: choose the reshaping piece by its index
+ The reshape kernel chose a component's piece by blending the
+ coefficients of neighbouring pieces with mix(x, y, t), which computes
+ x + (y - x) * t. t is 0 or 1. With t = 1 the result can differ from y
+ in the last bit. The kernel truncates the chosen piece's MMR offset to
+ a whole row. So when a polynomial piece with a negative coefficient on
+ s comes before an MMR piece, the blend can land just below that MMR
+ piece's row, and the kernel reads the weights of the row before.
+ .
+ The release build compiles the kernel with clang and -ffast-math, and
+ its output was right. Built without -ffast-math, on a synthetic profile
+ 5 picture whose P and T each have an MMR piece, a polynomial piece and
+ another MMR piece, 272 of 663 checked patches came out more than one
+ code from the definition, up to 498 luma codes.
+ .
+ Count the pivots that the signal reaches, and index the piece with that
+ count, as tonemap_d3d11 does. With -ffast-math the output does not
+ change.
+Author: Streamarr
+Forwarded: no
+Last-Update: 2026-11-13
+---
+Index: FFmpeg/libavfilter/cuda/tonemap.cu
+===================================================================
+--- FFmpeg.orig/libavfilter/cuda/tonemap.cu
++++ FFmpeg/libavfilter/cuda/tonemap.cu
+@@ -364,17 +364,12 @@ float3 reshape_dovi_yuv(float3 yuv,
+         coeffs = dovi_coeffs[0];
+ 
+         if (dovi_num_pivots > 2) {
+-            float t0 = s >= dovi_pivots[0], t1 = s >= dovi_pivots[1];
+-            float t2 = s >= dovi_pivots[2], t3 = s >= dovi_pivots[3];
+-            float t4 = s >= dovi_pivots[4], t5 = s >= dovi_pivots[5], t6 = s >= dovi_pivots[6];
+-
+-            coeffs = mix(mix(mix(dovi_coeffs[0], dovi_coeffs[1], make_float4(t0, t0, t0, t0)),
+-                             mix(dovi_coeffs[2], dovi_coeffs[3], make_float4(t2, t2, t2, t2)),
+-                             make_float4(t1, t1, t1, t1)),
+-                         mix(mix(dovi_coeffs[4], dovi_coeffs[5], make_float4(t4, t4, t4, t4)),
+-                             mix(dovi_coeffs[6], dovi_coeffs[7], make_float4(t6, t6, t6, t6)),
+-                             make_float4(t5, t5, t5, t5)),
+-                         make_float4(t3, t3, t3, t3));
++            // Index the piece rather than blend the pieces: x + (y - x) * 1 can round an MMR
++            // offset just below its row. The sentinel pivots above every signal end the count.
++            int piece = (s >= dovi_pivots[0]) + (s >= dovi_pivots[1]) + (s >= dovi_pivots[2]) +
++                        (s >= dovi_pivots[3]) + (s >= dovi_pivots[4]) + (s >= dovi_pivots[5]) +
++                        (s >= dovi_pivots[6]);
++            coeffs = dovi_coeffs[piece];
+         }
+ 
+         int has_mmr_poly = dovi_has_mmr && dovi_has_poly;

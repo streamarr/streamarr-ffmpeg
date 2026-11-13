@@ -1,0 +1,151 @@
+Description: avfilter/tonemapx: choose the reshaping piece in one function on the SIMD paths
+ The SSE4.2, AVX2 and NEON paths chose the piece of I's reshaping curve
+ inline, in reshape_dovi_iptpqc2(). The choice now sits in
+ dovi_piece_coeffs(), which takes a component's signal, its number of
+ pivots, its pivots and its coefficients. reshape_dovi_iptpqc2() still
+ calls it for I only, so the output does not change.
+Author: Streamarr
+Forwarded: no
+Last-Update: 2026-11-13
+---
+Index: FFmpeg/libavfilter/aarch64/vf_tonemapx_intrin_neon.c
+===================================================================
+--- FFmpeg.orig/libavfilter/aarch64/vf_tonemapx_intrin_neon.c
++++ FFmpeg/libavfilter/aarch64/vf_tonemapx_intrin_neon.c
+@@ -86,6 +86,23 @@ inline static float reshape_mmr(float32x4_t sig, float32x4_t coeffs, const float
+     return s;
+ }
+ 
++// The coefficients of the piece whose range holds s: the last one whose lower pivot s reaches.
++// pivots holds the inner pivots, then sentinels above every signal.
++inline static float32x4_t dovi_piece_coeffs(float s, int num_pivots, const float *pivots, const float *coeffs)
++{
++    if (num_pivots > 2) {
++        float32x4_t m01 = s >= pivots[0] ? vld1q_f32(coeffs + 4) : vld1q_f32(coeffs);
++        float32x4_t m23 = s >= pivots[2] ? vld1q_f32(coeffs + 3*4) : vld1q_f32(coeffs + 2*4);
++        float32x4_t m0123 = s >= pivots[1] ? m23 : m01;
++        float32x4_t m45 = s >= pivots[4] ? vld1q_f32(coeffs + 5*4) : vld1q_f32(coeffs + 4*4);
++        float32x4_t m67 = s >= pivots[6] ? vld1q_f32(coeffs + 7*4) : vld1q_f32(coeffs + 6*4);
++        float32x4_t m4567 = s >= pivots[5] ? m67 : m45;
++        return s >= pivots[3] ? m4567 : m0123;
++    }
++
++    return vld1q_f32(coeffs);
++}
++
+ #define CLAMP(a, b, c) (FFMIN(FFMAX((a), (b)), (c)))
+ inline static float32x4_t reshape_dovi_iptpqc2(float32x4_t sig, const TonemapIntParams *ctx)
+ {
+@@ -138,17 +155,7 @@ inline static float32x4_t reshape_dovi_iptpqc2(float32x4_t sig, const TonemapInt
+     // reshape I
+     s = vgetq_lane_f32(sig, 0);
+     result = sig;
+-    if (dovi_num_pivots_i > 2) {
+-        float32x4_t m01 = s >= dovi_pivots_i[0] ? vld1q_f32(dovi_coeffs_i + 4) : vld1q_f32(dovi_coeffs_i);
+-        float32x4_t m23 = s >= dovi_pivots_i[2] ? vld1q_f32(dovi_coeffs_i + 3*4) : vld1q_f32(dovi_coeffs_i + 2*4);
+-        float32x4_t m0123 = s >= dovi_pivots_i[1] ? m23 : m01;
+-        float32x4_t m45 = s >= dovi_pivots_i[4] ? vld1q_f32(dovi_coeffs_i + 5*4) : vld1q_f32(dovi_coeffs_i + 4*4);
+-        float32x4_t m67 = s >= dovi_pivots_i[6] ? vld1q_f32(dovi_coeffs_i + 7*4) : vld1q_f32(dovi_coeffs_i + 6*4);
+-        float32x4_t m4567 = s >= dovi_pivots_i[5] ? m67 : m45;
+-        coeffs = s >= dovi_pivots_i[3] ? m4567 : m0123;
+-    } else {
+-        coeffs = vld1q_f32(dovi_coeffs_i);
+-    }
++    coeffs = dovi_piece_coeffs(s, dovi_num_pivots_i, dovi_pivots_i, dovi_coeffs_i);
+ 
+     has_mmr_poly = dovi_has_mmr_i && dovi_has_poly_i;
+ 
+Index: FFmpeg/libavfilter/x86/vf_tonemapx_intrin_avx.c
+===================================================================
+--- FFmpeg.orig/libavfilter/x86/vf_tonemapx_intrin_avx.c
++++ FFmpeg/libavfilter/x86/vf_tonemapx_intrin_avx.c
+@@ -103,6 +103,23 @@ X86_64_V3 inline static float reshape_mmr(__m128 sig, __m128 coeffs, const float
+     return s;
+ }
+ 
++// The coefficients of the piece whose range holds s: the last one whose lower pivot s reaches.
++// pivots holds the inner pivots, then sentinels above every signal.
++X86_64_V3 inline static __m128 dovi_piece_coeffs(float s, int num_pivots, const float *pivots, const float *coeffs)
++{
++    if (num_pivots > 2) {
++        __m128 m01 = s >= pivots[0] ? _mm_loadu_ps(coeffs + 4) : _mm_loadu_ps(coeffs);
++        __m128 m23 = s >= pivots[2] ? _mm_loadu_ps(coeffs + 3*4) : _mm_loadu_ps(coeffs + 2*4);
++        __m128 m0123 = s >= pivots[1] ? m23 : m01;
++        __m128 m45 = s >= pivots[4] ? _mm_loadu_ps(coeffs + 5*4) : _mm_loadu_ps(coeffs + 4*4);
++        __m128 m67 = s >= pivots[6] ? _mm_loadu_ps(coeffs + 7*4) : _mm_loadu_ps(coeffs + 6*4);
++        __m128 m4567 = s >= pivots[5] ? m67 : m45;
++        return s >= pivots[3] ? m4567 : m0123;
++    }
++
++    return _mm_loadu_ps(coeffs);
++}
++
+ #define CLAMP(a, b, c) (FFMIN(FFMAX((a), (b)), (c)))
+ X86_64_V3 inline static __m128 reshape_dovi_iptpqc2(__m128 sig, const TonemapIntParams *ctx)
+ {
+@@ -155,17 +172,7 @@ X86_64_V3 inline static __m128 reshape_dovi_iptpqc2(__m128 sig, const TonemapInt
+     // reshape I
+     s = _mm_cvtss_f32(sig);
+     result = sig;
+-    if (dovi_num_pivots_i > 2) {
+-        __m128 m01 = s >= dovi_pivots_i[0] ? _mm_loadu_ps(dovi_coeffs_i + 4) : _mm_loadu_ps(dovi_coeffs_i);
+-        __m128 m23 = s >= dovi_pivots_i[2] ? _mm_loadu_ps(dovi_coeffs_i + 3*4) : _mm_loadu_ps(dovi_coeffs_i + 2*4);
+-        __m128 m0123 = s >= dovi_pivots_i[1] ? m23 : m01;
+-        __m128 m45 = s >= dovi_pivots_i[4] ? _mm_loadu_ps(dovi_coeffs_i + 5*4) : _mm_loadu_ps(dovi_coeffs_i + 4*4);
+-        __m128 m67 = s >= dovi_pivots_i[6] ? _mm_loadu_ps(dovi_coeffs_i + 7*4) : _mm_loadu_ps(dovi_coeffs_i + 6*4);
+-        __m128 m4567 = s >= dovi_pivots_i[5] ? m67 : m45;
+-        coeffs = s >= dovi_pivots_i[3] ? m4567 : m0123;
+-    } else {
+-        coeffs = _mm_loadu_ps(dovi_coeffs_i);
+-    }
++    coeffs = dovi_piece_coeffs(s, dovi_num_pivots_i, dovi_pivots_i, dovi_coeffs_i);
+ 
+     has_mmr_poly = dovi_has_mmr_i && dovi_has_poly_i;
+ 
+Index: FFmpeg/libavfilter/x86/vf_tonemapx_intrin_sse.c
+===================================================================
+--- FFmpeg.orig/libavfilter/x86/vf_tonemapx_intrin_sse.c
++++ FFmpeg/libavfilter/x86/vf_tonemapx_intrin_sse.c
+@@ -140,6 +140,23 @@ X86_64_V2 inline static float reshape_mmr(__m128 sig, __m128 coeffs, const float
+     return s;
+ }
+ 
++// The coefficients of the piece whose range holds s: the last one whose lower pivot s reaches.
++// pivots holds the inner pivots, then sentinels above every signal.
++X86_64_V2 inline static __m128 dovi_piece_coeffs(float s, int num_pivots, const float *pivots, const float *coeffs)
++{
++    if (num_pivots > 2) {
++        __m128 m01 = s >= pivots[0] ? _mm_loadu_ps(coeffs + 4) : _mm_loadu_ps(coeffs);
++        __m128 m23 = s >= pivots[2] ? _mm_loadu_ps(coeffs + 3*4) : _mm_loadu_ps(coeffs + 2*4);
++        __m128 m0123 = s >= pivots[1] ? m23 : m01;
++        __m128 m45 = s >= pivots[4] ? _mm_loadu_ps(coeffs + 5*4) : _mm_loadu_ps(coeffs + 4*4);
++        __m128 m67 = s >= pivots[6] ? _mm_loadu_ps(coeffs + 7*4) : _mm_loadu_ps(coeffs + 6*4);
++        __m128 m4567 = s >= pivots[5] ? m67 : m45;
++        return s >= pivots[3] ? m4567 : m0123;
++    }
++
++    return _mm_loadu_ps(coeffs);
++}
++
+ #define CLAMP(a, b, c) (FFMIN(FFMAX((a), (b)), (c)))
+ X86_64_V2 inline static __m128 reshape_dovi_iptpqc2(__m128 sig, const TonemapIntParams *ctx)
+ {
+@@ -192,17 +209,7 @@ X86_64_V2 inline static __m128 reshape_dovi_iptpqc2(__m128 sig, const TonemapInt
+     // reshape I
+     s = _mm_cvtss_f32(sig);
+     result = sig;
+-    if (dovi_num_pivots_i > 2) {
+-        __m128 m01 = s >= dovi_pivots_i[0] ? _mm_loadu_ps(dovi_coeffs_i + 4) : _mm_loadu_ps(dovi_coeffs_i);
+-        __m128 m23 = s >= dovi_pivots_i[2] ? _mm_loadu_ps(dovi_coeffs_i + 3*4) : _mm_loadu_ps(dovi_coeffs_i + 2*4);
+-        __m128 m0123 = s >= dovi_pivots_i[1] ? m23 : m01;
+-        __m128 m45 = s >= dovi_pivots_i[4] ? _mm_loadu_ps(dovi_coeffs_i + 5*4) : _mm_loadu_ps(dovi_coeffs_i + 4*4);
+-        __m128 m67 = s >= dovi_pivots_i[6] ? _mm_loadu_ps(dovi_coeffs_i + 7*4) : _mm_loadu_ps(dovi_coeffs_i + 6*4);
+-        __m128 m4567 = s >= dovi_pivots_i[5] ? m67 : m45;
+-        coeffs = s >= dovi_pivots_i[3] ? m4567 : m0123;
+-    } else {
+-        coeffs = _mm_loadu_ps(dovi_coeffs_i);
+-    }
++    coeffs = dovi_piece_coeffs(s, dovi_num_pivots_i, dovi_pivots_i, dovi_coeffs_i);
+ 
+     has_mmr_poly = dovi_has_mmr_i && dovi_has_poly_i;
+ 
