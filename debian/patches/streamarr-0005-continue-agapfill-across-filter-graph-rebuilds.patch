@@ -114,6 +114,26 @@ Description: fftools/ffmpeg_filter: continue the output of agapfill when a filte
  The asking still keeps the other inputs of the graph waiting. With
  -shortest, the audio of an output can then run past its video, to about
  the end of the gap less -shortest_buf_duration. max_gap bounds that.
+ .
+ A filter behind agapfill that writes frames of its own without asking
+ agapfill for more, for example aloop=loop=-1, gives a frame at every
+ request. send_frame() then never stops asking and never builds the new
+ graph, unless the output ends, for example at the time that -t sets.
+ -shortest is no such end, because the video waits with the other inputs.
+ Without an end, ffmpeg writes the repeated audio without limit, and one
+ SIGTERM does not stop ffmpeg, because sch_stop() waits for the filter
+ graph's thread. Any rule that stops the asking must pick a number of
+ requests or samples in which agapfill does not move. A small number turns
+ real audio into silence behind a filter that cuts frames smaller, for
+ example asetnsamples. A large number writes that much repeated audio
+ first. So the asking stays as it is.
+ .
+ send_frame() asks only ffmpeg's outputs, because only libavfilter can ask
+ a sink inside the graph, for example anullsink. A filter that waits on
+ the way to such a sink, for example amix behind asplit, then keeps the
+ rest of the gap in memory while the outputs take the same silence. With
+ a gap of 10 minutes, ffmpeg peaked at 229 to 232 MB instead of 12 to
+ 15 MB. No sample is lost, and max_gap bounds the memory.
 Author: Streamarr
 Forwarded: no
 Last-Update: 2026-11-12
@@ -122,7 +142,7 @@ Index: FFmpeg/doc/filters.texi
 ===================================================================
 --- FFmpeg.orig/doc/filters.texi
 +++ FFmpeg/doc/filters.texi
-@@ -2165,6 +2165,67 @@ agapfill=start=0:max_gap=600
+@@ -2165,6 +2165,82 @@ agapfill=start=0:max_gap=600
  @end example
  @end itemize
  
@@ -186,6 +206,21 @@ Index: FFmpeg/doc/filters.texi
 +graph wait. With @option{-shortest}, the audio of an output can then run past
 +its video, to about the end of the gap less @option{-shortest_buf_duration}.
 +@option{max_gap} bounds that.
++
++A filter behind agapfill that writes frames of its own without asking for
++more, for example @code{aloop=loop=-1}, gives a frame at every request.
++@command{ffmpeg} then never stops asking and never builds the new graph,
++unless the output ends, for example at the time that @option{-t} sets.
++@option{-shortest} is no such end, because the video waits with the other
++inputs of the graph. Without such an end, @command{ffmpeg} never stops
++writing the repeated audio on its own.
++
++@command{ffmpeg} asks only its own outputs, not a sink inside the graph such
++as @code{anullsink}. When a filter on the way to such a sink waits for another
++input, for example @code{amix} behind @code{asplit}, the outputs still give
++frames. @command{ffmpeg} then asks for the whole rest of the gap, and the
++waiting filter keeps all of that silence in memory until @command{ffmpeg}
++frees the old graph. @option{max_gap} bounds that memory.
 +
  @section agate
  
