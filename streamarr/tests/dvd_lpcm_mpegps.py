@@ -22,6 +22,8 @@ DVD-Video gives each LPCM packet the number of audio frames that start in its pa
 to the first of them, where 4 is the payload's first byte. The packet's timestamp names that frame.
 The check also requires:
 
+    in the shape whose frames are 120 samples, every packet gives the number of frames that start
+    in its payload and the pointer to the first of them, or 0 frames and pointer 0 when none starts
     every packet with a timestamp starts a frame at its pointer, and the timestamp is that byte's
     time, to within one tick of the 90 kHz clock
     a packet in which no frame starts carries no timestamp
@@ -306,6 +308,19 @@ def misaligned_payloads(vob, bits, channels):
     return misaligned, len(packets)
 
 
+def wrong_frame_headers(vob, frame_bytes):
+    """Packets whose frame count or pointer does not give the frames of frame_bytes, counted from
+    the stream's first byte, that start in their payload, of all packets."""
+    offset = wrong = 0
+    packets = lpcm_packets(vob)
+    for packet in packets:
+        first = -(-offset // frame_bytes) * frame_bytes
+        count = -(-(offset + len(packet.payload)) // frame_bytes) - first // frame_bytes
+        wrong += (packet.frames, packet.pointer) != (count, first - offset + 4 if count else 0)
+        offset += len(packet.payload)
+    return wrong, len(packets)
+
+
 def misplaced_timestamps(vob, bits, rate, channels):
     """Packets whose timestamp is not the time of the byte at their pointer, of all stamped ones.
 
@@ -406,7 +421,7 @@ def shape_name(shape):
 
 
 def check_shape(ffmpeg, directory, shape):
-    bits, rate, channels, _ = shape
+    bits, rate, channels, frame_size = shape
     name = shape_name(shape)
     vob = write_source(ffmpeg, directory, shape)
     failures = 0
@@ -416,10 +431,18 @@ def check_shape(ffmpeg, directory, shape):
     print("%s: %d of %d LPCM payloads start inside a %d-byte block: %s"
           % (name, misaligned, total, block_size(bits, channels), "ok" if not misaligned else "WRONG"))
 
+    if frame_size:
+        wrong, total = wrong_frame_headers(vob, frame_size * channels * bits // 8)
+        right = total and wrong == 0
+        failures += not right
+        print("%s: %d of %d LPCM packets do not give the number of frames that start in them and"
+              " where the first starts: %s" % (name, wrong, total, "ok" if right else "WRONG"))
+
     misplaced, stamped = misplaced_timestamps(vob, bits, rate, channels)
-    failures += misplaced != 0
+    right = stamped and misplaced == 0
+    failures += not right
     print("%s: %d of %d LPCM timestamps do not name the frame at the packet's pointer: %s"
-          % (name, misplaced, stamped, "ok" if not misplaced else "WRONG"))
+          % (name, misplaced, stamped, "ok" if right else "WRONG"))
     return failures + check_decodes(ffmpeg, vob, shape, name)
 
 
