@@ -7,7 +7,7 @@
 Everything is synthetic. The picture is a frame of flat patches, each one base-layer code triple
 (I, P, T): a grey ramp, rings of colours 16 to 260 codes around neutral, and bright colours whose
 L'M'S' goes above the PQ range. FFmpeg's libx265 encodes it losslessly, and this script writes a
-profile 5 RPU itself and appends it to the access unit. It checks six RPUs on the same picture.
+profile 5 RPU itself and appends it to the access unit. It checks seven RPUs on the same picture.
 Two reshape P and T with one piece each: a polynomial, or MMR, which maps each of them from the
 base-layer I, P and T together. The others split P and T into pieces at pivots:
 
@@ -15,6 +15,7 @@ base-layer I, P and T together. The others split P and T into pieces at pivots:
     three polynomial pieces, two of them of second order
     eight first-order pieces, the most an RPU carries, with I in eight pieces too
     two MMR pieces of different orders
+    an MMR piece, a polynomial piece, then another MMR piece
 
 P and T never share a pivot code, and every piece reshapes at least MIN_PATCHES_PER_PIECE
 checked patches.
@@ -77,8 +78,9 @@ def one_piece(piece):
 LUMA = one_piece(Polynomial((0.01, 0.85, 0.14)))
 CHROMA = one_piece(Polynomial((0.03, 0.94)))
 POLYNOMIAL, MMR = "polynomial", "MMR"
-TWO_POLYNOMIALS, THREE_POLYNOMIALS, EIGHT_POLYNOMIALS, TWO_MMR = (
-    "two-piece polynomial chroma", "three-piece polynomial chroma", "eight-piece polynomial", "two-piece MMR chroma")
+TWO_POLYNOMIALS, THREE_POLYNOMIALS, EIGHT_POLYNOMIALS, TWO_MMR, MIXED = (
+    "two-piece polynomial chroma", "three-piece polynomial chroma", "eight-piece polynomial", "two-piece MMR chroma",
+    "mixed MMR and polynomial chroma")
 # name -> the curves of I, P and T. All but the eight-piece RPU reshape I with one second-order piece.
 RPUS = {
     POLYNOMIAL: (LUMA, CHROMA, CHROMA),
@@ -119,6 +121,20 @@ RPUS = {
               Curve((0, 470, 1023), (Mmr(0.125, ((-0.15, -0.1, 0.75, 0, 0.3, 0.2, 0),)),
                                      Mmr(-0.125, ((0.1, 0, 1.55, 0, -0.2, 0, 0), (0, 0, -0.9, 0, 0, 0, 0),
                                                   (0, 0, 0.6, 0, 0, 0, 0)))))),
+    # P: below code 440, the MMR RPU's P; up to code 555, 0.5 + (P - 0.5) + 1.41 (P - 0.5)^2;
+    # from there, the second piece of the two-piece MMR RPU's P. T: below code 470,
+    # T + 0.3 (I - 0.5) (T - 0.5) + 0.3 (T - 0.5)^2, of second order; up to code 597,
+    # 0.5 + (T - 0.5) + 1.45 (T - 0.5)^2; from there,
+    # T + 0.2 (P - 0.5) (T - 0.5) - 0.2 (I - 0.5) (T - 0.5). The polynomial pieces have a negative
+    # coefficient on s, chosen so that blending it with the third piece in float32, x + (y - x),
+    # lands just below the row where that piece's MMR weights start.
+    MIXED: (LUMA,
+            Curve((0, 440, 555, 1023), (Mmr(0.075, ((-0.15, 0.85, 0, 0.3, 0, 0, 0),)),
+                                        Polynomial((0.3525, -0.41, 1.41)),
+                                        Mmr(-0.0125, ((0.125, 1.025, -0.1, -0.25, 0, 0.2, 0),)))),
+            Curve((0, 470, 597, 1023), (Mmr(0.15, ((-0.15, 0, 0.55, 0, 0.3, 0, 0), (0, 0, 0.3, 0, 0, 0, 0))),
+                                        Polynomial((0.3625, -0.45, 1.45)),
+                                        Mmr(0.0, ((0.1, -0.1, 1.0, 0, -0.2, 0.2, 0),))))),
 }
 
 # The IPT-PQ-C2 colour space of profile 5, as the RPU carries it.

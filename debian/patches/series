@@ -115,3 +115,4 @@ streamarr-0012-round-10-bit-samples-on-the-tonemapx-neon-path.patch
 streamarr-0013-choose-the-tonemapx-reshaping-piece-in-one-function.patch
 streamarr-0014-reshape-each-dolby-vision-component-by-its-own-piece.patch
 streamarr-0015-read-each-mmr-piece-from-its-own-offset-in-tonemapx.patch
+streamarr-0016-choose-the-tonemap-cuda-reshaping-piece-by-its-index.patch
