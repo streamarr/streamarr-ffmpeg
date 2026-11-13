@@ -1,0 +1,758 @@
+Description: fftools/ffmpeg_filter: continue the output of agapfill when a filter graph is rebuilt
+ ffmpeg builds a new filter graph when the parameters of an input change
+ mid-stream, for example when an AC-3 stream changes from 5.1 to stereo.
+ The agapfill filter of the new graph started from nothing. With its
+ start option it wrote the leading silence a second time: a source of
+ 10.05 s that begins at 2 s came out as 19.07 s. A gap at the change
+ stayed a hole, because only the old filter knew where the audio had
+ stopped, and an overlap at the change made the output step backward.
+ .
+ The filter gains two commands. position reports where its output
+ stands, and resume makes a filter continue from such a report. Before
+ send_frame() replaces a graph, it notes the position of every agapfill
+ filter. configure_filtergraph() makes the agapfill filter in its place
+ in the new graph resume from it. A filter that took no frame reports
+ nothing, so its successor starts afresh and still writes the leading
+ silence. That is the case after a seek whose discarded frames hold the
+ change.
+ .
+ The positions were noted by filter name, but a name does not tell two
+ filters apart. The keys matched regardless of case, so the position of
+ agapfill@A replaced that of agapfill@a. agapfill@a of the new graph
+ found none and started from nothing, and the source above came out as
+ 19.07 s again. ffmpeg also accepts an instance name twice, and cuts
+ a name to 63 characters. Two filters of one name, the second 10 s later
+ than the first, both resumed from the second one's position: the first
+ joined its next frame there, the second filled the 10 s up to it, and
+ the audio after the rebuild came 10 s late. The positions now go by the
+ order of the agapfill filters in the graph, which the same description
+ gives them again.
+ .
+ resume counts the position in the new graph's sample rate. When the rate
+ rises, a position near the end of the 64-bit range can pass it, and
+ av_rescale_q_rnd() then answers INT64_MIN, which means no timestamp. A
+ position of 9 x 10^18 samples at 44.1 kHz became a gap that never ended
+ at 48 kHz. Such a position now stops at the largest or the smallest
+ timestamp, as the output position does.
+ .
+ The filter writes a gap one frame of silence for each frame its output
+ asks for, and holds the frame after the gap, and the frames behind it,
+ until then. ffmpeg freed a graph with those frames in it when another
+ input of the same graph changed, for example the frame size of a video.
+ A gap of 30 s under way at such a change lost 4,096 to 16,384 samples
+ and the rest of the silence. The pending command reports the frames a
+ filter has not output yet, and send_frame() now asks the outputs behind
+ each agapfill filter for frames until none is pending. An output whose
+ consumer has finished, for example after -frames, would only discard the
+ rest of the gap, so its frames do not keep the asking going. A graph may
+ hold a cycle, for example through the feedback filter, and the search for
+ the outputs behind a filter followed it until the stack overflowed. The
+ search now enters each filter once.
+ .
+ A filter behind agapfill can end its output inside a gap, for example
+ atrim, while a filter behind that one goes on writing frames of its own,
+ for example apad. agapfill kept the frame from after the gap, which could
+ no longer leave, and pending reported it. send_frame() then asked for
+ frames without end and never built the new graph. agapfill now drops the
+ frame it holds once its output has ended, and pending reports none.
+ .
+ No frame comes when a filter behind agapfill waits for another input of
+ the same graph, for example amix, and that input is the one whose change
+ starts the rebuild. ffmpeg then freed the graph with the frame from after
+ the gap and the frames queued behind it. position reported the end of
+ the held frame. When no frame had queued behind it, the new filter joined
+ the next frame to the old output: in a gap from 2 s to 32 s rebuilt at
+ 5 s, the audio from 32.1 s came out at 4.99 s. position now reports the
+ end of the last frame the filter has output. The new filter then fills
+ the time of the frames that were lost with silence, and the audio after
+ them keeps its own time. Until the filter has output an input frame, it
+ reports the smallest timestamp, so a lead that start began is filled up
+ to the new filter's first frame however short the rest of it is.
+ .
+ The new filter wrote the time of the lost frames as silence only up to a
+ frame that followed them. When the frame from after the gap was the last
+ one, nothing followed, and the output ended at the rebuild: in a gap from
+ 2 s to 39.9 s rebuilt at 5 s, the audio ended at 4.99 s instead of 40 s.
+ position now also reports the end of the last frame the filter has taken,
+ the frames that wait on its input included. At the end of its input, the
+ new filter writes silence up to there, as it would up to a frame.
+ .
+ A split behind agapfill can feed an output and such a waiting filter.
+ The output kept giving frames, so send_frame() asked for the whole rest
+ of the gap, and the waiting filter kept every frame of it until the graph
+ was freed: with a gap of 10 minutes, ffmpeg peaked at 232 MB instead of
+ 14 MB. send_frame() now stops asking as soon as one output behind
+ agapfill gives no frame, and the frames agapfill holds become silence as
+ above.
+ .
+ send_frame() did not ask an output whose consumer had finished, for
+ example after -frames, since it discards every frame. A waiting mix on the
+ way to such an output then kept the rest of the gap as above, at 232 MB
+ instead of 14 MB. send_frame() now asks a finished output too, and stops
+ when it gives no frame, but the frames it gives are no reason to go on.
+ .
+ send_frame() asked the filters in the order the graph lists them, which is
+ the order the graph description declares them, and asked each once. Asking
+ one agapfill filter for the rest of its gap can hand frames to another
+ agapfill filter behind it, and the description may declare that one first.
+ ffmpeg then freed the graph with the frames the filter behind held, the
+ frame from after the gap among them, and the new graph wrote their time as
+ silence. send_frame() now walks the filters again until it finds none to
+ ask, and does not ask a filter again once its asking has stopped.
+ .
+ ffmpeg kept each position report in 64 bytes. A report holds three
+ timestamps of up to 20 characters and the sample rate, up to 74 bytes,
+ and snprintf() cut a longer one short. resume read what was left as a
+ lower sample rate, or refused it when the rate was gone. In audio stamped
+ 2 x 10^17 samples before zero, a report that ended in /48000 arrived as
+ /480. The position then stopped at the smallest timestamp, and the next
+ frame followed a gap of 6 million years. At 1.1 x 10^18 samples before
+ zero the rebuild failed, and at 10^18 samples after zero every frame after
+ it was stamped with the largest timestamp. ffmpeg now keeps 74 bytes, and
+ position fails instead of cutting its report short.
+ .
+ The asking still keeps the other inputs of the graph waiting. With
+ -shortest, the audio of an output can then run past its video, to about
+ the end of the gap less -shortest_buf_duration. max_gap bounds that.
+ .
+ A filter behind agapfill that writes frames of its own without asking
+ agapfill for more, for example aloop=loop=-1, gives a frame at every
+ request. send_frame() then never stops asking and never builds the new
+ graph, unless the output ends, for example at the time that -t sets.
+ -shortest is no such end, because the video waits with the other inputs.
+ Without an end, ffmpeg writes the repeated audio without limit, and one
+ SIGTERM does not stop ffmpeg, because sch_stop() waits for the filter
+ graph's thread. Any rule that stops the asking must pick a number of
+ requests or samples in which agapfill does not move. A small number turns
+ real audio into silence behind a filter that cuts frames smaller, for
+ example asetnsamples. A large number writes that much repeated audio
+ first. So the asking stays as it is.
+ .
+ send_frame() asks only ffmpeg's outputs, because only libavfilter can ask
+ a sink inside the graph, for example anullsink. A filter that waits on
+ the way to such a sink, for example amix behind asplit, then keeps the
+ rest of the gap in memory while the outputs take the same silence. With
+ a gap of 10 minutes, ffmpeg peaked at 229 to 232 MB instead of 12 to
+ 15 MB. No sample is lost, and max_gap bounds the memory.
+Author: Streamarr
+Forwarded: no
+Last-Update: 2026-11-12
+---
+Index: FFmpeg/doc/filters.texi
+===================================================================
+--- FFmpeg.orig/doc/filters.texi
++++ FFmpeg/doc/filters.texi
+@@ -2165,6 +2165,82 @@ agapfill=start=0:max_gap=600
+ @end example
+ @end itemize
+ 
++@subsection Commands
++
++This filter supports the following commands:
++@table @option
++@item position
++Report where the output stands, as four numbers with slashes between them:
++the timestamp of the next output sample, the end of the last input frame that
++the filter has output, the end of the last input frame that it has taken, the
++frames that wait on its input included, all three in samples, and the sample
++rate. Each end goes by that frame's own timestamp. Until the filter has output
++an input frame, the second number is the smallest timestamp, so a filter that
++resumes from the report fills the time up to its first frame with silence,
++however short that time is, as it does after @option{start}. The report is
++empty before the first frame. It takes up to 74 bytes, the terminating null
++included, and the command fails when the space for the reply is shorter.
++
++@item pending
++Report how many input frames the filter has not output yet: the frame it
++holds while it writes the silence before it, and the frames that wait behind
++that one. Once a filter behind it has ended its output, for example
++@code{atrim}, no frame can leave, and the filter drops the frame it holds
++and reports none.
++
++@item resume
++Continue the output of another agapfill filter. The argument is what the
++@code{position} command of that filter reported. The filter then ignores
++@option{start}, and its first frame is one more step after the last frame the
++other filter output: a gap between the two is filled, and any other step is
++joined. When the input ends before a frame comes, the end of the last frame the
++other filter took is that step, so the time of the frames it took and did not
++output becomes silence there too.
++A position that no timestamp at the filter's own sample rate reaches stops at
++the largest or the smallest timestamp, as the output position does. The
++command has no effect once the filter has taken a frame.
++@end table
++
++@command{ffmpeg} builds a new filter graph when the parameters of an input
++change mid-stream, for example the channel layout of the audio. Each agapfill
++filter of the new graph then resumes from the position of the filter in its
++place in the old graph. A filter whose predecessor took no frame starts
++afresh, with @option{start}.
++
++Before @command{ffmpeg} frees the old graph, it asks the outputs behind each
++agapfill filter for frames until the filter has output every frame it has, so
++a rebuild while the filter writes silence loses neither the rest of the
++silence nor a sample. It stops asking as soon as one of those outputs gives no
++frame, because a filter behind agapfill waits for another input of the graph,
++for example @code{amix}. The frames the filter still holds are then lost, and
++the filter of the new graph writes their time as silence, so the audio after
++them keeps its own time, and the output reaches their end when no audio
++follows them. Samples that other filters of the old graph hold are lost, as
++they are without this filter. An output that takes no more frames, for example
++after @option{-frames}, discards what it is given, so the frames it gives do
++not keep the asking going. It is still asked, and stops the asking when it
++gives no frame, because a filter on its way may wait as well.
++
++While @command{ffmpeg} asks for the rest of a gap, the other inputs of the
++graph wait. With @option{-shortest}, the audio of an output can then run past
++its video, to about the end of the gap less @option{-shortest_buf_duration}.
++@option{max_gap} bounds that.
++
++A filter behind agapfill that writes frames of its own without asking for
++more, for example @code{aloop=loop=-1}, gives a frame at every request.
++@command{ffmpeg} then never stops asking and never builds the new graph,
++unless the output ends, for example at the time that @option{-t} sets.
++@option{-shortest} is no such end, because the video waits with the other
++inputs of the graph. Without such an end, @command{ffmpeg} never stops
++writing the repeated audio on its own.
++
++@command{ffmpeg} asks only its own outputs, not a sink inside the graph such
++as @code{anullsink}. When a filter on the way to such a sink waits for another
++input, for example @code{amix} behind @code{asplit}, the outputs still give
++frames. @command{ffmpeg} then asks for the whole rest of the gap, and the
++waiting filter keeps all of that silence in memory until @command{ffmpeg}
++frees the old graph. @option{max_gap} bounds that memory.
++
+ @section agate
+ 
+ A gate is mainly used to reduce lower parts of a signal. This kind of signal
+Index: FFmpeg/fftools/ffmpeg_filter.c
+===================================================================
+--- FFmpeg.orig/fftools/ffmpeg_filter.c
++++ FFmpeg/fftools/ffmpeg_filter.c
+@@ -96,6 +96,11 @@ typedef struct FilterGraphThread {
+     // EOF status of each input/output, as received by the thread
+     uint8_t         *eof_in;
+     uint8_t         *eof_out;
++
++    // Where each agapfill filter of a graph that is being replaced stood, by
++    // its place among the agapfill filters of the graph, counted from 0. The
++    // filters of the new graph resume from there.
++    AVDictionary    *gap_fill_positions;
+ } FilterGraphThread;
+ 
+ typedef struct InputFilterPriv {
+@@ -2077,6 +2082,68 @@ static int graph_is_meta(AVFilterGraph *
+     return 1;
+ }
+ 
++static int is_gap_fill(const AVFilterContext *f)
++{
++    return !strcmp(f->filter->name, "agapfill");
++}
++
++/* An agapfill filter that has taken no frame reports nothing, and the filter
++ * in its place then starts afresh. */
++static int note_gap_fill_positions(AVFilterGraph *graph, AVDictionary **positions)
++{
++    unsigned place = 0;
++
++    for (unsigned i = 0; i < graph->nb_filters; i++) {
++        AVFilterContext *f = graph->filters[i];
++        /* The longest report: three timestamps of 20 characters, each with a
++         * slash after it, and a sample rate of 10 digits. */
++        char position[3 * 21 + 10 + 1] = "";
++        char key[11];
++        int ret;
++
++        if (!is_gap_fill(f))
++            continue;
++
++        snprintf(key, sizeof(key), "%u", place++);
++        ret = avfilter_process_command(f, "position", NULL, position, sizeof(position), 0);
++        if (ret >= 0 && position[0])
++            ret = av_dict_set(positions, key, position, 0);
++        if (ret < 0)
++            return ret;
++    }
++
++    return 0;
++}
++
++/* A name does not tell two filters apart: ffmpeg accepts an instance name
++ * twice, and cuts a name to 63 characters. The same graph description gives
++ * the agapfill filters the same order again. */
++static int resume_gap_fills(AVFilterGraph *graph, const AVDictionary *positions)
++{
++    unsigned place = 0;
++
++    for (unsigned i = 0; i < graph->nb_filters; i++) {
++        AVFilterContext *f = graph->filters[i];
++        const AVDictionaryEntry *position;
++        char key[11];
++        int ret;
++
++        if (!is_gap_fill(f))
++            continue;
++
++        snprintf(key, sizeof(key), "%u", place++);
++        position = av_dict_get(positions, key, NULL, 0);
++        if (!position)
++            continue;
++
++        ret = avfilter_process_command(f, "resume", position->value, NULL, 0, 0);
++        if (ret < 0)
++            return ret;
++    }
++
++    return 0;
++}
++
+ static int sub2video_frame(InputFilter *ifilter, AVFrame *frame, int buffer);
+ 
+ static int configure_filtergraph(FilterGraph *fg, FilterGraphThread *fgt)
+@@ -2160,6 +2227,11 @@ static int configure_filtergraph(FilterG
+     if ((ret = avfilter_graph_config(fgt->graph, NULL)) < 0)
+         goto fail;
+ 
++    ret = resume_gap_fills(fgt->graph, fgt->gap_fill_positions);
++    av_dict_free(&fgt->gap_fill_positions);
++    if (ret < 0)
++        goto fail;
++
+     fgp->is_meta = graph_is_meta(fgt->graph);
+ 
+     /* limit the lists of allowed formats to the ones selected, to
+@@ -3106,6 +3178,154 @@ static const char *unknown_if_null(const
+     return str ? str : "unknown";
+ }
+ 
++/* Marks in reached, by their index in graph, the filters that frames leaving
++ * graph->filters[from] pass. A graph may hold a cycle, for example through the
++ * feedback filter, so the walk enters each filter once. */
++static void mark_reached(const AVFilterGraph *graph, unsigned from, uint8_t *reached)
++{
++    const AVFilterContext *f = graph->filters[from];
++
++    reached[from] = 1;
++    for (unsigned i = 0; i < f->nb_outputs; i++)
++        for (unsigned j = 0; f->outputs[i] && j < graph->nb_filters; j++)
++            if (!reached[j] && graph->filters[j] == f->outputs[i]->dst)
++                mark_reached(graph, j, reached);
++}
++
++/* Marks in fed the outputs of fg that frames leaving graph->filters[from] reach. */
++static int find_outputs_behind(FilterGraph *fg, const AVFilterGraph *graph,
++                               unsigned from, uint8_t *fed)
++{
++    uint8_t *reached = av_calloc(graph->nb_filters, sizeof(*reached));
++
++    if (!reached)
++        return AVERROR(ENOMEM);
++
++    mark_reached(graph, from, reached);
++    for (int i = 0; i < fg->nb_outputs; i++) {
++        fed[i] = 0;
++        for (unsigned j = 0; j < graph->nb_filters; j++)
++            if (graph->filters[j] == fg->outputs[i]->filter)
++                fed[i] = reached[j];
++    }
++
++    av_free(reached);
++    return 0;
++}
++
++static int gap_fill_is_pending(AVFilterContext *f)
++{
++    char pending[32] = "0";
++
++    return avfilter_process_command(f, "pending", NULL, pending, sizeof(pending), 0) >= 0 &&
++           strcmp(pending, "0");
++}
++
++/* Ask each output marked in fed for a frame until one gives none, then send
++ * on what the outputs hold. Returns whether every output gave a frame and one
++ * of them takes frames, so 0 when none takes frames. An output whose consumer
++ * has finished, for example after -frames, discards every frame, so its
++ * frames are no reason to ask on. It is still asked, because a filter on its
++ * way may wait for another input and keep every frame it is handed. */
++static int pull_frames_behind(FilterGraph *fg, FilterGraphThread *fgt,
++                              const uint8_t *fed, AVFrame *frame)
++{
++    int taken = 0, waits = 0;
++
++    for (int i = 0; i < fg->nb_outputs && !waits; i++) {
++        AVFilterContext *sink = fg->outputs[i]->filter;
++        int ret;
++
++        if (!fed[i])
++            continue;
++
++        ret = av_buffersink_get_frame_flags(sink, NULL, AV_BUFFERSINK_FLAG_PEEK);
++        if (ret == AVERROR_EOF)
++            continue;
++        if (ret < 0 && ret != AVERROR(EAGAIN))
++            return ret;
++
++        taken |= !fgt->eof_out[i];
++        waits  = ret == AVERROR(EAGAIN);
++    }
++
++    for (int i = 0; i < fg->nb_outputs; i++) {
++        int ret = 0;
++
++        while (!ret) {
++            ret = fg_output_step(ofp_from_ofilter(fg->outputs[i]), fgt, frame);
++            if (ret < 0)
++                return ret;
++        }
++    }
++
++    return taken && !waits;
++}
++
++/* Ask the outputs behind graph->filters[index], an agapfill filter, for
++ * frames until it has output all it has. Returns 1 when the asking stops
++ * first: a filter behind it waits for another input of the graph, or no
++ * output behind it takes frames. */
++static int finish_gap_fill(FilterGraph *fg, FilterGraphThread *fgt, unsigned index,
++                           uint8_t *fed, AVFrame *frame)
++{
++    AVFilterContext *f = fgt->graph->filters[index];
++    int ret = find_outputs_behind(fg, fgt->graph, index, fed);
++
++    while (ret >= 0 && gap_fill_is_pending(f)) {
++        ret = pull_frames_behind(fg, fgt, fed, frame);
++        if (!ret)
++            return 1;
++    }
++
++    return FFMIN(ret, 0);
++}
++
++/**
++ * An agapfill filter writes a gap one frame of silence for each frame its
++ * output asks for, and holds the frame after the gap and the frames behind it
++ * until then. Freeing the graph would take those frames with it. So ask the
++ * outputs for frames until every agapfill filter has output all it has.
++ *
++ * An output gives no frame when a filter behind agapfill waits for another
++ * input of the graph, for example amix. That input cannot arrive before the
++ * graph is rebuilt, so asking the other outputs on would only pile the rest
++ * of the gap up in the waiting filter. The asking stops there, and the filter
++ * of the new graph writes the time of the frames agapfill still holds as
++ * silence: its position leaves them out.
++ *
++ * Asking one agapfill filter for frames can hand frames to another agapfill
++ * filter behind it, which the graph may list first. So the walk over the
++ * filters starts again until it finds none to ask. A filter whose asking
++ * stopped is not asked again.
++ */
++static int finish_gap_fills(FilterGraph *fg, FilterGraphThread *fgt, AVFrame *frame)
++{
++    AVFilterGraph *graph = fgt->graph;
++    uint8_t *fed     = av_calloc(fg->nb_outputs, sizeof(*fed));
++    uint8_t *stopped = av_calloc(graph->nb_filters, sizeof(*stopped));
++    int ret = fed && stopped ? 0 : AVERROR(ENOMEM);
++    int asked = 1;
++
++    while (ret >= 0 && asked) {
++        asked = 0;
++        for (unsigned i = 0; ret >= 0 && i < graph->nb_filters; i++) {
++            AVFilterContext *f = graph->filters[i];
++
++            if (stopped[i] || !is_gap_fill(f) || !gap_fill_is_pending(f))
++                continue;
++
++            ret = finish_gap_fill(fg, fgt, i, fed, frame);
++            stopped[i] = ret > 0;
++            asked = 1;
++        }
++    }
++
++    av_free(fed);
++    av_free(stopped);
++    return FFMIN(ret, 0);
++}
++
+ static int send_frame(FilterGraph *fg, FilterGraphThread *fgt,
+                       InputFilter *ifilter, AVFrame *frame)
+ {
+@@ -3194,6 +3414,8 @@ static int send_frame(FilterGraph *fg, F
+         }
+ 
+         ret = fgt->graph ? read_frames(fg, fgt, tmp) : 0;
++        if (ret >= 0 && fgt->graph)
++            ret = finish_gap_fills(fg, fgt, tmp);
+         av_frame_free(&tmp);
+         if (ret < 0)
+             return ret;
+@@ -3226,6 +3448,10 @@ static int send_frame(FilterGraph *fg, F
+             if (reason.len > 1)
+                 reason.str[reason.len - 2] = '\0'; // remove last comma
+             av_log(fg, AV_LOG_INFO, "Reconfiguring filter graph%s%s\n", reason.len ? " because " : "", reason.str);
++
++            ret = note_gap_fill_positions(fgt->graph, &fgt->gap_fill_positions);
++            if (ret < 0)
++                return ret;
+         } else {
+             /* Choke all input to avoid buffering excessive frames while the
+              * initial filter graph is being configured, and before we have a
+@@ -3291,6 +3517,7 @@ static void fg_thread_uninit(FilterGraph
+     av_frame_free(&fgt->frame);
+     av_freep(&fgt->eof_in);
+     av_freep(&fgt->eof_out);
++    av_dict_free(&fgt->gap_fill_positions);
+ 
+     avfilter_graph_free(&fgt->graph);
+ 
+Index: FFmpeg/libavfilter/af_agapfill.c
+===================================================================
+--- FFmpeg.orig/libavfilter/af_agapfill.c
++++ FFmpeg/libavfilter/af_agapfill.c
+@@ -21,6 +21,10 @@
+  * Fill gaps between audio frames with silence, without dropping a sample.
+  */
+ 
++#include <inttypes.h>
++#include <stdio.h>
++#include <string.h>
++
+ #include "libavutil/common.h"
+ #include "libavutil/mathematics.h"
+ #include "libavutil/opt.h"
+@@ -38,11 +42,14 @@ typedef struct AGapFillContext {
+     int64_t max_gap;        ///< longest silence to write, in microseconds; 0 for no limit
+     int packet_size;        ///< samples in each frame of silence
+ 
+-    int started;            ///< the first frame has arrived
++    int started;            ///< the first frame has arrived, or the filter continues another one
+     int64_t out_pos;        ///< timestamp of the next output sample, in samples
+     int64_t in_end;         ///< end of the previous input frame by its own timestamp, in samples
+-    int64_t silence_left;   ///< samples of silence still to write before the held frame
++    int64_t sent_end;       ///< end of the last input frame sent on, by its own timestamp; the smallest timestamp before one
++    int64_t taken_end;      ///< end of the last input frame taken, by its own timestamp; until a frame comes, that of the filter this one continues
++    int64_t silence_left;   ///< samples of silence still to write before the held frame, or before the end
+     AVFrame *held;          ///< input frame that waits for the silence before it
++    int eof;                ///< status that ended the input, passed on once the silence owed before it is written
+ 
+     int64_t nb_gaps;        ///< runs of silence written, the leading one included
+     int64_t nb_silence;     ///< samples of silence in those runs
+@@ -157,6 +164,7 @@ static int place_frame(AVFilterContext *
+         if (pts > start)
+             silence = av_sat_sub64(pts, start);
+         s->out_pos = pts - silence;
++        s->sent_end = INT64_MIN + 1;
+         s->started = 1;
+     } else {
+         if (pts == AV_NOPTS_VALUE)
+@@ -171,6 +179,7 @@ static int place_frame(AVFilterContext *
+     s->max_offset = FFMAX(s->max_offset,
+                           FFABS(av_sat_sub64(av_sat_add64(s->out_pos, silence), pts)));
+     s->in_end     = av_sat_add64(pts, frame->nb_samples);
++    s->taken_end  = s->in_end;
+     s->held       = frame;
+ 
+     return 0;
+@@ -207,6 +216,7 @@ static int send_held(AVFilterContext *ct
+     frame->duration = frame->nb_samples;
+ 
+     s->out_pos = av_sat_add64(s->out_pos, frame->nb_samples);
++    s->sent_end = s->in_end;
+ 
+     return ff_filter_frame(ctx->outputs[0], frame);
+ }
+@@ -219,9 +229,16 @@ static int activate(AVFilterContext *ctx
+     int64_t pts;
+     int ret, status;
+ 
+-    FF_FILTER_FORWARD_STATUS_BACK(outlink, inlink);
++    /* No frame leaves once the output has ended, so the filter lets go of the
++     * frame it holds, and pending reports none. */
++    status = ff_outlink_get_status(outlink);
++    if (status) {
++        av_frame_free(&s->held);
++        ff_inlink_set_status(inlink, status);
++        return 0;
++    }
+ 
+-    if (!s->held) {
++    if (!s->held && !s->eof) {
+         AVFrame *frame;
+ 
+         ret = ff_inlink_consume_frame(inlink, &frame);
+@@ -236,25 +253,38 @@ static int activate(AVFilterContext *ctx
+         }
+     }
+ 
+-    if (s->held) {
++    if (!s->held && !s->eof && ff_inlink_acknowledge_status(inlink, &status, &pts)) {
++        if (!s->started) {
++            if (pts != AV_NOPTS_VALUE)
++                pts = av_rescale_q(pts, inlink->time_base, outlink->time_base);
++            ff_outlink_set_status(outlink, status, pts);
++            return 0;
++        }
++        /* The frames a filter this one continues still held were lost with
++         * its graph. Their time becomes silence even when no frame follows. */
++        ret = owe_silence(ctx, s->taken_end, silence_after_step(ctx, s->taken_end));
++        if (ret < 0)
++            return ret;
++        s->eof = status;
++    }
++
++    if (s->held || s->eof) {
+         if (s->silence_left) {
+             /* One frame of silence for each frame the next filter asks for,
+              * so that no part of a long gap waits in a queue. */
+             if (!ff_outlink_frame_wanted(outlink))
+                 return FFERROR_NOT_READY;
+             ret = send_silence(ctx);
+-            if (ret < 0 || s->silence_left)
+-                return ret;
++            /* The held frame leaves in an activation of its own. A caller
++             * that asks the output for one frame at a time then finds no
++             * frame on the way there once pending reports none. */
++            if (ret >= 0 && !s->silence_left)
++                ff_filter_set_ready(ctx, 100);
++            return ret;
+         }
+-        return send_held(ctx);
+-    }
+-
+-    if (ff_inlink_acknowledge_status(inlink, &status, &pts)) {
+-        if (s->started)
+-            pts = s->out_pos;
+-        else if (pts != AV_NOPTS_VALUE)
+-            pts = av_rescale_q(pts, inlink->time_base, outlink->time_base);
+-        ff_outlink_set_status(outlink, status, pts);
++        if (s->held)
++            return send_held(ctx);
++        ff_outlink_set_status(outlink, s->eof, s->out_pos);
+         return 0;
+     }
+ 
+@@ -288,6 +318,104 @@ static int config_output(AVFilterLink *o
+     return 0;
+ }
+ 
++/**
++ * Continue the output of another agapfill filter, from what its position
++ * command reported. The first frame is then one more step for place_frame,
++ * and without one, so is the end of the last frame the other filter took.
++ */
++static int resume(AVFilterContext *ctx, const char *position)
++{
++    AVFilterLink *inlink = ctx->inputs[0];
++    AGapFillContext *s = ctx->priv;
++    const AVRational sample = { 1, inlink->sample_rate };
++    int64_t out_pos, in_end, taken_end;
++    int sample_rate;
++
++    if (!position || inlink->sample_rate <= 0 ||
++        sscanf(position, "%"SCNd64"/%"SCNd64"/%"SCNd64"/%d",
++               &out_pos, &in_end, &taken_end, &sample_rate) != 4 ||
++        sample_rate <= 0) {
++        av_log(ctx, AV_LOG_ERROR,
++               "resume takes what the position command of a configured filter reports.\n");
++        return AVERROR(EINVAL);
++    }
++    if (s->started)
++        return 0;
++
++    s->out_pos = rescale_saturated(out_pos, (AVRational){ 1, sample_rate }, sample,
++                                   AV_ROUND_NEAR_INF);
++    s->in_end  = rescale_saturated(in_end, (AVRational){ 1, sample_rate }, sample,
++                                   AV_ROUND_NEAR_INF);
++    s->sent_end  = s->in_end;
++    s->taken_end = rescale_saturated(taken_end, (AVRational){ 1, sample_rate }, sample,
++                                     AV_ROUND_NEAR_INF);
++    s->started   = 1;
++
++    return 0;
++}
++
++/* The end of the last input frame the filter has taken, by its own
++ * timestamp, the frames that wait on its input included. */
++static int64_t end_of_taken(AVFilterContext *ctx)
++{
++    AVFilterLink *inlink = ctx->inputs[0];
++    AGapFillContext *s = ctx->priv;
++    const AVRational sample = { 1, inlink->sample_rate };
++    int64_t end = s->taken_end;
++
++    for (size_t i = 0; i < ff_inlink_queued_frames(inlink); i++) {
++        const AVFrame *frame = ff_inlink_peek_frame(inlink, i);
++        int64_t pts = end;
++
++        if (frame->pts != AV_NOPTS_VALUE)
++            pts = rescale_saturated(frame->pts, inlink->time_base, sample, AV_ROUND_NEAR_INF);
++        end = av_sat_add64(pts, frame->nb_samples);
++    }
++
++    return end;
++}
++
++static int process_command(AVFilterContext *ctx, const char *cmd, const char *args,
++                           char *res, int res_len, int flags)
++{
++    AGapFillContext *s = ctx->priv;
++    int len;
++
++    if (!strcmp(cmd, "resume"))
++        return resume(ctx, args);
++    if (strcmp(cmd, "position") && strcmp(cmd, "pending"))
++        return AVERROR(ENOSYS);
++    if (!res || res_len <= 0)
++        return AVERROR(EINVAL);
++
++    if (!strcmp(cmd, "pending")) {
++        snprintf(res, res_len, "%zu", !!s->held + ff_inlink_queued_frames(ctx->inputs[0]));
++        return 0;
++    }
++
++    /* Nothing to continue before the first frame. A filter that continues
++     * this one takes the step to its first frame from the last frame sent on,
++     * so the time of frames lost with the old graph becomes a gap. Before a
++     * frame was sent on, that step is always a gap, as the lead before a
++     * first frame is. When no frame follows, the end of the frames taken is
++     * that step. */
++    res[0] = 0;
++    if (!s->started)
++        return 0;
++
++    len = snprintf(res, res_len, "%"PRId64"/%"PRId64"/%"PRId64"/%d",
++                   s->out_pos, s->sent_end, end_of_taken(ctx), ctx->inputs[0]->sample_rate);
++    /* resume would read a report cut short as another position. */
++    if (len >= res_len) {
++        res[0] = 0;
++        av_log(ctx, AV_LOG_ERROR, "The position takes %d bytes, more than the %d given.\n",
++               len + 1, res_len);
++        return AVERROR_BUFFER_TOO_SMALL;
++    }
++
++    return 0;
++}
++
+ static av_cold void uninit(AVFilterContext *ctx)
+ {
+     AGapFillContext *s = ctx->priv;
+@@ -309,12 +437,13 @@ static const AVFilterPad agapfill_output
+ };
+ 
+ const FFFilter ff_af_agapfill = {
+-    .p.name        = "agapfill",
+-    .p.description = NULL_IF_CONFIG_SMALL("Fill gaps between audio frames with silence."),
+-    .p.priv_class  = &agapfill_class,
+-    .priv_size     = sizeof(AGapFillContext),
+-    .activate      = activate,
+-    .uninit        = uninit,
++    .p.name          = "agapfill",
++    .p.description   = NULL_IF_CONFIG_SMALL("Fill gaps between audio frames with silence."),
++    .p.priv_class    = &agapfill_class,
++    .priv_size       = sizeof(AGapFillContext),
++    .activate        = activate,
++    .uninit          = uninit,
++    .process_command = process_command,
+     FILTER_INPUTS(ff_audio_default_filterpad),
+     FILTER_OUTPUTS(agapfill_outputs),
+ };

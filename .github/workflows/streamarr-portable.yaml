@@ -187,6 +187,20 @@ jobs:
             -map 1:a -c copy -f null - \
             -map 1:v -c copy -f null -
 
+      # streamarr-0004 adds the agapfill filter. streamarr-0005 makes the filter of a graph that
+      # ffmpeg rebuilds mid-stream continue the output of the graph before it. Without it the
+      # leading silence is written twice, a gap at the rebuild stays a hole, and a rebuild while
+      # the filter writes silence loses samples. The check makes its sources with lavfi and
+      # compares every output sample with the timeline the filter's rules give. linuxarm64
+      # binaries cannot run on these runners.
+      - name: Check that agapfill fills gaps and keeps every sample
+        if: matrix.target != 'linuxarm64'
+        run: |
+          set -euo pipefail
+          bin="$(mktemp -d)"
+          tar -xJf streamarr-release/*.tar.xz -C "${bin}" ffmpeg
+          python3 streamarr/tests/agapfill.py --ffmpeg "${bin}/ffmpeg"
+
       - name: Upload the archive
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

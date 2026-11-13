@@ -105,3 +105,5 @@
 0105-skip-oversized-a53-caption-sei-in-qsv-h264-encoder.patch
 0106-unref-the-last-frame-on-filter-graph-cleanup.patch
 streamarr-0001-unchoke-every-destination-of-a-stream.patch
+streamarr-0004-add-the-agapfill-audio-filter.patch
+streamarr-0005-continue-agapfill-across-filter-graph-rebuilds.patch
