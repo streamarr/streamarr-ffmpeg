@@ -1,0 +1,35 @@
+Description: avfilter/tonemapx: read the MMR weights of each piece from that piece's offset
+ update_dovi_buf() packs the MMR weights of a component's pieces one
+ after another, two rows of four floats for each order. It stores the
+ row where each piece starts. Every code path of tonemapx adds that row
+ number to a float pointer. So when a component has more than one MMR
+ piece, each piece after the first read its weights from a quarter of
+ its offset, inside the weights of the pieces before it.
+ .
+ With the previous patch, P and T reach their second and later pieces.
+ On a synthetic profile 5 picture with P and T in two MMR pieces, 588 of
+ 705 checked patches came out more than one code from the definition,
+ up to 166 luma and 469 chroma codes, on the C, SSE4.2, AVX2 and NEON
+ paths. I in more than one MMR piece read the wrong weights in the same
+ way before this series. tonemap_cuda counts in rows of four and was
+ right.
+ .
+ Store the offset in floats.
+Author: Streamarr
+Forwarded: no
+Last-Update: 2026-11-13
+---
+Index: FFmpeg/libavfilter/vf_tonemapx.c
+===================================================================
+--- FFmpeg.orig/libavfilter/vf_tonemapx.c
++++ FFmpeg/libavfilter/vf_tonemapx.c
+@@ -222,7 +222,8 @@ static void update_dovi_buf(AVFilterContext *ctx)
+                     has_mmr = 1;
+                     coeffs_data[i][3] = (float)comp->mmr_order[i];
+                     coeffs_data[i][0] = comp->mmr_constant[i];
+-                    coeffs_data[i][1] = (float)mmr_idx;
++                    // Every code path reads dovi_mmr as floats, and mmr_idx counts rows of four.
++                    coeffs_data[i][1] = (float)(4 * mmr_idx);
+                     for (j = 0; j < comp->mmr_order[i]; j++) {
+                         // store weights per order as two packed vec4s
+                         float *mmr = &mmr_packed_data[mmr_idx][0];

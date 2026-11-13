@@ -194,6 +194,10 @@ jobs:
       # Without streamarr-0011 it reshapes chroma with MMR from luma and chroma already reshaped,
       # and the check's MMR RPU comes out up to 9 luma codes wrong. Without streamarr-0012 the NEON
       # path truncates every 10-bit sample, and the mean error is half a code instead of zero.
+      # Without streamarr-0014 it reshapes P and T with their first piece only, and the check's
+      # RPUs with two, three and eight polynomial pieces come out up to 109 chroma codes wrong.
+      # Without streamarr-0015 it reads the MMR weights of a component's second piece from the
+      # wrong place, and the check's RPU with two MMR pieces comes out up to 469 chroma codes wrong.
       # The check writes its own profile 5 stream. It runs the path the runner's CPU selects
       # (AVX2 on Linux, NEON on macOS), then plain C, then SSE4.2 where the CPU has it.
       # linuxarm64 binaries cannot run on these runners.

@@ -1,0 +1,202 @@
+Description: avfilter/tonemap: reshape each Dolby Vision component with the piece its own value picks
+ An RPU can split the reshaping curve of each component into up to eight
+ pieces at pivots. The base-layer value of a component picks the piece
+ for that component. tonemapx and tonemap_cuda chose a piece for I only.
+ They wrote only the pivots of I into their reshaping buffer, and they
+ reshaped P and T with the first piece over the whole range.
+ .
+ On a synthetic profile 5 picture of flat patches, with P and T in two
+ polynomial pieces, 626 of 753 checked patches came out more than one
+ code from the definition, up to 50 luma and 61 chroma codes. With three
+ second-order pieces, 708 of 726 came out wrong, up to 109 chroma codes.
+ .
+ Write the pivots of every component, and choose the piece of P and T as
+ the filters choose the piece of I. In tonemapx the C loop does this,
+ and on the SSE4.2, AVX2 and NEON paths dovi_piece_coeffs() does. In
+ tonemap_cuda the reshape kernel does this, for the direct kernels and
+ for the 3D lookup table. A component with one piece takes the same path
+ as before.
+Author: Streamarr
+Forwarded: no
+Last-Update: 2026-11-13
+---
+Index: FFmpeg/libavfilter/vf_tonemap_cuda.c
+===================================================================
+--- FFmpeg.orig/libavfilter/vf_tonemap_cuda.c
++++ FFmpeg/libavfilter/vf_tonemap_cuda.c
+@@ -504,7 +504,7 @@ static void update_dovi_buf(AVFilterContext *ctx)
+         }
+ 
+         // dovi_pivots
+-        if (c == 0 && comp->num_pivots > 2) {
++        if (comp->num_pivots > 2) {
+             // Skip the (irrelevant) lower and upper bounds
+             float pivots_data[7+1] = {0};
+             memcpy(pivots_data, comp->pivots + 1,
+Index: FFmpeg/libavfilter/cuda/tonemap.cu
+===================================================================
+--- FFmpeg.orig/libavfilter/cuda/tonemap.cu
++++ FFmpeg/libavfilter/cuda/tonemap.cu
+@@ -363,7 +363,7 @@ float3 reshape_dovi_yuv(float3 yuv,
+         s = sig_arr[i];
+         coeffs = dovi_coeffs[0];
+ 
+-        if (i == 0 && dovi_num_pivots > 2) {
++        if (dovi_num_pivots > 2) {
+             float t0 = s >= dovi_pivots[0], t1 = s >= dovi_pivots[1];
+             float t2 = s >= dovi_pivots[2], t3 = s >= dovi_pivots[3];
+             float t4 = s >= dovi_pivots[4], t5 = s >= dovi_pivots[5], t6 = s >= dovi_pivots[6];
+Index: FFmpeg/libavfilter/vf_tonemapx.c
+===================================================================
+--- FFmpeg.orig/libavfilter/vf_tonemapx.c
++++ FFmpeg/libavfilter/vf_tonemapx.c
+@@ -258,7 +258,7 @@ static void update_dovi_buf(AVFilterContext *ctx)
+         }
+ 
+         // dovi_pivots
+-        if (c == 0 && comp->num_pivots > 2) {
++        if (comp->num_pivots > 2) {
+             // Skip the (irrelevant) lower and upper bounds
+             float pivots_data[7+1] = {0};
+             memcpy(pivots_data, comp->pivots + 1,
+@@ -371,7 +371,7 @@ inline static void reshape_dovi_yuv(float* dest, float* src, const TonemapIntPar
+         coeffs[2] = dovi_coeffs[0*4+2];
+         coeffs[3] = dovi_coeffs[0*4+3];
+ 
+-        if (i == 0 && dovi_num_pivots > 2) {
++        if (dovi_num_pivots > 2) {
+             const int t0 = s >= dovi_pivots[0], t1 = s >= dovi_pivots[1];
+             const int t2 = s >= dovi_pivots[2], t3 = s >= dovi_pivots[3];
+             const int t4 = s >= dovi_pivots[4], t5 = s >= dovi_pivots[5], t6 = s >= dovi_pivots[6];
+Index: FFmpeg/libavfilter/aarch64/vf_tonemapx_intrin_neon.c
+===================================================================
+--- FFmpeg.orig/libavfilter/aarch64/vf_tonemapx_intrin_neon.c
++++ FFmpeg/libavfilter/aarch64/vf_tonemapx_intrin_neon.c
+@@ -128,8 +128,10 @@ inline static float32x4_t reshape_dovi_iptpqc2(float32x4_t sig, const TonemapInt
+     float dovi_hi_i = dovi_params_i[7];
+ 
+     float* dovi_params_p = src_dovi_params + 1*8;
++    float* dovi_pivots_p = src_dovi_pivots + 1*8;
+     float* dovi_coeffs_p = src_dovi_coeffs + 1*8 * 4; //float4*
+     float* dovi_mmr_p = src_dovi_mmr + 1*48 * 4; //float4*
++    int dovi_num_pivots_p = dovi_params_p[0];
+     int dovi_has_mmr_p = dovi_params_p[1];
+     int dovi_has_poly_p = dovi_params_p[2];
+     int dovi_mmr_single_p = dovi_params_p[3];
+@@ -139,8 +141,10 @@ inline static float32x4_t reshape_dovi_iptpqc2(float32x4_t sig, const TonemapInt
+     float dovi_hi_p = dovi_params_p[7];
+ 
+     float* dovi_params_t = src_dovi_params + 2*8;
++    float* dovi_pivots_t = src_dovi_pivots + 2*8;
+     float* dovi_coeffs_t = src_dovi_coeffs + 2*8 * 4; //float4*
+     float* dovi_mmr_t = src_dovi_mmr + 2*48 * 4; //float4*
++    int dovi_num_pivots_t = dovi_params_t[0];
+     int dovi_has_mmr_t = dovi_params_t[1];
+     int dovi_has_poly_t = dovi_params_t[2];
+     int dovi_mmr_single_t = dovi_params_t[3];
+@@ -169,7 +173,7 @@ inline static float32x4_t reshape_dovi_iptpqc2(float32x4_t sig, const TonemapInt
+ 
+     // reshape P
+     s = vgetq_lane_f32(sig, 1);
+-    coeffs = vld1q_f32(dovi_coeffs_p);
++    coeffs = dovi_piece_coeffs(s, dovi_num_pivots_p, dovi_pivots_p, dovi_coeffs_p);
+     has_mmr_poly = dovi_has_mmr_p && dovi_has_poly_p;
+ 
+     if ((has_mmr_poly && vgetq_lane_f32(coeffs, 3) == 0.0f) || (!has_mmr_poly && dovi_has_poly_p))
+@@ -182,7 +186,7 @@ inline static float32x4_t reshape_dovi_iptpqc2(float32x4_t sig, const TonemapInt
+ 
+     // reshape T
+     s = vgetq_lane_f32(sig, 2);
+-    coeffs = vld1q_f32(dovi_coeffs_t);
++    coeffs = dovi_piece_coeffs(s, dovi_num_pivots_t, dovi_pivots_t, dovi_coeffs_t);
+     has_mmr_poly = dovi_has_mmr_t && dovi_has_poly_t;
+ 
+     if ((has_mmr_poly && vgetq_lane_f32(coeffs, 3) == 0.0f) || (!has_mmr_poly && dovi_has_poly_t))
+Index: FFmpeg/libavfilter/x86/vf_tonemapx_intrin_avx.c
+===================================================================
+--- FFmpeg.orig/libavfilter/x86/vf_tonemapx_intrin_avx.c
++++ FFmpeg/libavfilter/x86/vf_tonemapx_intrin_avx.c
+@@ -145,8 +145,10 @@ X86_64_V3 inline static __m128 reshape_dovi_iptpqc2(__m128 sig, const TonemapInt
+     float dovi_hi_i = dovi_params_i[7];
+ 
+     float* dovi_params_p = src_dovi_params + 1*8;
++    float* dovi_pivots_p = src_dovi_pivots + 1*8;
+     float* dovi_coeffs_p = src_dovi_coeffs + 1*8 * 4; //float4*
+     float* dovi_mmr_p = src_dovi_mmr + 1*48 * 4; //float4*
++    int dovi_num_pivots_p = dovi_params_p[0];
+     int dovi_has_mmr_p = dovi_params_p[1];
+     int dovi_has_poly_p = dovi_params_p[2];
+     int dovi_mmr_single_p = dovi_params_p[3];
+@@ -156,8 +158,10 @@ X86_64_V3 inline static __m128 reshape_dovi_iptpqc2(__m128 sig, const TonemapInt
+     float dovi_hi_p = dovi_params_p[7];
+ 
+     float* dovi_params_t = src_dovi_params + 2*8;
++    float* dovi_pivots_t = src_dovi_pivots + 2*8;
+     float* dovi_coeffs_t = src_dovi_coeffs + 2*8 * 4; //float4*
+     float* dovi_mmr_t = src_dovi_mmr + 2*48 * 4; //float4*
++    int dovi_num_pivots_t = dovi_params_t[0];
+     int dovi_has_mmr_t = dovi_params_t[1];
+     int dovi_has_poly_t = dovi_params_t[2];
+     int dovi_mmr_single_t = dovi_params_t[3];
+@@ -186,7 +190,7 @@ X86_64_V3 inline static __m128 reshape_dovi_iptpqc2(__m128 sig, const TonemapInt
+ 
+     // reshape P
+     s = _mm_cvtss_f32(_mm_shuffle_ps(sig, sig, _MM_SHUFFLE(1, 1, 1, 1)));
+-    coeffs = _mm_loadu_ps(dovi_coeffs_p);
++    coeffs = dovi_piece_coeffs(s, dovi_num_pivots_p, dovi_pivots_p, dovi_coeffs_p);
+     has_mmr_poly = dovi_has_mmr_p && dovi_has_poly_p;
+ 
+     if ((has_mmr_poly && _mm_cvtss_f32(_mm_shuffle_ps(coeffs, coeffs, _MM_SHUFFLE(3, 3, 3, 3))) == 0.0f) || (!has_mmr_poly && dovi_has_poly_p))
+@@ -199,7 +203,7 @@ X86_64_V3 inline static __m128 reshape_dovi_iptpqc2(__m128 sig, const TonemapInt
+ 
+     // reshape T
+     s = _mm_cvtss_f32(_mm_shuffle_ps(sig, sig, _MM_SHUFFLE(2, 2, 2, 2)));
+-    coeffs = _mm_loadu_ps(dovi_coeffs_t);
++    coeffs = dovi_piece_coeffs(s, dovi_num_pivots_t, dovi_pivots_t, dovi_coeffs_t);
+     has_mmr_poly = dovi_has_mmr_t && dovi_has_poly_t;
+ 
+     if ((has_mmr_poly && _mm_cvtss_f32(_mm_shuffle_ps(coeffs, coeffs, _MM_SHUFFLE(3, 3, 3, 3))) == 0.0f) || (!has_mmr_poly && dovi_has_poly_t))
+Index: FFmpeg/libavfilter/x86/vf_tonemapx_intrin_sse.c
+===================================================================
+--- FFmpeg.orig/libavfilter/x86/vf_tonemapx_intrin_sse.c
++++ FFmpeg/libavfilter/x86/vf_tonemapx_intrin_sse.c
+@@ -182,8 +182,10 @@ X86_64_V2 inline static __m128 reshape_dovi_iptpqc2(__m128 sig, const TonemapInt
+     float dovi_hi_i = dovi_params_i[7];
+ 
+     float* dovi_params_p = src_dovi_params + 1*8;
++    float* dovi_pivots_p = src_dovi_pivots + 1*8;
+     float* dovi_coeffs_p = src_dovi_coeffs + 1*8 * 4; //float4*
+     float* dovi_mmr_p = src_dovi_mmr + 1*48 * 4; //float4*
++    int dovi_num_pivots_p = dovi_params_p[0];
+     int dovi_has_mmr_p = dovi_params_p[1];
+     int dovi_has_poly_p = dovi_params_p[2];
+     int dovi_mmr_single_p = dovi_params_p[3];
+@@ -193,8 +195,10 @@ X86_64_V2 inline static __m128 reshape_dovi_iptpqc2(__m128 sig, const TonemapInt
+     float dovi_hi_p = dovi_params_p[7];
+ 
+     float* dovi_params_t = src_dovi_params + 2*8;
++    float* dovi_pivots_t = src_dovi_pivots + 2*8;
+     float* dovi_coeffs_t = src_dovi_coeffs + 2*8 * 4; //float4*
+     float* dovi_mmr_t = src_dovi_mmr + 2*48 * 4; //float4*
++    int dovi_num_pivots_t = dovi_params_t[0];
+     int dovi_has_mmr_t = dovi_params_t[1];
+     int dovi_has_poly_t = dovi_params_t[2];
+     int dovi_mmr_single_t = dovi_params_t[3];
+@@ -223,7 +227,7 @@ X86_64_V2 inline static __m128 reshape_dovi_iptpqc2(__m128 sig, const TonemapInt
+ 
+     // reshape P
+     s = _mm_cvtss_f32(_mm_shuffle_ps(sig, sig, _MM_SHUFFLE(1, 1, 1, 1)));
+-    coeffs = _mm_loadu_ps(dovi_coeffs_p);
++    coeffs = dovi_piece_coeffs(s, dovi_num_pivots_p, dovi_pivots_p, dovi_coeffs_p);
+     has_mmr_poly = dovi_has_mmr_p && dovi_has_poly_p;
+ 
+     if ((has_mmr_poly && _mm_cvtss_f32(_mm_shuffle_ps(coeffs, coeffs, _MM_SHUFFLE(3, 3, 3, 3))) == 0.0f) || (!has_mmr_poly && dovi_has_poly_p))
+@@ -236,7 +240,7 @@ X86_64_V2 inline static __m128 reshape_dovi_iptpqc2(__m128 sig, const TonemapInt
+ 
+     // reshape T
+     s = _mm_cvtss_f32(_mm_shuffle_ps(sig, sig, _MM_SHUFFLE(2, 2, 2, 2)));
+-    coeffs = _mm_loadu_ps(dovi_coeffs_t);
++    coeffs = dovi_piece_coeffs(s, dovi_num_pivots_t, dovi_pivots_t, dovi_coeffs_t);
+     has_mmr_poly = dovi_has_mmr_t && dovi_has_poly_t;
+ 
+     if ((has_mmr_poly && _mm_cvtss_f32(_mm_shuffle_ps(coeffs, coeffs, _MM_SHUFFLE(3, 3, 3, 3))) == 0.0f) || (!has_mmr_poly && dovi_has_poly_t))
