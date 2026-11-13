@@ -5,13 +5,17 @@ Description: avfilter/tonemap_cuda: keep a sample on a pivot in the piece that s
  code * (1.0f / 1023). A sample on such a pivot took the piece before.
  tonemapx divides each sample by 1023 and is not affected.
  .
- Store each inner pivot 2^-21 lower. That is 8 ulps at 0.5, and less
- than any other 10-bit read lies below a pivot: a whole code lies at
- least 1/1023 below, and chroma that the texture filters between two
- codes at least 1/256 of a code. On a synthetic profile 5 picture with
- patches on four chroma pivots, all 12 patches on a pivot took the
- piece below before this patch, up to 16 chroma codes off, and none
- after. Only samples that read exactly a pivot code change.
+ Store each inner pivot 2^-21 lower. That is 8 ulps at 0.5, above the
+ rounding of the read, and far below the 1/1023 between two 10-bit
+ codes. Chroma that the texture filters to less than 2^-21 below a
+ pivot, a two-thousandth of a code, now takes the piece above too.
+ Filtered chroma can come as close to a pivot as the read rounds, so no
+ margin separates every such value from a rounded read of the pivot.
+ .
+ On a synthetic profile 5 picture with patches on four chroma pivots,
+ all 12 patches on a pivot took the piece below before this patch, up
+ to 16 chroma codes off, and none after. On that picture only samples
+ that read exactly a pivot code change.
 Author: Streamarr
 Forwarded: no
 Last-Update: 2026-11-13
@@ -27,8 +31,8 @@ Index: FFmpeg/libavfilter/vf_tonemap_cuda.c
 -            // Skip the (irrelevant) lower and upper bounds
 +            // The kernel reads a code to within a few float ulps of code / (2^depth - 1), sometimes
 +            // just below the pivot of the same code. Lowering each pivot by 2^-21, 8 ulps at 0.5,
-+            // keeps such a sample in the piece that starts at the pivot. Any other 10-bit read,
-+            // a whole code or chroma the texture filters between codes, lies further from a pivot.
++            // keeps such a sample in the piece that starts at the pivot. A whole 10-bit code lies
++            // 1/1023 from a pivot; only chroma filtered to within 2^-21 below one also moves up.
              float pivots_data[7+1] = {0};
 -            memcpy(pivots_data, comp->pivots + 1,
 -                   (comp->num_pivots - 2) * sizeof(pivots_data[0]));
